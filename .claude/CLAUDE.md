@@ -67,14 +67,8 @@ Docker Hub: `polytopelabs/omnihedron`
 - `cargo +nightly fmt` formatting enforced in CI
 
 ### NOT YET IMPLEMENTED
-- Hot schema reload (LISTEN/NOTIFY + schema swap)
-- GraphQL subscriptions (schema registers the type, no resolver)
-- Query validation middleware (complexity, depth, alias, batch limits — flags exist in config but no enforcement)
-- Query timeout enforcement
+- Query timeout enforcement (`--query-timeout` flag exists in config but is never applied to query execution)
 - `--query-explain` SQL EXPLAIN logging
-- GraphiQL playground UI (flag exists, no HTML served)
-- Response compression
-- Schema listener keep-alive (`SELECT 1` every 180s)
 
 ---
 
@@ -131,8 +125,8 @@ All CLI flags accept env vars with the `OMNIHEDRON_` prefix.
 |---|---|---|---|
 | `--name` / `-n` | `OMNIHEDRON_NAME` | required | PostgreSQL schema name |
 | `--port` / `-p` | `OMNIHEDRON_PORT` | 3000 | HTTP port |
-| `--playground` | `OMNIHEDRON_PLAYGROUND` | off | Enable GraphiQL UI (not implemented) |
-| `--subscription` | `OMNIHEDRON_SUBSCRIPTION` | off | Enable subscriptions (not implemented) |
+| `--playground` | `OMNIHEDRON_PLAYGROUND` | off | Enable GraphiQL UI |
+| `--subscription` | `OMNIHEDRON_SUBSCRIPTION` | off | Enable WebSocket subscriptions |
 | `--aggregate` | `OMNIHEDRON_AGGREGATE` | on | Enable aggregation queries |
 | `--unsafe-mode` | `OMNIHEDRON_UNSAFE` | off | Disable all query limits |
 | `--query-limit` | `OMNIHEDRON_QUERY_LIMIT` | 100 | Max records per query |
