@@ -263,11 +263,13 @@ The global `_global` table exists but is typically empty.
 
 Tests live in `tests/integration_test.rs` and compare Rust vs TypeScript service responses.
 
-**What's tested:**
+**What's tested (39 tests total):**
+
 **Rust + TS comparison tests (both services must be running):**
 - `test_health` — `/health` returns 2xx; TypeScript `/graphql` responds to `{ __typename }`
 - `test_metadata` — `_metadata(chainId: "11155111")` returns matching data from both services
-- `test_introspection_types` — full schema type set matches (725 types); excludes only PostGraphile aggregate helper types: `__*`, `Having*`, `*AggregatesFilter`, `*GroupBy`, `*DistinctCountAggregates`, `*AggregateFilter`, `*ToMany*`
+- `test_metadatas` — `_metadatas` query returns all chain metadata edges; TS/Rust compared
+- `test_introspection_types` — full schema type set matches; excludes PostGraphile aggregate helper types: `__*`, `Having*`, `*AggregatesFilter`, `*GroupBy`, `*DistinctCountAggregates`, `*AggregateFilter`, `*ToMany*`
 - `test_first_entity_list` — first connection field discovered via introspection; `first: 5` returns matching nodes
 - `test_pagination` — page 1 → page 2 cursor, verifies no overlap between pages
 - `test_order_by` — `orderBy: ID_ASC` returns lexicographically sorted results on both services
@@ -275,19 +277,36 @@ Tests live in `tests/integration_test.rs` and compare Rust vs TypeScript service
 - `test_aggregates` — aggregates field responds without error (values not strictly compared)
 - `test_batch_query` — POST with JSON array of 2 queries returns array of 2 results
 - `test_query_with_variables` — GraphQL variable `$count: Int!` correctly applied
-- `test_filter_equalto` — `filter: { chain: { equalTo: "KUSAMA-4009" } }` returns 20 matching rows; TS/Rust compared
+- `test_single_record` — `assetTeleported(id: "0x2c5edd...")` returns exact record on both services
+- `test_offset_pagination` — `offset: 5, first: 5` skips first 5 rows; verifies no overlap
+- `test_last_pagination` — `last: 3` returns last 3 rows with `hasPreviousPage: true`; no overlap with `first: 3`
+- `test_orderby_multi_column` — `[BLOCK_NUMBER_ASC, ID_ASC]` multi-field ordering; verifies ascending order
+- `test_filter_equalto` — `filter: { chain: { equalTo: "KUSAMA-4009" } }` returns 20 matching rows
 - `test_filter_comparison` — `filter: { blockNumber: { greaterThan: 2156000 } }` on INT4 column; exercises `TextParam` fix
-- `test_filter_in` — `filter: { id: { in: [...] } }` returns exactly 3 named fixture rows; uses JSONB parameter via `TextParam`
+- `test_filter_in` — `filter: { id: { in: [...] } }` returns exactly 3 named fixture rows
 - `test_filter_string_ops` — `filter: { id: { startsWith: "0x2c5edd" } }` returns 1 row; LIKE operator
 - `test_filter_logical` — `and`/`or` logical filter operators combining chain and blockNumber conditions
+- `test_filter_not_equal` — `notEqualTo: "POLKADOT"` matches all 20 rows
+- `test_filter_not_in` — `notIn: [3 ids]` from 20 rows leaves exactly 17
+- `test_filter_contains` — `contains: "2c5edd"` matches exactly 1 row
+- `test_filter_ends_with` — `endsWith: "8ec6"` matches exactly 1 row
+- `test_filter_ilike` — `ilike: "kusama%"` matches all 20 rows (case-insensitive)
+- `test_filter_range` — `greaterThanOrEqualTo`/`lessThanOrEqualTo` on block_number; full range → 20 rows, min value → 1 row
+- `test_filter_not` — logical `not: { chain: { equalTo: "POLKADOT" } }` matches all 20 rows
 - `test_orderby_non_id` — `orderBy: BLOCK_NUMBER_ASC` returns ascending block number order on both services
 - `test_distinct` — `distinct: [CHAIN]` collapses 20 same-chain rows to 1; both services return chain="KUSAMA-4009"
+- `test_enum_field` — `orders { nodes { status } }` returns valid enum values (PLACED/FILLED/REDEEMED/REFUNDED)
 
 **Rust-only tests (probe only the Rust service):**
 - `test_count_only` — query with only `totalCount` (no `nodes`/`edges`) returns valid count
 - `test_total_count_accuracy` — `totalCount` with `first: 1000` equals actual `nodes.length` (verifies window function COUNT)
 - `test_numeric_aggregates` — `sum`/`min`/`max`/`average` on `blockNumber` and `amount` columns; all results are strings
 - `test_blockheight` — `blockHeight: "9999999999999"` returns all 20 rows; `blockHeight: "1729590000000"` returns exactly 1 row (Rust-only feature, TS rejects blockHeight)
+- `test_by_node_id` — fetches `nodeId` dynamically then looks up via `assetTeleportedByNodeId(nodeId: ...)`, verifies correct entity returned
+- `test_node_interface` — `node(nodeId: "...")` with inline fragment `... on AssetTeleported { id }`, verifies entity resolved via Node interface
+- `test_stddev_variance_aggregates` — `stddevSample`/`stddevPopulation`/`varianceSample`/`variancePopulation` on `blockNumber`; all returned as parseable non-negative f64 strings
+- `test_bigint_serialization` — `amount` field (int8/BigInt) serialised as JSON string `"9950040000"` not a JSON number
+- `test_bigfloat_serialization` — `orders.blockTimestamp` (numeric/BigFloat) serialised as a JSON string parseable as f64
 
 **Test infrastructure:**
 - `sort_nodes()` — recursively sorts arrays of objects by `id` field for deterministic comparison

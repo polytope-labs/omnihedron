@@ -82,6 +82,41 @@ jobs:
       - name: Run integration tests
         run: cargo test --test integration_test -- --nocapture
 
+      # ── Query-limit tests (Rust without --unsafe-mode) ─────────────────────
+      - name: Stop Rust service (unsafe)
+        run: |
+          if [ -f .omnihedron.pid ]; then
+            kill "$(cat .omnihedron.pid)" 2>/dev/null || true
+            sleep 1
+          fi
+
+      - name: Start Rust service (safe mode)
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5433"
+          DB_USER: postgres
+          DB_PASS: postgres
+          DB_DATABASE: indexer
+        run: |
+          ./target/release/omnihedron \
+            --name app \
+            --port 3000 \
+            &
+          echo $! > .omnihedron.pid
+
+      - name: Wait for Rust service (safe mode)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 3 http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Rust service (safe mode) is ready."
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run query-limit tests
+        run: cargo test --test integration_test test_query_limit -- --ignored --nocapture
+
       - name: Show service logs on failure
         if: failure()
         run: |

@@ -6,9 +6,33 @@
 //! indexer's HTTP API and merged into the response.
 
 use async_graphql::dynamic::ResolverContext;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
+
+fn base64_cursor(idx: usize) -> String {
+	BASE64.encode(format!("[{idx}]"))
+}
+
+/// If `v` is a JSON string whose content is a JSON object or array,
+/// re-parse it and return the inner value. Otherwise return `v` unchanged.
+///
+/// Some `_metadata` keys (e.g. `deployments`) are stored in PostgreSQL as a
+/// JSONB *string* that contains a serialised JSON object — i.e. the DB value
+/// is `""{\"k\":\"v\"}"` at the JSONB level.  PostGraphile's GetMetadataPlugin
+/// explicitly parses these back to objects; we replicate that behaviour here.
+fn try_reparse_json_string(v: Value) -> Value {
+	if let Value::String(ref s) = v {
+		let t = s.trim();
+		if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+			if let Ok(parsed) = serde_json::from_str::<Value>(t) {
+				return parsed;
+			}
+		}
+	}
+	v
+}
 
 use crate::config::Config;
 
@@ -96,9 +120,13 @@ pub async fn resolve_metadata(
 	let mut meta = serde_json::Map::new();
 	for row in &rows {
 		let key: String = row.get(0);
-		// value is jsonb — read natively as serde_json::Value
+		// value is jsonb — read natively as serde_json::Value.
+		// Some keys (e.g. `deployments`) are stored as a JSON string whose content
+		// is itself a JSON object/array (double-encoded). Re-parse those strings so
+		// the GraphQL JSON scalar returns a proper object, matching PostGraphile.
 		let val: Option<Value> = row.try_get::<_, Value>(1).ok();
 		if let Some(v) = val {
+			let v = try_reparse_json_string(v);
 			meta.insert(key, v);
 		}
 	}
@@ -176,7 +204,7 @@ pub async fn resolve_metadatas(
 			let key: String = row.get(0);
 			let val: Option<Value> = row.try_get::<_, Value>(1).ok();
 			if let Some(v) = val {
-				meta.insert(key, v);
+				meta.insert(key, try_reparse_json_string(v));
 			}
 		}
 		meta.insert("queryNodeVersion".to_string(), json!(env!("CARGO_PKG_VERSION")));
@@ -191,8 +219,15 @@ pub async fn resolve_metadatas(
 		}
 	}
 
+	let edges: Vec<Value> = nodes
+		.iter()
+		.enumerate()
+		.map(|(i, node)| json!({ "cursor": base64_cursor(i), "node": node }))
+		.collect();
+
 	Ok(Some(json!({
 		"totalCount": total_count,
 		"nodes": nodes,
+		"edges": edges,
 	})))
 }

@@ -55,3 +55,79 @@ fn count_fields(
 	}
 	count
 }
+
+#[cfg(test)]
+mod tests {
+	use async_graphql::parser::parse_query;
+
+	use super::*;
+
+	#[test]
+	fn simple_query_under_limit() {
+		// 3 fields: a, b, c
+		let doc = parse_query("{ a { b { c } } }").unwrap();
+		let result = validate_complexity(&doc, 5);
+		assert!(result.is_ok(), "complexity 3 should pass limit 5");
+		assert_eq!(result.unwrap(), 3);
+	}
+
+	#[test]
+	fn query_at_exact_limit_passes() {
+		// 5 fields: a, b, c, d, e
+		let doc = parse_query("{ a { b { c { d { e } } } } }").unwrap();
+		let result = validate_complexity(&doc, 5);
+		assert!(result.is_ok(), "complexity 5 should pass limit 5");
+		assert_eq!(result.unwrap(), 5);
+	}
+
+	#[test]
+	fn query_over_limit_fails() {
+		// 6 fields: a, b, c, d, e, f
+		let doc = parse_query("{ a { b { c { d { e { f } } } } } }").unwrap();
+		let result = validate_complexity(&doc, 5);
+		assert!(result.is_err(), "complexity 6 should fail limit 5");
+		let msg = result.unwrap_err().message;
+		assert!(
+			msg.contains("complexity") || msg.contains("6"),
+			"error should mention complexity: {msg}"
+		);
+	}
+
+	#[test]
+	fn sibling_fields_all_counted() {
+		// a + b + c = 3 fields at the same level
+		let doc = parse_query("{ a b c }").unwrap();
+		let result = validate_complexity(&doc, 5);
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), 3);
+	}
+
+	#[test]
+	fn introspection_query_is_not_counted() {
+		let doc =
+			parse_query("query IntrospectionQuery { __schema { types { name fields { name } } } }")
+				.unwrap();
+		let result = validate_complexity(&doc, 1);
+		assert!(result.is_ok(), "IntrospectionQuery should not count toward complexity");
+		assert_eq!(result.unwrap(), 0);
+	}
+
+	#[test]
+	fn inline_fragment_fields_are_counted() {
+		// Inline fragments are transparent but their fields still count.
+		// { a { ... { b { c } } } } → a, b, c = 3 fields
+		let doc = parse_query("{ a { ... { b { c } } } }").unwrap();
+		let result = validate_complexity(&doc, 5);
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), 3);
+	}
+
+	#[test]
+	fn fragment_spread_fields_are_counted() {
+		// fragment F on T { x y } { a { ...F } } → a + x + y = 3
+		let doc = parse_query("fragment F on T { x y } { a { ...F } }").unwrap();
+		let result = validate_complexity(&doc, 5);
+		assert!(result.is_ok());
+		assert_eq!(result.unwrap(), 3);
+	}
+}

@@ -50,6 +50,12 @@ pub async fn resolve_connection(
 		.map(|v| serde_json::to_value(v.as_value()).unwrap_or(Value::Null));
 
 	let order_by_gql = ctx.args.get("orderBy").map(|v| v.as_value().clone());
+	let order_by_null: Option<String> =
+		ctx.args.get("orderByNull").and_then(|v| match v.as_value() {
+			async_graphql::Value::Enum(s) => Some(s.as_str().to_string()),
+			async_graphql::Value::String(s) => Some(s.clone()),
+			_ => None,
+		});
 	let distinct_gql = ctx.args.get("distinct").map(|v| v.as_value().clone());
 
 	let schema = &cfg.name;
@@ -112,10 +118,26 @@ pub async fn resolve_connection(
 		)
 	};
 
-	let order_clause = if order_clauses.is_empty() {
-		"ORDER BY t.id ASC".to_string()
+	let nulls_suffix = match order_by_null.as_deref() {
+		Some("NULLS_FIRST") => " NULLS FIRST",
+		Some("NULLS_LAST") => " NULLS LAST",
+		_ => "",
+	};
+
+	let forward_order_clause = if order_clauses.is_empty() {
+		format!("ORDER BY t.id ASC{nulls_suffix}")
 	} else {
-		format!("ORDER BY {}", order_clauses.join(", "))
+		let clauses_with_nulls: Vec<String> =
+			order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect();
+		format!("ORDER BY {}", clauses_with_nulls.join(", "))
+	};
+
+	// For backward pagination (`last`), reverse each ORDER BY direction so the
+	// database returns the last N rows of the logical set; we un-reverse them below.
+	let order_clause = if pagination.is_backwards {
+		reverse_order_clause(&forward_order_clause)
+	} else {
+		forward_order_clause
 	};
 
 	let count_sql =
@@ -184,6 +206,12 @@ pub async fn resolve_connection(
 		// Strip the synthetic window-count column — it must not appear in GraphQL output.
 		if let Value::Object(ref mut map) = node {
 			map.remove("__total_count");
+			// Embed blockHeight so nested relation resolvers can inherit historical filtering.
+			if is_historical {
+				if let Some(ref bh) = block_height {
+					map.insert("_block_height".to_string(), json!(bh));
+				}
+			}
 		}
 		let cursor_fields: Vec<(&str, Value)> =
 			vec![("id", node.get("id").cloned().unwrap_or(json!(null)))];
@@ -192,8 +220,24 @@ pub async fn resolve_connection(
 		nodes.push(node);
 	}
 
-	let has_next = (pagination.offset + limit) < total as usize;
-	let has_prev = pagination.offset > 0 || after.is_some();
+	// Backward pagination: rows were fetched in reversed order — restore logical order.
+	if pagination.is_backwards {
+		nodes.reverse();
+		edges.reverse();
+	}
+
+	let (has_next, has_prev) = if pagination.is_backwards {
+		// `last`: we're at the tail of the set.
+		// hasPreviousPage = there are more rows before our window.
+		// hasNextPage = only true if a `before` cursor was provided (we're not at the very end).
+		let has_prev = total as usize > limit || before.is_some();
+		let has_next = before.is_some();
+		(has_next, has_prev)
+	} else {
+		let has_next = (pagination.offset + limit) < total as usize;
+		let has_prev = pagination.offset > 0 || after.is_some();
+		(has_next, has_prev)
+	};
 
 	let start_cursor = edges.first().and_then(|e| e.get("cursor")).cloned();
 	let end_cursor = edges.last().and_then(|e| e.get("cursor")).cloned();
@@ -283,9 +327,10 @@ fn build_select_cols(
 ///
 /// Rules (in priority order):
 /// 1. `id` is always included (cursor generation).
-/// 2. Any column whose camelCase name (or raw name) appears in `requested`.
-/// 3. All `order_cols` and `distinct_cols` (needed for ORDER BY / DISTINCT ON).
-/// 4. `_block_range` for historical tables (needed in WHERE clause).
+/// 2. `_id` is always included when present — needed to encode PostGraphile-compatible nodeIds.
+/// 3. Any column whose camelCase name (or raw name) appears in `requested`.
+/// 4. All `order_cols` and `distinct_cols` (needed for ORDER BY / DISTINCT ON).
+/// 5. `_block_range` for historical tables (needed in WHERE clause).
 ///
 /// If `requested` is empty (shouldn't happen in practice) only `t."id"` is returned.
 pub fn filter_columns_by_request(
@@ -295,8 +340,14 @@ pub fn filter_columns_by_request(
 	distinct_cols: &[String],
 	is_historical: bool,
 ) -> String {
+	let has_internal_id = columns.iter().any(|c| c == "_id");
+
 	if requested.is_empty() {
-		return "t.\"id\"".to_string();
+		return if has_internal_id {
+			"t.\"id\", t.\"_id\"".to_string()
+		} else {
+			"t.\"id\"".to_string()
+		};
 	}
 
 	let mut selected: Vec<String> = Vec::new();
@@ -309,9 +360,12 @@ pub fn filter_columns_by_request(
 	};
 
 	add("id");
+	if has_internal_id {
+		add("_id");
+	}
 
 	for col in columns {
-		if col == "id" {
+		if col == "id" || col == "_id" {
 			continue;
 		}
 		if requested.contains(&to_camel_case(col)) || requested.contains(col.as_str()) {
@@ -445,6 +499,31 @@ mod tests {
 	}
 }
 
+/// Reverse every ASC/DESC direction in an `ORDER BY ...` clause string.
+/// Used for backward pagination (`last`): we reverse the sort so the DB gives
+/// us the last N rows of the logical set, then we un-reverse the result.
+fn reverse_order_clause(clause: &str) -> String {
+	// clause looks like "ORDER BY t.id ASC" or "ORDER BY t.col1 ASC, t.col2 DESC"
+	let prefix = "ORDER BY ";
+	let terms = clause.trim_start_matches(prefix);
+	let reversed = terms
+		.split(',')
+		.map(|term| {
+			let t = term.trim();
+			if t.ends_with(" ASC") {
+				format!("{} DESC", &t[..t.len() - 4])
+			} else if t.ends_with(" DESC") {
+				format!("{} ASC", &t[..t.len() - 5])
+			} else {
+				// No explicit direction — default is ASC, so reverse to DESC
+				format!("{t} DESC")
+			}
+		})
+		.collect::<Vec<_>>()
+		.join(", ");
+	format!("{prefix}{reversed}")
+}
+
 fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
 	// async-graphql may not coerce a single enum value into a list for dynamic
 	// schema arguments, so accept both List and bare Enum/String forms.
@@ -513,6 +592,22 @@ pub fn row_to_json(row: &tokio_postgres::Row) -> Value {
 	Value::Object(map)
 }
 
+/// A `FromSql` implementation that reads any PostgreSQL type as a raw UTF-8 string.
+/// Used for custom types (enums, etc.) that `tokio-postgres` won't coerce to `String`.
+struct AnyStr(String);
+impl<'a> tokio_postgres::types::FromSql<'a> for AnyStr {
+	fn from_sql(
+		_ty: &tokio_postgres::types::Type,
+		raw: &'a [u8],
+	) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+		Ok(AnyStr(std::str::from_utf8(raw)?.to_string()))
+	}
+
+	fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+		true
+	}
+}
+
 pub fn pg_col_to_json(
 	row: &tokio_postgres::Row,
 	idx: usize,
@@ -578,10 +673,10 @@ pub fn pg_col_to_json(
 			.flatten()
 			.map_or(Value::Null, |v| json!(hex::encode(v))),
 		_ => row
-			.try_get::<_, Option<String>>(idx)
+			.try_get::<_, Option<AnyStr>>(idx)
 			.ok()
 			.flatten()
-			.map_or(Value::Null, |v| json!(v)),
+			.map_or(Value::Null, |v| json!(v.0)),
 	}
 }
 

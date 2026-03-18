@@ -138,20 +138,43 @@ fn build_op_condition(
 			*param_offset += 1;
 			Some((format!("{qualified} NOT LIKE ${}", param_offset), Some(value.clone())))
 		},
-		"ilike" => {
+		"likeInsensitive" => {
 			*param_offset += 1;
 			Some((format!("{qualified} ILIKE ${}", param_offset), Some(value.clone())))
 		},
-		"notIlike" => {
+		"notLikeInsensitive" => {
 			*param_offset += 1;
 			Some((format!("{qualified} NOT ILIKE ${}", param_offset), Some(value.clone())))
 		},
 		"startsWith" => {
-			// LIKE 'prefix%'
 			*param_offset += 1;
 			let prefix = value.as_str().unwrap_or("").to_string() + "%";
 			Some((
 				format!("{qualified} LIKE ${}", param_offset),
+				Some(serde_json::Value::String(prefix)),
+			))
+		},
+		"notStartsWith" => {
+			*param_offset += 1;
+			let prefix = value.as_str().unwrap_or("").to_string() + "%";
+			Some((
+				format!("{qualified} NOT LIKE ${}", param_offset),
+				Some(serde_json::Value::String(prefix)),
+			))
+		},
+		"startsWithInsensitive" => {
+			*param_offset += 1;
+			let prefix = value.as_str().unwrap_or("").to_string() + "%";
+			Some((
+				format!("{qualified} ILIKE ${}", param_offset),
+				Some(serde_json::Value::String(prefix)),
+			))
+		},
+		"notStartsWithInsensitive" => {
+			*param_offset += 1;
+			let prefix = value.as_str().unwrap_or("").to_string() + "%";
+			Some((
+				format!("{qualified} NOT ILIKE ${}", param_offset),
 				Some(serde_json::Value::String(prefix)),
 			))
 		},
@@ -163,7 +186,31 @@ fn build_op_condition(
 				Some(serde_json::Value::String(suffix)),
 			))
 		},
-		"contains" => {
+		"notEndsWith" => {
+			*param_offset += 1;
+			let suffix = "%".to_string() + value.as_str().unwrap_or("");
+			Some((
+				format!("{qualified} NOT LIKE ${}", param_offset),
+				Some(serde_json::Value::String(suffix)),
+			))
+		},
+		"endsWithInsensitive" => {
+			*param_offset += 1;
+			let suffix = "%".to_string() + value.as_str().unwrap_or("");
+			Some((
+				format!("{qualified} ILIKE ${}", param_offset),
+				Some(serde_json::Value::String(suffix)),
+			))
+		},
+		"notEndsWithInsensitive" => {
+			*param_offset += 1;
+			let suffix = "%".to_string() + value.as_str().unwrap_or("");
+			Some((
+				format!("{qualified} NOT ILIKE ${}", param_offset),
+				Some(serde_json::Value::String(suffix)),
+			))
+		},
+		"includes" => {
 			*param_offset += 1;
 			let pattern = "%".to_string() + value.as_str().unwrap_or("") + "%";
 			Some((
@@ -171,6 +218,100 @@ fn build_op_condition(
 				Some(serde_json::Value::String(pattern)),
 			))
 		},
+		"notIncludes" => {
+			*param_offset += 1;
+			let pattern = "%".to_string() + value.as_str().unwrap_or("") + "%";
+			Some((
+				format!("{qualified} NOT LIKE ${}", param_offset),
+				Some(serde_json::Value::String(pattern)),
+			))
+		},
+		"includesInsensitive" => {
+			*param_offset += 1;
+			let pattern = "%".to_string() + value.as_str().unwrap_or("") + "%";
+			Some((
+				format!("{qualified} ILIKE ${}", param_offset),
+				Some(serde_json::Value::String(pattern)),
+			))
+		},
+		"notIncludesInsensitive" => {
+			*param_offset += 1;
+			let pattern = "%".to_string() + value.as_str().unwrap_or("") + "%";
+			Some((
+				format!("{qualified} NOT ILIKE ${}", param_offset),
+				Some(serde_json::Value::String(pattern)),
+			))
+		},
+		"equalToInsensitive" => {
+			*param_offset += 1;
+			Some((format!("lower({qualified}) = lower(${})", param_offset), Some(value.clone())))
+		},
+		"notEqualToInsensitive" => {
+			*param_offset += 1;
+			Some((format!("lower({qualified}) != lower(${})", param_offset), Some(value.clone())))
+		},
+		"distinctFromInsensitive" => {
+			*param_offset += 1;
+			Some((
+				format!("lower({qualified}) IS DISTINCT FROM lower(${})", param_offset),
+				Some(value.clone()),
+			))
+		},
+		"notDistinctFromInsensitive" => {
+			*param_offset += 1;
+			Some((
+				format!("lower({qualified}) IS NOT DISTINCT FROM lower(${})", param_offset),
+				Some(value.clone()),
+			))
+		},
+		"lessThanInsensitive" => {
+			*param_offset += 1;
+			Some((format!("lower({qualified}) < lower(${})", param_offset), Some(value.clone())))
+		},
+		"lessThanOrEqualToInsensitive" => {
+			*param_offset += 1;
+			Some((format!("lower({qualified}) <= lower(${})", param_offset), Some(value.clone())))
+		},
+		"greaterThanInsensitive" => {
+			*param_offset += 1;
+			Some((format!("lower({qualified}) > lower(${})", param_offset), Some(value.clone())))
+		},
+		"greaterThanOrEqualToInsensitive" => {
+			*param_offset += 1;
+			Some((format!("lower({qualified}) >= lower(${})", param_offset), Some(value.clone())))
+		},
+		"inInsensitive" =>
+			if let Some(arr) = value.as_array() {
+				if arr.is_empty() {
+					return Some(("FALSE".to_string(), None));
+				}
+				*param_offset += 1;
+				Some((
+					format!(
+						"lower({qualified}) = ANY(ARRAY(SELECT lower(x) FROM jsonb_array_elements_text(${}::jsonb) AS x))",
+						param_offset
+					),
+					Some(value.clone()),
+				))
+			} else {
+				None
+			},
+		"notInInsensitive" =>
+			if let Some(arr) = value.as_array() {
+				if arr.is_empty() {
+					return None;
+				}
+				*param_offset += 1;
+				Some((
+					format!(
+						"lower({qualified}) != ALL(ARRAY(SELECT lower(x) FROM jsonb_array_elements_text(${}::jsonb) AS x))",
+						param_offset
+					),
+					Some(value.clone()),
+				))
+			} else {
+				None
+			},
 		"distinctFrom" => {
 			*param_offset += 1;
 			Some((format!("{qualified} IS DISTINCT FROM ${}", param_offset), Some(value.clone())))

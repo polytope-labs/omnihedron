@@ -2,16 +2,16 @@ use anyhow::{Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value};
 
-/// Encode a PostGraphile-compatible `nodeId` from a type name and primary key value.
+/// Encode a PostGraphile-compatible `nodeId` from a table name and `_id` UUID value.
 ///
-/// Format: base64(JSON.stringify([typeName, pkValue]))
-/// e.g. AccumulatedFee + "abc123" → base64('["AccumulatedFee","abc123"]')
+/// Format: base64(JSON.stringify([tableName, pkValue]))
+/// e.g. "asset_teleporteds" + "a3f2c1d8-..." → base64('["asset_teleporteds","a3f2c1d8-..."]')
 pub fn encode_node_id(type_name: &str, pk_value: &Value) -> String {
 	let arr = Value::Array(vec![Value::String(type_name.to_string()), pk_value.clone()]);
 	BASE64.encode(arr.to_string().as_bytes())
 }
 
-/// Decode a `nodeId` back to (typeName, pkValue).
+/// Decode a `nodeId` back to (tableName, pkValue).
 pub fn decode_node_id(node_id: &str) -> Result<(String, Value)> {
 	let bytes = BASE64
 		.decode(node_id)

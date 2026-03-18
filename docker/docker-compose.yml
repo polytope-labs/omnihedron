@@ -83,6 +83,7 @@ services:
       DB_USER: postgres
       DB_PASS: postgres
       DB_DATABASE: indexer
+      OMNIHEDRON_LOG_LEVEL: debug
     ports:
       - "3000:3000"
     command: ["--name", "${SCHEMA_NAME:-app}", "--port", "3000", "--unsafe-mode"]

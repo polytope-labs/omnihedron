@@ -4615,3 +4615,49 @@ COPY "app"."transfers" ("id","chain","amount","from","to","_id","_block_range") 
 0x0fff0cebd74c1f31436a3ed943166440d8dd4167607fe254dba499c0f540790d	EVM-97	995004000000000000	0x0000000000000000000000000000000000000000000000000000000000000000	0x000000000000000000000000742d35cc6634c0532925a3b844bc454e4438f44e	97167e6e-b5d5-4e22-95a3-57bc31406120	[1755257647000,)
 0xf8c6875427b699a9909bb13870c2f0e6a9dd0a062d1f4035d38e6fa6c4cda3bc	EVM-97	4991004000000000000	0x0000000000000000000000000000000000000000000000000000000000000000	0x000000000000000000000000ea4f68301acec0dc9bbe10f15730c59fb79d237e	5ec6737b-1df4-4b44-ba6a-f94dd477a75a	[1755257707000,)
 \.
+
+
+-- ---------------------------------------------------------------------------
+-- Test tables for historical nested relation filtering
+-- test_authors (historical parent) + test_books (historical child with FK)
+-- Used by test_historical_nested_relation in integration_test.rs.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE app.test_authors (
+    id text NOT NULL,
+    name text NOT NULL,
+    _id uuid NOT NULL,
+    _block_range int8range NOT NULL
+);
+
+ALTER TABLE app.test_authors ADD CONSTRAINT test_authors_pkey PRIMARY KEY (_id);
+-- UNIQUE on id is required for the FK from test_books to work.
+ALTER TABLE app.test_authors ADD CONSTRAINT test_authors_id_unique UNIQUE (id);
+
+CREATE TABLE app.test_books (
+    id text NOT NULL,
+    title text NOT NULL,
+    author_id text NOT NULL,
+    _id uuid NOT NULL,
+    _block_range int8range NOT NULL
+);
+
+ALTER TABLE app.test_books ADD CONSTRAINT test_books_pkey PRIMARY KEY (_id);
+ALTER TABLE app.test_books ADD CONSTRAINT test_books_author_id_fkey
+    FOREIGN KEY (author_id) REFERENCES app.test_authors(id);
+
+-- One author visible at all block heights.
+INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
+    ('11111111-1111-1111-1111-111111111111'::uuid,
+     'author-alice', 'Alice', '[0,)'::int8range);
+
+-- book-1 v1: visible at blocks [100, 500).
+-- book-1 v2: visible at blocks [500, ∞).
+-- book-2: always visible [0, ∞).
+INSERT INTO app.test_books (_id, id, title, author_id, _block_range) VALUES
+    ('22222222-2222-2222-2222-222222222201'::uuid,
+     'book-1', 'Book One v1', 'author-alice', '[100,500)'::int8range),
+    ('22222222-2222-2222-2222-222222222202'::uuid,
+     'book-1', 'Book One v2', 'author-alice', '[500,)'::int8range),
+    ('22222222-2222-2222-2222-222222222203'::uuid,
+     'book-2', 'Book Two', 'author-alice', '[0,)'::int8range);

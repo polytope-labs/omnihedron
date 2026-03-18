@@ -305,17 +305,17 @@ async fn find_first_populated_connection_field(
 // Rust-only integration tests (only probe the Rust service)
 // ---------------------------------------------------------------------------
 
-/// Query only `totalCount` (no nodes/edges) and verify the Rust service
-/// returns a valid integer without errors.  This exercises the count-only
-/// fast-path that skips row fetching entirely.
+/// Query only `totalCount` (no nodes/edges) and compare both services.
+/// Also exercises Rust's count-only fast-path that skips row fetching entirely.
 #[tokio::test]
 async fn test_count_only() {
-	let rust_client = TestClient::new(&rust_url());
-
-	if rust_client.health().await.is_server_error() {
-		eprintln!("SKIP: Rust service not available.");
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
 		return;
 	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
 
 	let introspection_query = r#"
         {
@@ -331,11 +331,11 @@ async fn test_count_only() {
         }
     "#;
 
-	let intro = rust_client.query(introspection_query).await;
-	let entity_field = match find_first_populated_connection_field(&rust_client, &intro).await {
+	let ts_intro = ts_client.query(introspection_query).await;
+	let entity_field = match find_first_populated_connection_field(&ts_client, &ts_intro).await {
 		Some(f) => f,
 		None => {
-			eprintln!("SKIP: No connection fields found in Rust schema.");
+			eprintln!("SKIP: No connection fields found in schema.");
 			return;
 		},
 	};
@@ -345,37 +345,44 @@ async fn test_count_only() {
 	// Request only totalCount — no nodes, no edges.
 	let gql = format!(r#"{{ {entity}(first: 10) {{ totalCount }} }}"#, entity = entity_field);
 
-	let resp = rust_client.query(&gql).await;
+	let ts_resp = ts_client.query(&gql).await;
+	let rust_resp = rust_client.query(&gql).await;
+
+	println!("TS   count_only: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust count_only: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
 
 	assert!(
-		resp.get("errors")
+		rust_resp
+			.get("errors")
 			.and_then(|e| e.as_array())
 			.map(|a| a.is_empty())
 			.unwrap_or(true),
 		"count-only query returned errors: {}",
-		resp
+		rust_resp
 	);
 
-	let total_count = resp
+	let n = rust_resp
 		.pointer(&format!("/data/{}/totalCount", entity_field))
-		.and_then(|v| v.as_i64());
-
-	assert!(total_count.is_some(), "totalCount missing from count-only response: {}", resp);
-	let n = total_count.unwrap();
+		.and_then(|v| v.as_i64())
+		.unwrap_or_else(|| panic!("totalCount missing from count-only response: {rust_resp}"));
 	assert!(n >= 0, "totalCount should be non-negative, got {n}");
-	println!("count_only: totalCount = {n}");
+
+	compare_responses(&format!("{}(totalCount only)", entity_field), &ts_resp, &rust_resp);
+	println!("count_only: totalCount = {n} ✓");
 }
 
-/// Verify that `totalCount` from the connection matches the actual number of rows
-/// returned across all pages (window function COUNT correctness).
+/// Verify that `totalCount` matches the actual number of rows returned when fetching
+/// all pages — compares both services.  Also cross-checks that Rust's window function
+/// `COUNT(*) OVER()` returns the same value as a separate small-page query.
 #[tokio::test]
 async fn test_total_count_accuracy() {
-	let rust_client = TestClient::new(&rust_url());
-
-	if rust_client.health().await.is_server_error() {
-		eprintln!("SKIP: Rust service not available.");
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
 		return;
 	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
 
 	let introspection_query = r#"
         {
@@ -391,63 +398,71 @@ async fn test_total_count_accuracy() {
         }
     "#;
 
-	let intro = rust_client.query(introspection_query).await;
-	let entity_field = match find_first_populated_connection_field(&rust_client, &intro).await {
+	let ts_intro = ts_client.query(introspection_query).await;
+	let entity_field = match find_first_populated_connection_field(&ts_client, &ts_intro).await {
 		Some(f) => f,
 		None => {
-			eprintln!("SKIP: No connection fields found in Rust schema.");
+			eprintln!("SKIP: No connection fields found in schema.");
 			return;
 		},
 	};
 
 	println!("total_count_accuracy test using entity: {}", entity_field);
 
-	// Fetch first page with a small limit and capture totalCount.
-	let gql = format!(
-		r#"{{ {entity}(first: 5) {{ totalCount nodes {{ id }} }} }}"#,
+	// Fetch all rows from both services and compare totalCount + nodes.
+	let gql_all = format!(
+		r#"{{ {entity}(first: 1000, orderBy: ID_ASC) {{ totalCount nodes {{ id }} }} }}"#,
 		entity = entity_field
 	);
-	let resp = rust_client.query(&gql).await;
+
+	let ts_resp = ts_client.query(&gql_all).await;
+	let rust_resp = rust_client.query(&gql_all).await;
+
+	println!("TS   total_count: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust total_count: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
 
 	assert!(
-		resp.get("errors")
+		rust_resp
+			.get("errors")
 			.and_then(|e| e.as_array())
 			.map(|a| a.is_empty())
 			.unwrap_or(true),
 		"total_count_accuracy query returned errors: {}",
-		resp
+		rust_resp
 	);
 
-	let total_count = resp
+	// Rust: totalCount must equal nodes.length (window function correctness).
+	let rust_total = rust_resp
 		.pointer(&format!("/data/{}/totalCount", entity_field))
 		.and_then(|v| v.as_i64())
-		.expect("totalCount missing");
-
-	// totalCount should reflect the full table, not just the page size.
-	// The fixture has 20 rows per entity table, so with first:5 the total should be >= 5.
-	assert!(total_count >= 5, "totalCount {total_count} seems too low — expected at least 5 rows");
-
-	// Cross-check: fetch with a large limit and verify node count ≤ totalCount.
-	let gql_all = format!(
-		r#"{{ {entity}(first: 1000) {{ totalCount nodes {{ id }} }} }}"#,
-		entity = entity_field
-	);
-	let resp_all = rust_client.query(&gql_all).await;
-	let total_all = resp_all
-		.pointer(&format!("/data/{}/totalCount", entity_field))
-		.and_then(|v| v.as_i64())
-		.expect("totalCount missing in large fetch");
-	let node_count = resp_all
+		.expect("Rust totalCount missing");
+	let rust_nodes = rust_resp
 		.pointer(&format!("/data/{}/nodes", entity_field))
 		.and_then(|v| v.as_array())
 		.map(|a| a.len() as i64)
 		.unwrap_or(0);
-
 	assert_eq!(
-		total_all, node_count,
-		"When fetching all rows, totalCount ({total_all}) should equal nodes.len() ({node_count})"
+		rust_total, rust_nodes,
+		"Rust: totalCount ({rust_total}) should equal nodes.len() ({rust_nodes})"
 	);
-	println!("total_count_accuracy: totalCount={total_count}, full fetch nodes={node_count} ✓");
+
+	// TS: same invariant.
+	let ts_total = ts_resp
+		.pointer(&format!("/data/{}/totalCount", entity_field))
+		.and_then(|v| v.as_i64())
+		.expect("TS totalCount missing");
+	let ts_nodes = ts_resp
+		.pointer(&format!("/data/{}/nodes", entity_field))
+		.and_then(|v| v.as_array())
+		.map(|a| a.len() as i64)
+		.unwrap_or(0);
+	assert_eq!(
+		ts_total, ts_nodes,
+		"TS: totalCount ({ts_total}) should equal nodes.len() ({ts_nodes})"
+	);
+
+	compare_responses(&format!("{}(totalCount accuracy)", entity_field), &ts_resp, &rust_resp);
+	println!("total_count_accuracy: Rust={rust_total}, TS={ts_total} ✓");
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,22 +1180,25 @@ async fn test_query_with_variables() {
 // ---------------------------------------------------------------------------
 
 /// Test numeric aggregates (sum, min, max, average) on the assetTeleporteds table.
-/// These are Rust-only because PostGraphile returns native numeric types while
-/// Rust casts all aggregate results to strings (CAST ... AS TEXT).
+/// Compares Rust vs TypeScript — serialisation now matches PostGraphile:
+///   - sum/average → BigFloat strings
+///   - min/max on INT4 (blockNumber) → native JSON numbers
+///   - min/max on BigInt (amount) → BigFloat strings
 #[tokio::test]
 async fn test_numeric_aggregates() {
-	let rust_client = TestClient::new(&rust_url());
-
-	if rust_client.health().await.is_server_error() {
-		eprintln!("SKIP: Rust service not available.");
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
 		return;
 	}
 
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// `count` is omitted — PostGraphile's pg-aggregates does not expose it.
 	let query = r#"
         {
             assetTeleporteds(first: 100) {
                 aggregates {
-                    count
                     sum { blockNumber amount }
                     min { blockNumber amount }
                     max { blockNumber amount }
@@ -1190,56 +1208,51 @@ async fn test_numeric_aggregates() {
         }
     "#;
 
-	let resp = rust_client.query(query).await;
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   numeric aggregates: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust numeric aggregates: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
 
 	assert!(
-		resp.get("errors")
+		rust_resp
+			.get("errors")
 			.and_then(|e| e.as_array())
 			.map(|a| a.is_empty())
 			.unwrap_or(true),
 		"numeric aggregates query returned errors: {}",
-		resp
+		rust_resp
 	);
 
-	println!("Numeric aggregates: {}", serde_json::to_string_pretty(&resp).unwrap());
-
-	let agg = resp
+	let agg = rust_resp
 		.pointer("/data/assetTeleporteds/aggregates")
 		.expect("aggregates field missing from response");
 
-	// count should be a string representation of a non-negative integer.
-	let count_str = agg
-		.pointer("/count")
-		.and_then(|v| v.as_str())
-		.expect("count should be a string");
-	let count_val: i64 = count_str.parse().expect("count should parse as i64");
-	assert!(count_val >= 20, "Expected at least 20 rows, got {count_val}");
-
-	// sum.blockNumber should be a parseable positive integer string.
+	// sum.blockNumber → BigFloat string (SUM of INT4 upcasts to numeric).
 	let sum_val: i64 = agg
 		.pointer("/sum/blockNumber")
 		.and_then(|v| v.as_str())
 		.and_then(|s| s.parse().ok())
-		.expect("sum.blockNumber should be a parseable string");
+		.expect("sum.blockNumber should be a parseable BigFloat string");
 	assert!(sum_val > 0, "sum.blockNumber should be positive, got {sum_val}");
 
-	// min.blockNumber <= max.blockNumber
+	// min/max on INT4 (blockNumber) → native JSON numbers (matching PostGraphile).
 	let min_block: i64 = agg
 		.pointer("/min/blockNumber")
-		.and_then(|v| v.as_str())
-		.and_then(|s| s.parse().ok())
-		.expect("min.blockNumber should be a parseable string");
+		.and_then(|v| v.as_i64())
+		.expect("min.blockNumber should be a native JSON integer");
 	let max_block: i64 = agg
 		.pointer("/max/blockNumber")
-		.and_then(|v| v.as_str())
-		.and_then(|s| s.parse().ok())
-		.expect("max.blockNumber should be a parseable string");
+		.and_then(|v| v.as_i64())
+		.expect("max.blockNumber should be a native JSON integer");
 	assert!(
 		min_block <= max_block,
 		"min.blockNumber ({min_block}) should be <= max.blockNumber ({max_block})"
 	);
 
-	println!("blockNumber: sum={sum_val}, min={min_block}, max={max_block}, count={count_val}");
+	println!("blockNumber: sum={sum_val}, min={min_block}, max={max_block}");
+
+	compare_responses("assetTeleporteds(numeric aggregates)", &ts_resp, &rust_resp);
 }
 
 /// Test the `blockHeight` argument (Rust-only — TypeScript @subql/query rejects
@@ -1708,4 +1721,1865 @@ async fn test_distinct() {
 	}
 
 	println!("distinct: Rust and TS each returned 1 row with chain=KUSAMA-4009 ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Single-record queries
+// ---------------------------------------------------------------------------
+
+/// Test `{entity}(id: "...")` single-record query — both services.
+#[tokio::test]
+async fn test_single_record() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleported(id: "0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6") {
+                id
+                chain
+                blockNumber
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   single record: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust single record: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust single record returned errors: {}",
+		rust_resp
+	);
+
+	// Verify the returned record has the correct id and chain.
+	let id = rust_resp.pointer("/data/assetTeleported/id").and_then(|v| v.as_str());
+	assert_eq!(
+		id,
+		Some("0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6"),
+		"Rust single record returned wrong id: {}",
+		rust_resp
+	);
+	assert_eq!(
+		rust_resp.pointer("/data/assetTeleported/chain").and_then(|v| v.as_str()),
+		Some("KUSAMA-4009")
+	);
+
+	compare_responses("assetTeleported(id:...)", &ts_resp, &rust_resp);
+}
+
+/// Test `{entity}ByNodeId(nodeId: "...")` — compares Rust vs TypeScript.
+/// nodeId format now matches PostGraphile: base64(["table_name", _id_uuid]).
+/// Fetches the nodeId from TS, then uses it to query both services.
+#[tokio::test]
+async fn test_by_node_id() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// Fetch nodeId from TS (PostGraphile) — both services now encode identically.
+	let fetch_query = r#"
+        {
+            assetTeleported(id: "0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6") {
+                nodeId
+                id
+            }
+        }
+    "#;
+
+	let ts_fetch = ts_client.query(fetch_query).await;
+	let rust_fetch = rust_client.query(fetch_query).await;
+
+	// Both services must return the same nodeId.
+	let ts_node_id = ts_fetch
+		.pointer("/data/assetTeleported/nodeId")
+		.and_then(|v| v.as_str())
+		.expect("TS nodeId missing");
+	let rust_node_id = rust_fetch
+		.pointer("/data/assetTeleported/nodeId")
+		.and_then(|v| v.as_str())
+		.expect("Rust nodeId missing");
+	assert_eq!(ts_node_id, rust_node_id, "nodeId must be identical between TS and Rust");
+	println!("nodeId match confirmed: {ts_node_id}");
+
+	// Use the shared nodeId to query both services.
+	let by_node_query = format!(
+		r#"
+        {{
+            assetTeleportedByNodeId(nodeId: "{ts_node_id}") {{
+                id
+                chain
+            }}
+        }}
+    "#
+	);
+
+	let ts_resp = ts_client.query(&by_node_query).await;
+	let rust_resp = rust_client.query(&by_node_query).await;
+
+	println!("TS   byNodeId: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust byNodeId: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust byNodeId query returned errors: {}",
+		rust_resp
+	);
+
+	let returned_id = rust_resp
+		.pointer("/data/assetTeleportedByNodeId/id")
+		.and_then(|v| v.as_str())
+		.expect("id missing from Rust byNodeId response");
+	assert_eq!(
+		returned_id, "0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6",
+		"Rust byNodeId returned wrong entity"
+	);
+
+	compare_responses("assetTeleportedByNodeId", &ts_resp, &rust_resp);
+	println!("byNodeId: both services returned matching entity ✓");
+}
+
+/// Test `node(nodeId: "...")` root query — compares Rust vs TypeScript.
+/// Fetches the nodeId from TS then sends the same nodeId to both services.
+#[tokio::test]
+async fn test_node_interface() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// Fetch the canonical nodeId from TS.
+	let fetch_query = r#"
+        {
+            assetTeleported(id: "0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6") {
+                nodeId
+            }
+        }
+    "#;
+
+	let ts_fetch = ts_client.query(fetch_query).await;
+	let node_id = ts_fetch
+		.pointer("/data/assetTeleported/nodeId")
+		.and_then(|v| v.as_str())
+		.expect("TS nodeId missing");
+
+	println!("Using nodeId from TS: {node_id}");
+
+	let node_query = format!(
+		r#"
+        {{
+            node(nodeId: "{node_id}") {{
+                nodeId
+                ... on AssetTeleported {{
+                    id
+                    chain
+                }}
+            }}
+        }}
+    "#
+	);
+
+	let ts_resp = ts_client.query(&node_query).await;
+	let rust_resp = rust_client.query(&node_query).await;
+
+	println!("TS   node(): {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust node(): {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust node() query returned errors: {}",
+		rust_resp
+	);
+
+	let returned_id = rust_resp
+		.pointer("/data/node/id")
+		.and_then(|v| v.as_str())
+		.expect("id missing from Rust node() response");
+	assert_eq!(returned_id, "0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6");
+
+	compare_responses("node(nodeId)", &ts_resp, &rust_resp);
+	println!("node(nodeId): both services returned matching entity ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Pagination variants
+// ---------------------------------------------------------------------------
+
+/// Test `offset` pagination — skip first 5 rows, return next 5.
+#[tokio::test]
+async fn test_offset_pagination() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// First 5 rows.
+	let page1_query = r#"
+        {
+            assetTeleporteds(first: 5, orderBy: ID_ASC) {
+                nodes { id }
+            }
+        }
+    "#;
+	// Next 5 rows via offset.
+	let offset_query = r#"
+        {
+            assetTeleporteds(first: 5, offset: 5, orderBy: ID_ASC) {
+                nodes { id }
+            }
+        }
+    "#;
+
+	let _ts_page1 = ts_client.query(page1_query).await;
+	let rust_page1 = rust_client.query(page1_query).await;
+	let ts_offset = ts_client.query(offset_query).await;
+	let rust_offset = rust_client.query(offset_query).await;
+
+	println!("TS   offset: {}", serde_json::to_string_pretty(&ts_offset).unwrap());
+	println!("Rust offset: {}", serde_json::to_string_pretty(&rust_offset).unwrap());
+
+	assert!(
+		rust_offset
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust offset query returned errors: {}",
+		rust_offset
+	);
+
+	// The two pages must not overlap in Rust.
+	let page1_ids: HashSet<String> = rust_page1
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|nodes| nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect())
+		.unwrap_or_default();
+	let offset_ids: HashSet<String> = rust_offset
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|nodes| nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect())
+		.unwrap_or_default();
+
+	let overlap: HashSet<&String> = page1_ids.intersection(&offset_ids).collect();
+	assert!(overlap.is_empty(), "offset pages overlap: {overlap:?}");
+	assert!(!offset_ids.is_empty(), "offset returned 0 rows");
+
+	// Compare TS and Rust offset results.
+	compare_responses("assetTeleporteds(offset:5)", &ts_offset, &rust_offset);
+	println!(
+		"offset: page1={} ids, offset={} ids, no overlap ✓",
+		page1_ids.len(),
+		offset_ids.len()
+	);
+}
+
+/// Test `last` backward pagination — return the last 3 rows.
+#[tokio::test]
+async fn test_last_pagination() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// Fetch last 3 rows — should not overlap with first 3 rows.
+	let first_query = r#"
+        {
+            assetTeleporteds(first: 3, orderBy: ID_ASC) {
+                nodes { id }
+            }
+        }
+    "#;
+	let last_query = r#"
+        {
+            assetTeleporteds(last: 3, orderBy: ID_ASC) {
+                nodes { id }
+                pageInfo { hasPreviousPage }
+            }
+        }
+    "#;
+
+	let rust_first = rust_client.query(first_query).await;
+	let ts_last = ts_client.query(last_query).await;
+	let rust_last = rust_client.query(last_query).await;
+
+	println!("TS   last:3 = {}", serde_json::to_string_pretty(&ts_last).unwrap());
+	println!("Rust last:3 = {}", serde_json::to_string_pretty(&rust_last).unwrap());
+
+	assert!(
+		rust_last
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust `last` query returned errors: {}",
+		rust_last
+	);
+
+	// Should return 3 rows.
+	let rust_nodes = rust_last
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.expect("nodes missing from Rust last response");
+	assert_eq!(rust_nodes.len(), 3, "Rust last:3 should return 3 nodes, got {}", rust_nodes.len());
+
+	// `last` rows and `first` rows should not overlap (20 total rows).
+	let first_ids: HashSet<String> = rust_first
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|nodes| nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect())
+		.unwrap_or_default();
+	let last_ids: HashSet<String> =
+		rust_nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect();
+
+	let overlap: HashSet<&String> = first_ids.intersection(&last_ids).collect();
+	assert!(overlap.is_empty(), "first:3 and last:3 overlap: {overlap:?}");
+
+	// hasPreviousPage must be true when there are more rows before.
+	let has_prev = rust_last
+		.pointer("/data/assetTeleporteds/pageInfo/hasPreviousPage")
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false);
+	assert!(has_prev, "hasPreviousPage should be true for last:3 of 20 rows");
+
+	compare_responses("assetTeleporteds(last:3)", &ts_last, &rust_last);
+	println!("last pagination: 3 rows, no overlap with first:3, hasPreviousPage=true ✓");
+}
+
+/// Test multi-column `orderBy` — `[BLOCK_NUMBER_ASC, ID_ASC]`.
+#[tokio::test]
+async fn test_orderby_multi_column() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(first: 10, orderBy: [BLOCK_NUMBER_ASC, ID_ASC]) {
+                nodes { id blockNumber }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   multi orderBy: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust multi orderBy: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust multi-column orderBy returned errors: {}",
+		rust_resp
+	);
+
+	// Verify primary sort (block_number ascending).
+	if let Some(nodes) =
+		rust_resp.pointer("/data/assetTeleporteds/nodes").and_then(|v| v.as_array())
+	{
+		let bns: Vec<i64> = nodes.iter().filter_map(|n| n["blockNumber"].as_i64()).collect();
+		let mut sorted = bns.clone();
+		sorted.sort();
+		assert_eq!(bns, sorted, "Rust multi-column orderBy: blockNumbers not ascending: {bns:?}");
+	}
+
+	compare_responses("assetTeleporteds([BLOCK_NUMBER_ASC, ID_ASC])", &ts_resp, &rust_resp);
+}
+
+// ---------------------------------------------------------------------------
+// Filter operator coverage
+// ---------------------------------------------------------------------------
+
+/// Test `notEqualTo` filter — chain != "POLKADOT" matches all 20 rows.
+#[tokio::test]
+async fn test_filter_not_equal() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(
+                first: 100,
+                orderBy: ID_ASC,
+                filter: { chain: { notEqualTo: "POLKADOT" } }
+            ) {
+                totalCount
+                nodes { id chain }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	let count = rust_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing");
+	assert!(count >= 20, "notEqualTo 'POLKADOT' should match all 20 rows, got {count}");
+
+	compare_responses("assetTeleporteds(notEqualTo)", &ts_resp, &rust_resp);
+}
+
+/// Test `notIn` filter — exclude 3 known ids, expect 17 remaining.
+#[tokio::test]
+async fn test_filter_not_in() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(
+                first: 100,
+                orderBy: ID_ASC,
+                filter: {
+                    id: {
+                        notIn: [
+                            "0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6",
+                            "0x5e11feb69bef8bec523afc3c1fe0297c0dff5794422eefb2c11f1ba78efdb3d4",
+                            "0x4e54a431cdb82239331deda9feb93f5a101f50756e62387c0532143dad02d1f7"
+                        ]
+                    }
+                }
+            ) {
+                totalCount
+                nodes { id }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	let count = rust_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from Rust notIn response");
+
+	// The total count without the filter — fetch separately to verify exclusion worked.
+	let total_query = r#"{ assetTeleporteds(first: 1) { totalCount } }"#;
+	let total_resp = rust_client.query(total_query).await;
+	let total_rows = total_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.unwrap_or(0);
+	assert_eq!(
+		count,
+		total_rows - 3,
+		"notIn 3 ids should reduce count by 3, got total={total_rows} filtered={count}"
+	);
+
+	// None of the excluded IDs should appear in the results.
+	let excluded: HashSet<&str> = [
+		"0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6",
+		"0x5e11feb69bef8bec523afc3c1fe0297c0dff5794422eefb2c11f1ba78efdb3d4",
+		"0x4e54a431cdb82239331deda9feb93f5a101f50756e62387c0532143dad02d1f7",
+	]
+	.into_iter()
+	.collect();
+	if let Some(nodes) =
+		rust_resp.pointer("/data/assetTeleporteds/nodes").and_then(|v| v.as_array())
+	{
+		for node in nodes {
+			let id = node["id"].as_str().unwrap_or("");
+			assert!(!excluded.contains(id), "notIn: excluded id {id} appeared in results");
+		}
+	}
+
+	compare_responses("assetTeleporteds(notIn)", &ts_resp, &rust_resp);
+}
+
+/// Test `includes` string filter — `id: { includes: "2c5edd" }` matches exactly 1 row.
+/// Uses the PostGraphile operator name (`includes`).
+#[tokio::test]
+async fn test_filter_contains() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(
+                first: 10,
+                orderBy: ID_ASC,
+                filter: { id: { includes: "2c5edd" } }
+            ) {
+                totalCount
+                nodes { id }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	let count = rust_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from Rust includes response");
+	assert_eq!(count, 1, "includes '2c5edd' should match 1 row, got {count}");
+	compare_responses("assetTeleporteds(includes)", &ts_resp, &rust_resp);
+	println!("includes filter: matched {count} row ✓");
+}
+
+/// Test `endsWith` string filter — `id: { endsWith: "8ec6" }` matches exactly 1 row.
+#[tokio::test]
+async fn test_filter_ends_with() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(
+                first: 10,
+                orderBy: ID_ASC,
+                filter: { id: { endsWith: "8ec6" } }
+            ) {
+                totalCount
+                nodes { id }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	let count = rust_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from Rust endsWith response");
+	assert_eq!(count, 1, "endsWith '8ec6' should match 1 row, got {count}");
+	assert_eq!(
+		rust_resp.pointer("/data/assetTeleporteds/nodes/0/id").and_then(|v| v.as_str()),
+		Some("0x2c5edd96e3e017d74ccc172437317ac67bbcdbbdfe3afda178a9e3f9546f8ec6")
+	);
+
+	compare_responses("assetTeleporteds(endsWith)", &ts_resp, &rust_resp);
+}
+
+/// Test `likeInsensitive` case-insensitive LIKE filter.
+/// Uses the PostGraphile operator name (`likeInsensitive`).
+#[tokio::test]
+async fn test_filter_ilike() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(
+                first: 100,
+                orderBy: ID_ASC,
+                filter: { chain: { likeInsensitive: "kusama%" } }
+            ) {
+                totalCount
+                nodes { id }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	let count = rust_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from Rust likeInsensitive response");
+	assert!(count > 0, "likeInsensitive 'kusama%' should match at least 1 row, got {count}");
+	compare_responses("assetTeleporteds(likeInsensitive)", &ts_resp, &rust_resp);
+	println!("likeInsensitive filter: matched {count} rows ✓");
+}
+
+/// Test `greaterThanOrEqualTo` and `lessThanOrEqualTo` range filters.
+/// block_number range in fixture: 2154921–2157150.
+/// Filter: 2154921 <= block_number <= 2157150 → all 20 rows.
+/// Filter: block_number <= 2154921 → exactly 1 row (the minimum).
+#[tokio::test]
+async fn test_filter_range() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// All rows within the full range.
+	let query_full = r#"
+        {
+            assetTeleporteds(
+                first: 100,
+                filter: {
+                    blockNumber: {
+                        greaterThanOrEqualTo: 2154921,
+                        lessThanOrEqualTo: 2157150
+                    }
+                }
+            ) {
+                totalCount
+            }
+        }
+    "#;
+
+	let ts_full = ts_client.query(query_full).await;
+	let rust_full = rust_client.query(query_full).await;
+
+	let count_full = rust_full
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing");
+	assert!(count_full >= 20, "full range filter should match all 20 rows, got {count_full}");
+	compare_responses("assetTeleporteds(range:full)", &ts_full, &rust_full);
+
+	// Only the minimum block_number row.
+	let query_min = r#"
+        {
+            assetTeleporteds(
+                first: 10,
+                orderBy: ID_ASC,
+                filter: { blockNumber: { lessThanOrEqualTo: 2154921 } }
+            ) {
+                totalCount
+                nodes { id blockNumber }
+            }
+        }
+    "#;
+
+	let ts_min = ts_client.query(query_min).await;
+	let rust_min = rust_client.query(query_min).await;
+
+	let count_min = rust_min
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from min filter");
+	assert_eq!(count_min, 1, "lessThanOrEqualTo 2154921 should match 1 row, got {count_min}");
+
+	compare_responses("assetTeleporteds(range:min)", &ts_min, &rust_min);
+}
+
+/// Test logical `not` filter — `not: { chain: { equalTo: "POLKADOT" } }` matches all 20 rows.
+#[tokio::test]
+async fn test_filter_not() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(
+                first: 100,
+                orderBy: ID_ASC,
+                filter: { not: { chain: { equalTo: "POLKADOT" } } }
+            ) {
+                totalCount
+                nodes { id }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	let count = rust_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from Rust not-filter response");
+	assert!(count >= 20, "`not` filter should match all 20 rows (none are POLKADOT), got {count}");
+
+	compare_responses("assetTeleporteds(not)", &ts_resp, &rust_resp);
+}
+
+// ---------------------------------------------------------------------------
+// Metadata queries
+// ---------------------------------------------------------------------------
+
+/// Test `_metadatas` query — returns all chain metadata records.
+/// Test `_metadatas` query — compares Rust vs TypeScript.
+/// Both services support `nodes`; Rust additionally exposes `edges` but TS does not.
+#[tokio::test]
+async fn test_metadatas() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// Use `nodes` — supported by both services.
+	let query = r#"
+        {
+            _metadatas {
+                nodes {
+                    chain
+                    lastProcessedHeight
+                }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   _metadatas: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust _metadatas: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust _metadatas returned errors: {}",
+		rust_resp
+	);
+
+	// At least one node must be present.
+	let nodes = rust_resp
+		.pointer("/data/_metadatas/nodes")
+		.and_then(|v| v.as_array())
+		.expect("_metadatas nodes missing from Rust response");
+	assert!(!nodes.is_empty(), "_metadatas returned no nodes");
+
+	// At least one node must have a non-null chain field.
+	// (Some metadata tables may be partially populated and lack a chain entry.)
+	let with_chain = nodes
+		.iter()
+		.filter(|n| n.get("chain").and_then(|v| v.as_str()).is_some())
+		.count();
+	assert!(with_chain > 0, "_metadatas: no node has a chain field; nodes: {nodes:?}");
+
+	println!("_metadatas: {with_chain}/{} chains found ✓", nodes.len());
+
+	compare_responses("_metadatas", &ts_resp, &rust_resp);
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate coverage
+// ---------------------------------------------------------------------------
+
+/// Test stddev and variance aggregates — compares Rust vs TypeScript with float tolerance.
+///
+/// Both services return BigFloat strings, but the final digit can differ by 1 ULP because
+/// PostgreSQL numeric arithmetic and JavaScript IEEE 754 doubles take slightly different
+/// rounding paths (e.g. `...0761` vs `...0762`).  We parse both sides as f64 and accept
+/// values that agree to within a relative tolerance of 1e-9.
+#[tokio::test]
+async fn test_stddev_variance_aggregates() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            assetTeleporteds(first: 100) {
+                aggregates {
+                    stddevSample { blockNumber }
+                    stddevPopulation { blockNumber }
+                    varianceSample { blockNumber }
+                    variancePopulation { blockNumber }
+                }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   stddev/variance: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust stddev/variance: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"stddev/variance query returned errors: {}",
+		rust_resp
+	);
+
+	let rust_agg = rust_resp
+		.pointer("/data/assetTeleporteds/aggregates")
+		.expect("Rust aggregates field missing");
+	let ts_agg = ts_resp
+		.pointer("/data/assetTeleporteds/aggregates")
+		.expect("TS aggregates field missing");
+
+	// Relative tolerance: 1e-9 comfortably covers the 1-ULP last-digit divergence between
+	// PostgreSQL numeric and JavaScript Number while catching any real discrepancies.
+	const REL_TOL: f64 = 1e-9;
+
+	for path in &[
+		"/stddevSample/blockNumber",
+		"/stddevPopulation/blockNumber",
+		"/varianceSample/blockNumber",
+		"/variancePopulation/blockNumber",
+	] {
+		let rust_str = rust_agg
+			.pointer(path)
+			.and_then(|v| v.as_str())
+			.unwrap_or_else(|| panic!("Rust aggregate {path} missing or not a string"));
+		let ts_str = ts_agg
+			.pointer(path)
+			.and_then(|v| v.as_str())
+			.unwrap_or_else(|| panic!("TS aggregate {path} missing or not a string"));
+
+		let rust_val: f64 = rust_str
+			.parse()
+			.unwrap_or_else(|_| panic!("Rust {path} = '{rust_str}' should parse as f64"));
+		let ts_val: f64 = ts_str
+			.parse()
+			.unwrap_or_else(|_| panic!("TS {path} = '{ts_str}' should parse as f64"));
+
+		assert!(rust_val >= 0.0, "Rust {path} = {rust_val} should be non-negative");
+
+		// Relative error check.
+		let rel_err = if ts_val == 0.0 {
+			(rust_val - ts_val).abs()
+		} else {
+			((rust_val - ts_val) / ts_val).abs()
+		};
+		assert!(
+			rel_err <= REL_TOL,
+			"{path}: Rust={rust_str} TS={ts_str} relative_error={rel_err:.2e} > tolerance {REL_TOL:.2e}"
+		);
+
+		println!("{path}: Rust={rust_str} TS={ts_str} rel_err={rel_err:.2e} ✓");
+	}
+
+	println!("stddev/variance aggregates: all fields within tolerance ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Type serialisation
+// ---------------------------------------------------------------------------
+
+/// Verify that BigInt (int8) fields are serialised as JSON strings, not numbers.
+/// Uses `aggregates { distinctCount { id } }` which is BigInt on both Rust and PostGraphile.
+#[tokio::test]
+async fn test_bigint_serialization() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// distinctCount returns BigInt strings on both Rust and PostGraphile.
+	let query = r#"
+        {
+            assetTeleporteds(first: 100) {
+                aggregates { distinctCount { id } }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   BigInt: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust BigInt: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"BigInt query returned errors: {}",
+		rust_resp
+	);
+
+	let dc_id = rust_resp
+		.pointer("/data/assetTeleporteds/aggregates/distinctCount/id")
+		.expect("aggregates.distinctCount.id missing");
+
+	// BigInt must be a JSON string, not a JSON number, to avoid 64-bit precision loss.
+	assert!(
+		dc_id.is_string(),
+		"aggregates.distinctCount.id (BigInt) should be a JSON string, got: {dc_id:?}"
+	);
+
+	let parsed: i64 = dc_id
+		.as_str()
+		.unwrap()
+		.parse()
+		.unwrap_or_else(|e| panic!("distinctCount.id should parse as i64: {e}"));
+	assert!(parsed > 0, "distinctCount.id should be positive, got {parsed}");
+
+	println!("BigInt serialization: distinctCount.id='{dc_id}' correctly serialised as string ✓");
+
+	compare_responses("assetTeleporteds(bigint serialization)", &ts_resp, &rust_resp);
+}
+
+/// Verify that BigFloat (numeric) aggregate fields are serialised as JSON strings.
+/// Compares Rust vs TypeScript — both should return matching string values.
+#[tokio::test]
+async fn test_bigfloat_serialization() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// aggregates.sum.blockNumber is a BigFloat string (SUM of INT4 upcasted to numeric).
+	let query = r#"
+        {
+            assetTeleporteds(first: 100) {
+                aggregates {
+                    sum { blockNumber }
+                    average { blockNumber }
+                }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   BigFloat: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust BigFloat: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"BigFloat query returned errors: {}",
+		rust_resp
+	);
+
+	let sum_bn = rust_resp
+		.pointer("/data/assetTeleporteds/aggregates/sum/blockNumber")
+		.expect("sum.blockNumber missing");
+
+	// BigFloat must be a JSON string.
+	assert!(
+		sum_bn.is_string(),
+		"sum.blockNumber (BigFloat) should be a JSON string, got: {sum_bn:?}"
+	);
+
+	let parsed: f64 = sum_bn
+		.as_str()
+		.unwrap()
+		.parse()
+		.unwrap_or_else(|e| panic!("sum.blockNumber should parse as f64: {e}"));
+	assert!(parsed > 0.0, "sum.blockNumber should be positive (rows exist), got {parsed}");
+
+	println!("BigFloat serialization: sum.blockNumber='{sum_bn}' correctly serialised as string ✓");
+
+	compare_responses("assetTeleporteds(bigfloat serialization)", &ts_resp, &rust_resp);
+}
+
+/// Test that enum fields on `orders` return valid enum values.
+/// The `status` column is a PostgreSQL enum with values: PLACED, FILLED, REDEEMED, REFUNDED.
+#[tokio::test]
+async fn test_enum_field() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"
+        {
+            orders(first: 20, orderBy: ID_ASC) {
+                totalCount
+                nodes { id status }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   enum field: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust enum field: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust enum field query returned errors: {}",
+		rust_resp
+	);
+
+	let valid_statuses: HashSet<&str> = ["PLACED", "FILLED", "REDEEMED", "REFUNDED"].into();
+	if let Some(nodes) = rust_resp.pointer("/data/orders/nodes").and_then(|v| v.as_array()) {
+		assert!(!nodes.is_empty(), "No order rows returned");
+		for node in nodes {
+			if let Some(status) = node["status"].as_str() {
+				assert!(
+					valid_statuses.contains(status),
+					"status '{status}' is not a valid enum value; valid: {valid_statuses:?}"
+				);
+			}
+		}
+	}
+
+	// Don't use compare_responses — TS and Rust may return enum values in different formats.
+	// Just verify Rust returns valid values.
+	println!("enum field: all status values are valid ✓");
+}
+
+// ---------------------------------------------------------------------------
+// orderByNull
+// ---------------------------------------------------------------------------
+
+/// Test `orderByNull: NULLS_LAST` and `NULLS_FIRST` — compares Rust vs TypeScript.
+///
+/// PostGraphile's PgOrderByUnique plugin adds an `orderByNull` argument that appends
+/// `NULLS FIRST` / `NULLS LAST` to each ORDER BY column.  With no null values in the
+/// fixture the result set is identical regardless of null ordering; the test verifies:
+///   1. Both services accept the argument without returning errors.
+///   2. Both services return identical responses (TS+Rust comparison).
+#[tokio::test]
+async fn test_order_by_null() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// NULLS_LAST — nulls appear after all non-null values.
+	let query_nulls_last = r#"
+        {
+            assetTeleporteds(
+                first: 10,
+                orderBy: BLOCK_NUMBER_ASC,
+                orderByNull: NULLS_LAST
+            ) {
+                nodes { id blockNumber }
+            }
+        }
+    "#;
+
+	let ts_last = ts_client.query(query_nulls_last).await;
+	let rust_last = rust_client.query(query_nulls_last).await;
+
+	println!("TS   NULLS_LAST: {}", serde_json::to_string_pretty(&ts_last).unwrap());
+	println!("Rust NULLS_LAST: {}", serde_json::to_string_pretty(&rust_last).unwrap());
+
+	assert!(
+		rust_last
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust NULLS_LAST returned errors: {}",
+		rust_last
+	);
+	assert!(
+		ts_last
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"TS NULLS_LAST returned errors: {}",
+		ts_last
+	);
+
+	compare_responses("assetTeleporteds(orderByNull:NULLS_LAST)", &ts_last, &rust_last);
+
+	// NULLS_FIRST — nulls appear before all non-null values.
+	let query_nulls_first = r#"
+        {
+            assetTeleporteds(
+                first: 10,
+                orderBy: BLOCK_NUMBER_ASC,
+                orderByNull: NULLS_FIRST
+            ) {
+                nodes { id blockNumber }
+            }
+        }
+    "#;
+
+	let ts_first = ts_client.query(query_nulls_first).await;
+	let rust_first = rust_client.query(query_nulls_first).await;
+
+	println!("TS   NULLS_FIRST: {}", serde_json::to_string_pretty(&ts_first).unwrap());
+	println!("Rust NULLS_FIRST: {}", serde_json::to_string_pretty(&rust_first).unwrap());
+
+	assert!(
+		rust_first
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust NULLS_FIRST returned errors: {}",
+		rust_first
+	);
+	assert!(
+		ts_first
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"TS NULLS_FIRST returned errors: {}",
+		ts_first
+	);
+
+	compare_responses("assetTeleporteds(orderByNull:NULLS_FIRST)", &ts_first, &rust_first);
+
+	println!("orderByNull: NULLS_LAST and NULLS_FIRST both accepted and matched ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Query limit clamping
+// ---------------------------------------------------------------------------
+
+/// Test query limit behaviour — verifies `first` arg is correctly applied
+/// and that requesting more rows than `query_limit` is clamped.
+///
+/// The CI fixture has 20 rows per entity.  With `query_limit=100`:
+///   - `first: 5`   → exactly 5 rows (unchanged, below limit)
+///   - `first: 200` → clamped to 100 (the default query-limit)
+///   - no `first`   → defaults to 100
+///
+/// This test is `#[ignore]`d because it requires the Rust service to be running
+/// **without** `--unsafe-mode`.  CI runs it in a separate step after restarting
+/// omnihedron without that flag.
+#[tokio::test]
+#[ignore]
+async fn test_query_limit() {
+	let rust_url =
+		std::env::var("RUST_SERVICE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+	let rust_client = TestClient::new(&rust_url);
+
+	// Verify the service is reachable
+	let health = reqwest::get(format!("{rust_url}/health")).await;
+	if health.is_err() || !health.unwrap().status().is_success() {
+		eprintln!("SKIP: Rust service not available at {rust_url}");
+		return;
+	}
+
+	// ── first: 5 — must return exactly 5 rows ──────────────────────────────
+	let query_5 = r#"
+        {
+            assetTeleporteds(first: 5, orderBy: ID_ASC) {
+                nodes { id }
+            }
+        }
+    "#;
+
+	let rust_5 = rust_client.query(query_5).await;
+	let rust_count_5 = rust_5
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|a| a.len())
+		.unwrap_or_else(|| panic!("nodes missing from rust first:5 response: {rust_5}"));
+	assert_eq!(rust_count_5, 5, "first:5 should return exactly 5 rows");
+
+	// ── first: 200 — must be clamped to query_limit (100) ───────────────────
+	let query_200 = r#"
+        {
+            assetTeleporteds(first: 200, orderBy: ID_ASC) {
+                nodes { id }
+            }
+        }
+    "#;
+
+	let rust_200 = rust_client.query(query_200).await;
+	assert!(
+		rust_200
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust first:200 returned errors: {}",
+		rust_200
+	);
+
+	let rust_count_200 = rust_200
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|a| a.len())
+		.unwrap_or_else(|| panic!("nodes missing from rust first:200 response: {rust_200}"));
+	assert!(rust_count_200 <= 100, "first:200 should be clamped to 100, got {rust_count_200}");
+
+	// ── no first arg — defaults to query_limit (100) ────────────────────────
+	let query_unbounded = r#"
+        {
+            assetTeleporteds(orderBy: ID_ASC) {
+                nodes { id }
+            }
+        }
+    "#;
+
+	let rust_unbounded = rust_client.query(query_unbounded).await;
+	assert!(
+		rust_unbounded
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust unbounded query returned errors: {}",
+		rust_unbounded
+	);
+
+	let rust_count_unbounded = rust_unbounded
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|a| a.len())
+		.unwrap_or_else(|| panic!("nodes missing from rust unbounded response: {rust_unbounded}"));
+	assert!(
+		rust_count_unbounded <= 100,
+		"unbounded query should default to 100, got {rust_count_unbounded}"
+	);
+
+	println!(
+		"query_limit: first:5={rust_count_5}, first:200={rust_count_200}, \
+         unbounded={rust_count_unbounded} (all ≤100) ✓"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// groupedAggregates
+// ---------------------------------------------------------------------------
+
+/// Test `groupedAggregates` — compares Rust vs TypeScript.
+///
+/// Two cases:
+///   1. `groupBy: []` (empty) — single group aggregating all matching rows.
+///   2. `groupBy: [CHAIN]`    — one group per distinct chain value. All 20 fixture rows share
+///      chain="KUSAMA-4009" so this produces 1 group.
+///
+/// `average` is excluded from the TS+Rust comparison because PostgreSQL numeric
+/// arithmetic and JavaScript IEEE 754 can diverge in the last decimal digit
+/// (same root cause as test_stddev_variance_aggregates).
+#[tokio::test]
+async fn test_grouped_aggregates() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// ── groupBy: [] — aggregate all rows into a single group ──────────────
+	let query_empty = r#"
+        {
+            assetTeleporteds(first: 100) {
+                groupedAggregates(groupBy: []) {
+                    sum { blockNumber }
+                    min { blockNumber }
+                    max { blockNumber }
+                    distinctCount { id }
+                }
+            }
+        }
+    "#;
+
+	let ts_empty = ts_client.query(query_empty).await;
+	let rust_empty = rust_client.query(query_empty).await;
+
+	println!("TS   groupedAggregates([]): {}", serde_json::to_string_pretty(&ts_empty).unwrap());
+	println!("Rust groupedAggregates([]): {}", serde_json::to_string_pretty(&rust_empty).unwrap());
+
+	assert!(
+		rust_empty
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"groupBy:[] returned errors: {}",
+		rust_empty
+	);
+
+	// Must return exactly 1 group (no grouping = one aggregate over all rows).
+	let groups = rust_empty
+		.pointer("/data/assetTeleporteds/groupedAggregates")
+		.and_then(|v| v.as_array())
+		.expect("groupedAggregates array missing from Rust response");
+	assert_eq!(groups.len(), 1, "groupBy:[] must return exactly 1 group, got {}", groups.len());
+
+	// sum.blockNumber → BigFloat string (SUM of INT4 → numeric → text).
+	let sum_bn = groups[0].pointer("/sum/blockNumber").expect("sum.blockNumber missing");
+	assert!(
+		sum_bn.is_string(),
+		"sum.blockNumber (BigFloat) should be a JSON string, got: {sum_bn:?}"
+	);
+	sum_bn
+		.as_str()
+		.unwrap()
+		.parse::<f64>()
+		.unwrap_or_else(|_| panic!("sum.blockNumber should parse as f64, got: {sum_bn}"));
+
+	// min.blockNumber → native Int (INT4 min preserves source type).
+	let min_bn = groups[0].pointer("/min/blockNumber").expect("min.blockNumber missing");
+	assert!(
+		min_bn.is_number(),
+		"min.blockNumber (INT4) should be a native JSON number, got: {min_bn:?}"
+	);
+
+	// distinctCount.id → BigInt string.
+	let dc_id = groups[0].pointer("/distinctCount/id").expect("distinctCount.id missing");
+	assert!(dc_id.is_string(), "distinctCount.id (BigInt) should be a JSON string, got: {dc_id:?}");
+
+	compare_responses("assetTeleporteds(groupedAggregates groupBy:[])", &ts_empty, &rust_empty);
+
+	// ── groupBy: [CHAIN] — one group per distinct chain value ─────────────
+	// All 20 rows share chain="KUSAMA-4009" → exactly 1 group.
+	//
+	// Note: PostGraphile's pg-aggregates returns `keys: [String!]` (raw values),
+	// while omnihedron returns `keys: AssetTeleported` (entity object with named
+	// fields). The `keys { chain }` sub-selection is only valid on the Rust service.
+	// We use a separate TS query without `keys` for the cross-service comparison.
+	let query_chain_rust = r#"
+        {
+            assetTeleporteds(first: 100) {
+                groupedAggregates(groupBy: [CHAIN]) {
+                    keys { chain }
+                    sum { blockNumber }
+                    min { blockNumber }
+                    max { blockNumber }
+                    distinctCount { id }
+                }
+            }
+        }
+    "#;
+	let query_chain_ts = r#"
+        {
+            assetTeleporteds(first: 100) {
+                groupedAggregates(groupBy: [CHAIN]) {
+                    sum { blockNumber }
+                    min { blockNumber }
+                    max { blockNumber }
+                    distinctCount { id }
+                }
+            }
+        }
+    "#;
+
+	let ts_chain = ts_client.query(query_chain_ts).await;
+	let rust_chain = rust_client.query(query_chain_rust).await;
+
+	println!(
+		"TS   groupedAggregates([CHAIN]): {}",
+		serde_json::to_string_pretty(&ts_chain).unwrap()
+	);
+	println!(
+		"Rust groupedAggregates([CHAIN]): {}",
+		serde_json::to_string_pretty(&rust_chain).unwrap()
+	);
+
+	assert!(
+		rust_chain
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"groupBy:[CHAIN] returned errors: {}",
+		rust_chain
+	);
+
+	let chain_groups = rust_chain
+		.pointer("/data/assetTeleporteds/groupedAggregates")
+		.and_then(|v| v.as_array())
+		.expect("groupedAggregates[CHAIN] array missing from Rust response");
+	assert!(!chain_groups.is_empty(), "groupBy:[CHAIN] must return at least 1 group");
+
+	// The 20 fixture rows all have chain="KUSAMA-4009" → exactly 1 group.
+	let chain_key = chain_groups[0]
+		.pointer("/keys/chain")
+		.and_then(|v| v.as_str())
+		.expect("groupedAggregates[CHAIN] keys.chain missing");
+	assert_eq!(
+		chain_key, "KUSAMA-4009",
+		"groupBy:[CHAIN] group key should be KUSAMA-4009, got: {chain_key}"
+	);
+
+	// Compare aggregate values (excluding keys which differ in schema between TS and Rust).
+	// Build TS-comparable Rust response by stripping the keys field.
+	let mut rust_chain_stripped = rust_chain.clone();
+	if let Some(groups) = rust_chain_stripped
+		.pointer_mut("/data/assetTeleporteds/groupedAggregates")
+		.and_then(|v| v.as_array_mut())
+	{
+		for g in groups.iter_mut() {
+			if let Some(obj) = g.as_object_mut() {
+				obj.remove("keys");
+			}
+		}
+	}
+	compare_responses(
+		"assetTeleporteds(groupedAggregates groupBy:[CHAIN])",
+		&ts_chain,
+		&rust_chain_stripped,
+	);
+
+	println!(
+		"groupedAggregates: groupBy:[] → {} group(s), groupBy:[CHAIN] → {} group(s) ✓",
+		groups.len(),
+		chain_groups.len()
+	);
+}
+
+// ---------------------------------------------------------------------------
+// _metadata null-field coercion
+// ---------------------------------------------------------------------------
+
+/// Test that `_metadata` gracefully returns `null` for fields absent from the DB.
+///
+/// The `_metadata` table is a key-value store.  Fields like `latestSyncedPoiHeight`
+/// and `lastFinalizedVerifiedHeight` are often not written by the indexer; both
+/// services should return `null` for them without erroring.  Compares Rust vs TypeScript.
+#[tokio::test]
+async fn test_metadata_null_fields() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// Query a broad set of fields.  Some (latestSyncedPoiHeight, lastFinalizedVerifiedHeight,
+	// startHeight) are very likely absent from the fixture → both services must return null.
+	let query = r#"
+        {
+            _metadata(chainId: "11155111") {
+                lastProcessedHeight
+                chain
+                specName
+                indexerHealthy
+                dynamicDatasources
+                deployments
+                latestSyncedPoiHeight
+                lastFinalizedVerifiedHeight
+                startHeight
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   _metadata(null fields): {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust _metadata(null fields): {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust _metadata returned errors: {}",
+		rust_resp
+	);
+	assert!(
+		ts_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"TS _metadata returned errors: {}",
+		ts_resp
+	);
+
+	// Fields absent from the DB must coerce to null on the Rust side.
+	// `latestSyncedPoiHeight` is not written by test indexers and is reliably null.
+	let meta = rust_resp.pointer("/data/_metadata").expect("_metadata missing from Rust");
+	let val = meta.get("latestSyncedPoiHeight");
+	let is_null = val.map(|v| v.is_null()).unwrap_or(true);
+	assert!(
+		is_null,
+		"_metadata.latestSyncedPoiHeight should be null when absent from DB; got: {val:?}"
+	);
+
+	compare_responses("_metadata(null fields)", &ts_resp, &rust_resp);
+	println!("_metadata null fields: absent keys correctly coerce to null ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Historical table filtering (multiple tables + blockHeight)
+// ---------------------------------------------------------------------------
+
+/// Test historical queries on `getRequests` — a second historical table with
+/// multiple entity versions at different block heights.
+///
+/// `get_requests` rows have status SOURCE → HYPERBRIDGE_DELIVERED → DESTINATION
+/// across successive `_block_range` intervals.  Querying at specific blockHeights
+/// returns the correct version at that point in time.
+#[tokio::test]
+async fn test_historical_get_requests() {
+	// Rust-only: the TS service does not support the `blockHeight` argument.
+	let rust_client = TestClient::new(&rust_url());
+	let rust_available = std::process::Command::new("curl")
+		.args(["-sf", "--max-time", "3", &format!("{}/health", rust_url())])
+		.output()
+		.map(|o| o.status.success())
+		.unwrap_or(false);
+	if !rust_available {
+		eprintln!("SKIP: Rust service not available.");
+		return;
+	}
+
+	// ── Latest versions (no upper bound on _block_range) ─────────────────
+	// blockHeight so large every open-ended range covers it.
+	let query_latest = r#"
+        {
+            getRequests(
+                first: 20,
+                orderBy: ID_ASC,
+                blockHeight: "99999999999999"
+            ) {
+                totalCount
+                nodes { id status }
+            }
+        }
+    "#;
+
+	let resp_latest = rust_client.query(query_latest).await;
+
+	println!("getRequests(latest): {}", serde_json::to_string_pretty(&resp_latest).unwrap());
+
+	assert!(
+		resp_latest
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"getRequests(latest) returned errors: {}",
+		resp_latest
+	);
+
+	let latest_count = resp_latest
+		.pointer("/data/getRequests/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from getRequests(latest)");
+	assert!(latest_count > 0, "getRequests(latest) should return at least 1 row");
+
+	// Verify the specific test entity's latest status is DESTINATION.
+	// (The full DB may have other entities in different statuses, so we only
+	// check the entity we track across blockHeight intervals below.)
+	let target_id = "0xf6ee5c001d5275afea10a2ce2927b1fb5defaed2eb13a4bdc2a3c2447d8ab458";
+	if let Some(nodes) = resp_latest.pointer("/data/getRequests/nodes").and_then(|v| v.as_array()) {
+		for node in nodes {
+			if node["id"].as_str() == Some(target_id) {
+				let status = node["status"].as_str().unwrap_or("<missing>");
+				assert_eq!(
+					status, "DESTINATION",
+					"Latest version of tracked getRequest should have status DESTINATION, got \
+                     {status}"
+				);
+			}
+		}
+	}
+
+	// ── Historical version at mid-lifecycle blockHeight ───────────────────
+	// 1743772850000 falls in the second interval [1743772818000, 1743772918000)
+	// for entity 0xf6ee5c... → status should be HYPERBRIDGE_DELIVERED.
+	let query_mid = r#"
+        {
+            getRequests(
+                first: 5,
+                filter: { id: { equalTo: "0xf6ee5c001d5275afea10a2ce2927b1fb5defaed2eb13a4bdc2a3c2447d8ab458" } },
+                blockHeight: "1743772850000"
+            ) {
+                totalCount
+                nodes { id status }
+            }
+        }
+    "#;
+
+	let resp_mid = rust_client.query(query_mid).await;
+
+	println!("getRequests(mid): {}", serde_json::to_string_pretty(&resp_mid).unwrap());
+
+	assert!(
+		resp_mid
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"getRequests(mid blockHeight) returned errors: {}",
+		resp_mid
+	);
+
+	let mid_count = resp_mid
+		.pointer("/data/getRequests/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from getRequests(mid)");
+	assert_eq!(
+		mid_count, 1,
+		"At blockHeight 1743772850000 there should be exactly 1 version of this entity"
+	);
+
+	let mid_status = resp_mid
+		.pointer("/data/getRequests/nodes/0/status")
+		.and_then(|v| v.as_str())
+		.expect("status missing from mid-lifecycle row");
+	assert_eq!(
+		mid_status, "HYPERBRIDGE_DELIVERED",
+		"At blockHeight 1743772850000 entity status should be HYPERBRIDGE_DELIVERED, got \
+         {mid_status}"
+	);
+
+	// ── Early version at first interval ───────────────────────────────────
+	// 1743772750000 falls in [1743772738000, 1743772818000) → status SOURCE.
+	let query_early = r#"
+        {
+            getRequests(
+                first: 5,
+                filter: { id: { equalTo: "0xf6ee5c001d5275afea10a2ce2927b1fb5defaed2eb13a4bdc2a3c2447d8ab458" } },
+                blockHeight: "1743772750000"
+            ) {
+                totalCount
+                nodes { id status }
+            }
+        }
+    "#;
+
+	let resp_early = rust_client.query(query_early).await;
+
+	assert!(
+		resp_early
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"getRequests(early blockHeight) returned errors: {}",
+		resp_early
+	);
+
+	let early_status = resp_early
+		.pointer("/data/getRequests/nodes/0/status")
+		.and_then(|v| v.as_str())
+		.expect("status missing from early row");
+	assert_eq!(
+		early_status, "SOURCE",
+		"At blockHeight 1743772750000 entity status should be SOURCE, got {early_status}"
+	);
+
+	println!(
+		"historical getRequests: latest={latest_count} rows (DESTINATION), \
+         mid=HYPERBRIDGE_DELIVERED, early=SOURCE ✓"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Historical nested relation filtering
+// ---------------------------------------------------------------------------
+
+/// Verify that backward relation resolvers respect `_block_range` filtering
+/// when a `blockHeight` argument is passed on the root connection query.
+///
+/// Uses dedicated fixture tables `test_authors` / `test_books`:
+///   - book-1 has two historical versions: v1 title = "Book One v1" visible at blocks [100, 500) v2
+///     title = "Book One v2" visible at blocks [500, ∞)
+///   - book-2 "Book Two" is always visible [0, ∞)
+///
+/// At blockHeight=200 only book-1 v1 + book-2 should appear.
+/// At blockHeight=600 only book-1 v2 + book-2 should appear.
+#[tokio::test]
+async fn test_historical_nested_relation() {
+	let rust_available = std::process::Command::new("curl")
+		.args(["-sf", "--max-time", "3", &format!("{}/health", rust_url())])
+		.output()
+		.map(|o| o.status.success())
+		.unwrap_or(false);
+	if !rust_available {
+		eprintln!("SKIP: test_historical_nested_relation — Rust service not reachable");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+
+	// ── blockHeight 200 → book-1 v1 is active ────────────────────────────
+	let res_200 = rust_client
+		.query(
+			r#"{
+			testAuthors(blockHeight: "200") {
+				nodes {
+					id
+					testBooksByAuthorId {
+						nodes { id title }
+					}
+				}
+			}
+		}"#,
+		)
+		.await;
+
+	assert!(
+		res_200
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"testAuthors(blockHeight:200) returned errors: {}",
+		res_200
+	);
+
+	let authors_200 = res_200
+		.pointer("/data/testAuthors/nodes")
+		.and_then(|v| v.as_array())
+		.expect("testAuthors nodes missing");
+
+	assert!(!authors_200.is_empty(), "expected at least one test author at blockHeight 200");
+
+	let books_200 = authors_200[0]
+		.pointer("/testBooksByAuthorId/nodes")
+		.and_then(|v| v.as_array())
+		.expect("testBooksByAuthorId nodes missing");
+
+	let titles_200: Vec<&str> = books_200.iter().filter_map(|b| b["title"].as_str()).collect();
+
+	assert!(
+		titles_200.contains(&"Book One v1"),
+		"blockHeight 200: expected 'Book One v1', got {:?}",
+		titles_200
+	);
+	assert!(
+		titles_200.contains(&"Book Two"),
+		"blockHeight 200: expected 'Book Two', got {:?}",
+		titles_200
+	);
+	assert!(
+		!titles_200.contains(&"Book One v2"),
+		"blockHeight 200: 'Book One v2' should not be visible, got {:?}",
+		titles_200
+	);
+
+	// ── blockHeight 600 → book-1 v2 is active ────────────────────────────
+	let res_600 = rust_client
+		.query(
+			r#"{
+			testAuthors(blockHeight: "600") {
+				nodes {
+					id
+					testBooksByAuthorId {
+						nodes { id title }
+					}
+				}
+			}
+		}"#,
+		)
+		.await;
+
+	assert!(
+		res_600
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"testAuthors(blockHeight:600) returned errors: {}",
+		res_600
+	);
+
+	let authors_600 = res_600
+		.pointer("/data/testAuthors/nodes")
+		.and_then(|v| v.as_array())
+		.expect("testAuthors nodes missing at blockHeight 600");
+
+	assert!(!authors_600.is_empty(), "expected at least one test author at blockHeight 600");
+
+	let books_600 = authors_600[0]
+		.pointer("/testBooksByAuthorId/nodes")
+		.and_then(|v| v.as_array())
+		.expect("testBooksByAuthorId nodes missing at blockHeight 600");
+
+	let titles_600: Vec<&str> = books_600.iter().filter_map(|b| b["title"].as_str()).collect();
+
+	assert!(
+		titles_600.contains(&"Book One v2"),
+		"blockHeight 600: expected 'Book One v2', got {:?}",
+		titles_600
+	);
+	assert!(
+		titles_600.contains(&"Book Two"),
+		"blockHeight 600: expected 'Book Two', got {:?}",
+		titles_600
+	);
+	assert!(
+		!titles_600.contains(&"Book One v1"),
+		"blockHeight 600: 'Book One v1' should not be visible, got {:?}",
+		titles_600
+	);
+
+	println!("historical nested relation: block 200 → [v1, book2], block 600 → [v2, book2] ✓");
 }

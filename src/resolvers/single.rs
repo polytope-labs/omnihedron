@@ -48,8 +48,8 @@ pub async fn resolve_single(
 
 /// Resolve a `{entity}ByNodeId(nodeId: ID!)` query.
 ///
-/// Decodes the PostGraphile-compatible nodeId (base64 `[typeName, pkValue]`)
-/// and performs a lookup by the `id` primary key column.
+/// Decodes the PostGraphile-compatible nodeId (base64 `[table_name, _id_uuid]`)
+/// and performs a lookup by the internal `_id` UUID column.
 pub async fn resolve_by_node_id(
 	ctx: &ResolverContext<'_>,
 	pool: &Pool,
@@ -63,7 +63,7 @@ pub async fn resolve_by_node_id(
 		.map(str::to_string)
 		.ok_or_else(|| async_graphql::Error::new("Missing required argument: nodeId"))?;
 
-	let (_type_name, pk_value) = decode_node_id(&node_id)
+	let (_table_name, pk_value) = decode_node_id(&node_id)
 		.map_err(|e| async_graphql::Error::new(format!("Invalid nodeId: {e}")))?;
 
 	let pk_str = match &pk_value {
@@ -73,7 +73,9 @@ pub async fn resolve_by_node_id(
 	};
 
 	let schema = &cfg.name;
-	let sql = format!(r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t.id = $1 LIMIT 1"#);
+	// Look up by the internal _id UUID column (PostGraphile-compatible nodeId encoding).
+	let sql =
+		format!(r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t."_id"::text = $1 LIMIT 1"#);
 
 	debug!(sql = %sql, "Executing byNodeId query");
 

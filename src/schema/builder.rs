@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use async_graphql::{Value as GqlValue, dynamic::*};
+use async_graphql::{Name, Value as GqlValue, dynamic::*};
 use deadpool_postgres::Pool;
 use tracing::info;
 
@@ -12,7 +12,7 @@ use crate::{
 	},
 	resolvers,
 	schema::{
-		aggregates::register_aggregate_types,
+		aggregates::{register_aggregate_types, register_grouped_aggregate_types},
 		cursor::encode_node_id,
 		filters::{filter_type_for as scalar_filter_for, register_scalar_filters},
 		inflector::{
@@ -62,6 +62,16 @@ pub fn build_schema(
 	}
 
 	// ── Root Query type ───────────────────────────────────────────────────────
+	// Build a table_name → type_name map for the node() resolver.
+	// nodeId encodes [table_name, _id_uuid], so we decode table_name and map to the
+	// GraphQL type name for FieldValue::with_type().
+	let table_to_type: std::collections::HashMap<String, String> = tables
+		.iter()
+		.filter(|t| t.columns.iter().any(|c| c.name == "_id"))
+		.map(|t| (t.name.clone(), table_to_type_name(&t.name)))
+		.collect();
+	let table_to_type = Arc::new(table_to_type);
+
 	let mut query = Object::new("Query");
 	for table in tables {
 		let type_name = table_to_type_name(&table.name);
@@ -138,7 +148,7 @@ pub fn build_schema(
 		);
 
 		// {entity}ByNodeId query
-		let by_node_id_field = format!("{type_name}ByNodeId");
+		let by_node_id_field = format!("{single_field}ByNodeId");
 		let pool_clone3 = pool.clone();
 		let table_name3 = table.name.clone();
 		let cfg_clone3 = cfg.clone();
@@ -181,16 +191,60 @@ pub fn build_schema(
 		.argument(InputValue::new("filter", TypeRef::named("BigIntFilter"))),
 	);
 
-	// ── node(id) root query — anchors the Node interface in the schema ────────
-	// PostGraphile exposes a `node(nodeId: ID!): Node` root field so that the
-	// Node interface is always reachable from the schema root.  Our resolver
-	// always returns null (we rely on per-entity single-record queries instead).
-	query = query.field(
-		Field::new("node", TypeRef::named("Node"), |_ctx| {
-			FieldFuture::new(async move { Ok(None::<FieldValue>) })
-		})
-		.argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
-	);
+	// ── node(nodeId: ID!): Node root query ───────────────────────────────────
+	// Decodes the PostGraphile-compatible nodeId [table_name, _id_uuid], maps
+	// table_name → GraphQL TypeName, fetches by _id, and returns with the
+	// concrete type so inline fragments (`... on AssetTeleported { id }`) work.
+	{
+		let pool_node = pool.clone();
+		let cfg_node = cfg.clone();
+		let table_to_type_node = table_to_type.clone();
+		query = query.field(
+			Field::new("node", TypeRef::named("Node"), move |ctx| {
+				let pool = pool_node.clone();
+				let cfg = cfg_node.clone();
+				let table_to_type = table_to_type_node.clone();
+				FieldFuture::new(async move {
+					use crate::schema::cursor::decode_node_id;
+					let node_id_str = ctx
+						.args
+						.get("nodeId")
+						.and_then(|v| v.string().ok())
+						.map(str::to_string)
+						.ok_or_else(|| {
+							async_graphql::Error::new("Missing required argument: nodeId")
+						})?;
+					let (table_name, pk_val) = decode_node_id(&node_id_str)
+						.map_err(|e| async_graphql::Error::new(format!("Invalid nodeId: {e}")))?;
+					let type_name = table_to_type.get(&table_name).cloned().ok_or_else(|| {
+						async_graphql::Error::new(format!("Unknown table: {table_name}"))
+					})?;
+					let pk_str = match &pk_val {
+						serde_json::Value::String(s) => s.clone(),
+						serde_json::Value::Number(n) => n.to_string(),
+						other => other.to_string(),
+					};
+					let schema = &cfg.name;
+					let sql = format!(
+						r#"SELECT * FROM "{schema}"."{table_name}" AS t WHERE t."_id"::text = $1 LIMIT 1"#
+					);
+					let client = pool.get().await?;
+					use tokio_postgres::types::ToSql;
+					let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(pk_str)];
+					let pg_refs: Vec<&(dyn ToSql + Sync)> =
+						params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
+					let rows = client.query(&sql, &pg_refs).await?;
+					if rows.is_empty() {
+						return Ok(None);
+					}
+					use crate::resolvers::connection::row_to_json;
+					let row_val = row_to_json(&rows[0]);
+					Ok(Some(FieldValue::with_type(FieldValue::owned_any(row_val), type_name)))
+				})
+			})
+			.argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+		);
+	}
 
 	// ── _metadata queries ─────────────────────────────────────────────────────
 	{
@@ -291,8 +345,10 @@ fn register_null_order(builder: SchemaBuilder) -> SchemaBuilder {
 }
 
 fn register_node_interface(builder: SchemaBuilder) -> SchemaBuilder {
+	// PostGraphile's Node interface uses `id: ID!` where `id` is the base64 nodeId.
+	// In omnihedron, this is exposed as `nodeId: ID!` on every entity type.
 	builder.register(
-		Interface::new("Node").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID))),
+		Interface::new("Node").field(InterfaceField::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
 	)
 }
 
@@ -337,21 +393,39 @@ fn register_table_types(
 	let edge_type_name = format!("{plural_type_name}Edge");
 
 	// ── Entity type ────────────────────────────────────────────────────────
-	let mut entity_obj = Object::new(&type_name);
+	// Only implement the Node interface for entities that have an `id` column —
+	// the interface requires `id: ID!` which tables like `_global` (no id column) lack.
+	let has_id_col = table.public_columns().any(|c| c.name == "id");
+	let mut entity_obj = if has_id_col {
+		Object::new(&type_name).implement("Node")
+	} else {
+		Object::new(&type_name)
+	};
 
-	// nodeId: PostGraphile computed field — base64(["TypeName", pkValue])
-	// Uses the first primary key column, falling back to "id".
+	// nodeId: PostGraphile-compatible computed field.
+	// Format: base64(["table_name", _id_uuid]) — matches PostGraphile exactly.
+	// `_id` is always fetched in the SELECT (see filter_columns_by_request rule 2).
+	// Falls back to base64(["table_name", id_string]) for tables without `_id`.
 	{
-		let pk_col = table.primary_keys.first().cloned().unwrap_or_else(|| "id".to_string());
-		let type_name_for_node = type_name.clone();
+		let has_internal_id = table.columns.iter().any(|c| c.name == "_id");
+		let table_name_for_node = table.name.clone();
+		let fallback_pk = if has_id_col {
+			"id".to_string()
+		} else {
+			table.primary_keys.first().cloned().unwrap_or_else(|| "id".to_string())
+		};
 		entity_obj =
 			entity_obj.field(Field::new("nodeId", TypeRef::named_nn(TypeRef::ID), move |ctx| {
-				let pk = pk_col.clone();
-				let type_name = type_name_for_node.clone();
+				let table_name = table_name_for_node.clone();
+				let fallback = fallback_pk.clone();
 				FieldFuture::new(async move {
 					let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
-					let pk_val = parent.get(&pk).cloned().unwrap_or(serde_json::Value::Null);
-					let node_id = encode_node_id(&type_name, &pk_val);
+					let pk_val = if has_internal_id {
+						parent.get("_id").cloned().unwrap_or(serde_json::Value::Null)
+					} else {
+						parent.get(&fallback).cloned().unwrap_or(serde_json::Value::Null)
+					};
+					let node_id = encode_node_id(&table_name, &pk_val);
 					Ok(Some(GqlValue::String(node_id)))
 				})
 			}));
@@ -361,6 +435,7 @@ fn register_table_types(
 		let (base_gql_type, _) = pg_type_to_graphql(&col.pg_type, &col.udt_name);
 		// For enum columns use the resolved display name; fall back to scalar mapping.
 		let gql_type: &str = col.enum_display_name.as_deref().unwrap_or(base_gql_type);
+		let is_enum = col.enum_display_name.is_some();
 		let field_name = to_camel_case(&col.name);
 		let type_ref =
 			if col.is_nullable { TypeRef::named(gql_type) } else { TypeRef::named_nn(gql_type) };
@@ -369,7 +444,15 @@ fn register_table_types(
 			let col = col_name.clone();
 			FieldFuture::new(async move {
 				let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
-				Ok(json_field_to_gql_value(parent, &col))
+				if is_enum {
+					// async-graphql requires GqlValue::Enum for enum fields.
+					Ok(parent
+						.get(&col)
+						.and_then(|v| v.as_str())
+						.map(|s| GqlValue::Enum(Name::new(s))))
+				} else {
+					Ok(json_field_to_gql_value(parent, &col))
+				}
 			})
 		}));
 	}
@@ -381,6 +464,13 @@ fn register_table_types(
 		let fk_col = fk.column.clone();
 		let foreign_table = fk.foreign_table.clone();
 		let pool_clone = pool.clone();
+		// Determine whether the related table is historical so the resolver can
+		// apply `_block_range` filtering when a blockHeight is inherited.
+		let foreign_is_historical = all_tables
+			.iter()
+			.find(|t| t.name == fk.foreign_table)
+			.map(|t| t.is_historical)
+			.unwrap_or(false);
 
 		entity_obj =
 			entity_obj.field(Field::new(field_name, TypeRef::named(&related_type), move |ctx| {
@@ -393,6 +483,7 @@ fn register_table_types(
 						&pool,
 						&foreign_table,
 						&fk_col,
+						foreign_is_historical,
 					)
 					.await?;
 					Ok(maybe.map(FieldValue::owned_any))
@@ -410,6 +501,7 @@ fn register_table_types(
 				let child_table = other_table.name.clone();
 				let fk_col = fk.column.clone();
 				let pool_clone = pool.clone();
+				let child_is_historical = other_table.is_historical;
 
 				entity_obj = entity_obj.field(
 					Field::new(field_name, TypeRef::named_nn(&child_conn_type), move |ctx| {
@@ -422,6 +514,7 @@ fn register_table_types(
 								&pool,
 								&child_table,
 								&fk_col,
+								child_is_historical,
 							)
 							.await?;
 							Ok(maybe.map(FieldValue::owned_any))
@@ -500,6 +593,10 @@ fn register_table_types(
 			register_aggregate_types(table, builder);
 		builder = new_builder;
 
+		// Clone before moving into closures so grouped aggregates can share them.
+		let numeric_cols_gagg = numeric_cols.clone();
+		let all_cols_gagg = all_cols.clone();
+
 		let pool_agg = pool.clone();
 		conn_obj =
 			conn_obj.field(Field::new("aggregates", TypeRef::named(&agg_type_name), move |ctx| {
@@ -513,6 +610,36 @@ fn register_table_types(
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			}));
+
+		let (new_builder, agg_group_type_name, group_by_enum_name) =
+			register_grouped_aggregate_types(table, builder);
+		builder = new_builder;
+
+		let pool_gagg = pool.clone();
+		conn_obj = conn_obj.field(
+			Field::new(
+				"groupedAggregates",
+				TypeRef::named_nn_list(&agg_group_type_name),
+				move |ctx| {
+					let pool = pool_gagg.clone();
+					let num_cols = numeric_cols_gagg.clone();
+					let all = all_cols_gagg.clone();
+					FieldFuture::new(async move {
+						let maybe = resolvers::aggregates::resolve_grouped_aggregates(
+							&ctx, &pool, &num_cols, &all,
+						)
+						.await?;
+						match maybe {
+							Some(serde_json::Value::Array(groups)) => Ok(Some(FieldValue::list(
+								groups.into_iter().map(FieldValue::owned_any),
+							))),
+							_ => Ok(Some(FieldValue::list(std::iter::empty::<FieldValue>()))),
+						}
+					})
+				},
+			)
+			.argument(InputValue::new("groupBy", TypeRef::named_nn_list(&group_by_enum_name))),
+		);
 	}
 
 	builder = builder.register(conn_obj);
