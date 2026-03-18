@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::sync::Arc;
 
 use async_graphql::{Name, Value as GqlValue, dynamic::*};
@@ -16,8 +31,9 @@ use crate::{
 		cursor::encode_node_id,
 		filters::{filter_type_for as scalar_filter_for, register_scalar_filters},
 		inflector::{
-			backward_relation_field, table_to_connection_field, table_to_plural_type_name,
-			table_to_single_field, table_to_type_name, to_camel_case, to_screaming_snake,
+			backward_relation_field, forward_relation_field, table_to_connection_field,
+			table_to_plural_type_name, table_to_single_field, table_to_type_name, to_camel_case,
+			to_screaming_snake,
 		},
 		metadata::register_metadata_types,
 		subscriptions::register_subscriptions,
@@ -25,11 +41,16 @@ use crate::{
 };
 
 /// Build the complete dynamic GraphQL schema from an introspected set of tables.
+///
+/// `historical_arg_name` controls whether historical tables expose a `blockHeight`
+/// or `timestamp` argument. TS reads `historicalStateEnabled` from `_metadata`;
+/// if `"timestamp"`, this should be `"timestamp"`, otherwise `"blockHeight"`.
 pub fn build_schema(
 	tables: &[TableInfo],
 	enums: &[EnumInfo],
 	pool: Arc<Pool>,
 	cfg: Arc<Config>,
+	historical_arg_name: &str,
 ) -> anyhow::Result<Schema> {
 	info!(table_count = tables.len(), "Building GraphQL schema");
 
@@ -87,25 +108,32 @@ pub fn build_schema(
 		let is_historical = table.is_historical;
 		let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
 
+		// Build filter context for relation-aware filtering
+		let filter_ctx = build_filter_context(table, tables, &cfg.name);
+		let filter_ctx = Arc::new(filter_ctx);
+
 		// Connection (list) query
 		let mut conn_field = Field::new(&connection_field, TypeRef::named_nn(&connection_type), {
 			let pool = pool_clone.clone();
 			let table_name = table.name.clone();
 			let cfg = cfg_clone.clone();
 			let col_names = col_names.clone();
+			let filter_ctx = filter_ctx.clone();
 			move |ctx| {
 				let pool = pool.clone();
 				let table_name = table_name.clone();
 				let cfg = cfg.clone();
 				let col_names = col_names.clone();
+				let filter_ctx = filter_ctx.clone();
 				FieldFuture::new(async move {
-					let maybe = resolvers::connection::resolve_connection(
+					let maybe = resolvers::connection::resolve_connection_ctx(
 						&ctx,
 						&pool,
 						&table_name,
 						&cfg,
 						is_historical,
 						&col_names,
+						&filter_ctx,
 					)
 					.await?;
 					Ok(maybe.map(FieldValue::owned_any))
@@ -124,7 +152,7 @@ pub fn build_schema(
 
 		if table.is_historical {
 			conn_field = conn_field
-				.argument(InputValue::new("blockHeight", TypeRef::named(TypeRef::STRING)));
+				.argument(InputValue::new(historical_arg_name, TypeRef::named(TypeRef::STRING)));
 		}
 
 		query = query.field(conn_field);
@@ -460,7 +488,7 @@ fn register_table_types(
 	// ── Forward relation fields (FK → single related record) ───────────────
 	for fk in &table.foreign_keys {
 		let related_type = table_to_type_name(&fk.foreign_table);
-		let field_name = to_camel_case(&fk.foreign_table); // e.g. account
+		let field_name = forward_relation_field(&fk.column); // e.g. author (from author_id)
 		let fk_col = fk.column.clone();
 		let foreign_table = fk.foreign_table.clone();
 		let pool_clone = pool.clone();
@@ -491,42 +519,134 @@ fn register_table_types(
 			}));
 	}
 
-	// ── Backward relation fields (child → parent connection) ───────────────
+	// ── Backward relation fields (child → parent connection or single) ────
 	for other_table in all_tables {
 		for fk in &other_table.foreign_keys {
 			if fk.foreign_table == table.name {
+				let child_type_name = table_to_type_name(&other_table.name);
 				let child_plural_type_name = table_to_plural_type_name(&other_table.name);
-				let child_conn_type = format!("{child_plural_type_name}Connection");
 				let field_name = backward_relation_field(&other_table.name, &fk.column);
 				let child_table = other_table.name.clone();
 				let fk_col = fk.column.clone();
 				let pool_clone = pool.clone();
+				let cfg_clone = cfg.clone();
 				let child_is_historical = other_table.is_historical;
 
-				entity_obj = entity_obj.field(
-					Field::new(field_name, TypeRef::named_nn(&child_conn_type), move |ctx| {
-						let pool = pool_clone.clone();
-						let child_table = child_table.clone();
-						let fk_col = fk_col.clone();
-						FieldFuture::new(async move {
-							let maybe = resolvers::relations::resolve_backward_relation(
-								&ctx,
-								&pool,
-								&child_table,
-								&fk_col,
-								child_is_historical,
-							)
-							.await?;
-							Ok(maybe.map(FieldValue::owned_any))
+				// One-to-one: FK column has a unique constraint → single record field
+				let is_unique = other_table.is_column_unique(&fk.column);
+
+				if is_unique {
+					// Single record backward relation (one-to-one)
+					entity_obj = entity_obj.field(Field::new(
+						field_name,
+						TypeRef::named(&child_type_name),
+						move |ctx| {
+							let pool = pool_clone.clone();
+							let child_table = child_table.clone();
+							let fk_col = fk_col.clone();
+							FieldFuture::new(async move {
+								let maybe = resolvers::relations::resolve_backward_single(
+									&ctx,
+									&pool,
+									&child_table,
+									&fk_col,
+									child_is_historical,
+								)
+								.await?;
+								Ok(maybe.map(FieldValue::owned_any))
+							})
+						},
+					));
+				} else {
+					// Many backward relation (one-to-many) → connection
+					let child_conn_type = format!("{child_plural_type_name}Connection");
+					let child_filter_type = format!("{child_type_name}Filter");
+					let child_orderby_enum = format!("{child_plural_type_name}OrderBy");
+					let child_distinct_enum = format!("{}_distinct_enum", &other_table.name);
+
+					entity_obj = entity_obj.field(
+						Field::new(field_name, TypeRef::named_nn(&child_conn_type), move |ctx| {
+							let pool = pool_clone.clone();
+							let child_table = child_table.clone();
+							let fk_col = fk_col.clone();
+							let cfg = cfg_clone.clone();
+							FieldFuture::new(async move {
+								let maybe = resolvers::relations::resolve_backward_relation(
+									&ctx,
+									&pool,
+									&child_table,
+									&fk_col,
+									child_is_historical,
+									&cfg,
+								)
+								.await?;
+								Ok(maybe.map(FieldValue::owned_any))
+							})
 						})
-					})
-					.argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
-					.argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
-					.argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
-					.argument(InputValue::new("after", TypeRef::named("Cursor")))
-					.argument(InputValue::new("before", TypeRef::named("Cursor"))),
-				);
+						.argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
+						.argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
+						.argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
+						.argument(InputValue::new("after", TypeRef::named("Cursor")))
+						.argument(InputValue::new("before", TypeRef::named("Cursor")))
+						.argument(InputValue::new(
+							"orderBy",
+							TypeRef::named_nn_list(&child_orderby_enum),
+						))
+						.argument(InputValue::new("filter", TypeRef::named(&child_filter_type)))
+						.argument(InputValue::new(
+							"distinct",
+							TypeRef::named_nn_list(&child_distinct_enum),
+						))
+						.argument(InputValue::new("orderByNull", TypeRef::named("NullOrder"))),
+					);
+				}
 			}
+		}
+	}
+
+	// ── Many-to-many relation fields (via junction tables) ───────────────
+	for junction in all_tables {
+		if !junction.is_junction_table() {
+			continue;
+		}
+		let fks = &junction.foreign_keys;
+		// For each pair of FKs in the junction table, if one points to this table,
+		// the other is the target. Register a shortcut field on this entity.
+		for (i, fk) in fks.iter().enumerate() {
+			if fk.foreign_table != table.name {
+				continue;
+			}
+			let other_fk = &fks[1 - i]; // the other FK
+			let target_plural = table_to_plural_type_name(&other_fk.foreign_table);
+			let target_conn = format!("{target_plural}Connection");
+			let field_name = table_to_connection_field(&other_fk.foreign_table);
+			let junction_name = junction.name.clone();
+			let fk_to_source = fk.column.clone();
+			let fk_to_target = other_fk.column.clone();
+			let target_table = other_fk.foreign_table.clone();
+			let pool_clone = pool.clone();
+			let cfg_clone = cfg.clone();
+
+			entity_obj = entity_obj.field(
+				Field::new(&field_name, TypeRef::named_nn(&target_conn), move |ctx| {
+					let pool = pool_clone.clone();
+					let junction = junction_name.clone();
+					let fk_src = fk_to_source.clone();
+					let fk_tgt = fk_to_target.clone();
+					let target = target_table.clone();
+					let cfg = cfg_clone.clone();
+					FieldFuture::new(async move {
+						let maybe = resolvers::relations::resolve_many_to_many(
+							&ctx, &pool, &junction, &fk_src, &fk_tgt, &target, &cfg,
+						)
+						.await?;
+						Ok(maybe.map(FieldValue::owned_any))
+					})
+				})
+				.argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
+				.argument(InputValue::new("last", TypeRef::named(TypeRef::INT)))
+				.argument(InputValue::new("offset", TypeRef::named(TypeRef::INT))),
+			);
 		}
 	}
 
@@ -653,13 +773,48 @@ fn register_table_types(
 	for col in table.public_columns() {
 		let (base_gql_type, _) = pg_type_to_graphql(&col.pg_type, &col.udt_name);
 		let field_name = to_camel_case(&col.name);
-		// For enum columns, the filter type is `{EnumDisplayName}Filter`.
 		let field_filter: String = if let Some(display_name) = &col.enum_display_name {
 			format!("{display_name}Filter")
 		} else {
 			scalar_filter_for(base_gql_type).to_string()
 		};
 		filter_obj = filter_obj.field(InputValue::new(field_name, TypeRef::named(field_filter)));
+	}
+
+	// ── Forward relation filters + Exists filters ─────────────────────────
+	for fk in &table.foreign_keys {
+		let foreign_type = table_to_type_name(&fk.foreign_table);
+		let fk_field_name = forward_relation_field(&fk.column);
+		// Forward filter: e.g. `testAuthors: TestAuthorFilter`
+		let foreign_filter = format!("{foreign_type}Filter");
+		filter_obj =
+			filter_obj.field(InputValue::new(&fk_field_name, TypeRef::named(&foreign_filter)));
+		// Exists filter: e.g. `testAuthorsExists: Boolean`
+		let exists_field = format!("{fk_field_name}Exists");
+		filter_obj =
+			filter_obj.field(InputValue::new(&exists_field, TypeRef::named(TypeRef::BOOLEAN)));
+	}
+
+	// ── Backward relation (ToMany) filters ────────────────────────────────
+	for other_table in all_tables {
+		for fk in &other_table.foreign_keys {
+			if fk.foreign_table == table.name {
+				let child_type = table_to_type_name(&other_table.name);
+				let child_filter = format!("{child_type}Filter");
+				let to_many_filter_name = format!("{type_name}ToMany{child_type}Filter");
+				let rel_field_name = backward_relation_field(&other_table.name, &fk.column);
+
+				// Register the ToMany filter input type (some/none/every)
+				let to_many_obj = InputObject::new(&to_many_filter_name)
+					.field(InputValue::new("some", TypeRef::named(&child_filter)))
+					.field(InputValue::new("none", TypeRef::named(&child_filter)))
+					.field(InputValue::new("every", TypeRef::named(&child_filter)));
+				builder = builder.register(to_many_obj);
+
+				filter_obj = filter_obj
+					.field(InputValue::new(&rel_field_name, TypeRef::named(&to_many_filter_name)));
+			}
+		}
 	}
 
 	builder = builder.register(filter_obj);
@@ -672,6 +827,37 @@ fn register_table_types(
 			.item(EnumItem::new(format!("{upper}_ASC")))
 			.item(EnumItem::new(format!("{upper}_DESC")));
 	}
+
+	// ── Aggregate orderBy enum values (PgOrderByAggregatesPlugin) ─────────
+	// For each backward relation, add COUNT and per-numeric-column aggregate variants.
+	for other_table in all_tables {
+		for fk in &other_table.foreign_keys {
+			if fk.foreign_table == table.name {
+				let child_upper = to_screaming_snake(&other_table.name);
+				let fk_upper = to_screaming_snake(&fk.column);
+				let prefix = format!("{child_upper}_BY_{fk_upper}");
+
+				// Count aggregate
+				orderby = orderby
+					.item(EnumItem::new(format!("{prefix}_COUNT_ASC")))
+					.item(EnumItem::new(format!("{prefix}_COUNT_DESC")));
+
+				// Per-numeric-column aggregates
+				for col in other_table.public_columns() {
+					let (_, is_numeric) = pg_type_to_graphql(&col.pg_type, &col.udt_name);
+					if is_numeric {
+						let col_upper = to_screaming_snake(&col.name);
+						for agg in &["SUM", "AVERAGE", "MIN", "MAX"] {
+							orderby = orderby
+								.item(EnumItem::new(format!("{prefix}_{agg}_{col_upper}_ASC")))
+								.item(EnumItem::new(format!("{prefix}_{agg}_{col_upper}_DESC")));
+						}
+					}
+				}
+			}
+		}
+	}
+
 	builder = builder.register(orderby);
 
 	// ── Distinct enum ──────────────────────────────────────────────────────
@@ -683,6 +869,59 @@ fn register_table_types(
 	builder = builder.register(distinct);
 
 	builder
+}
+
+// ── Filter context builder ────────────────────────────────────────────────────
+
+fn build_filter_context(
+	table: &TableInfo,
+	all_tables: &[TableInfo],
+	schema: &str,
+) -> crate::sql::filter::FilterContext {
+	use crate::sql::filter::{BackwardRelInfo, FilterContext, ForwardRelInfo};
+
+	let mut ctx = FilterContext::default();
+
+	// Forward relations + Exists
+	for fk in &table.foreign_keys {
+		let field_name = forward_relation_field(&fk.column);
+		let foreign_is_historical = all_tables
+			.iter()
+			.find(|t| t.name == fk.foreign_table)
+			.map(|t| t.is_historical)
+			.unwrap_or(false);
+		ctx.forward_relations.insert(
+			field_name.clone(),
+			ForwardRelInfo {
+				schema: schema.to_string(),
+				foreign_table: fk.foreign_table.clone(),
+				fk_column: fk.column.clone(),
+				foreign_pk: "id".to_string(),
+				is_historical: foreign_is_historical,
+			},
+		);
+		ctx.exists_fields.insert(format!("{field_name}Exists"), fk.column.clone());
+	}
+
+	// Backward relations
+	for other in all_tables {
+		for fk in &other.foreign_keys {
+			if fk.foreign_table == table.name {
+				let rel_name = backward_relation_field(&other.name, &fk.column);
+				ctx.backward_relations.insert(
+					rel_name,
+					BackwardRelInfo {
+						schema: schema.to_string(),
+						child_table: other.name.clone(),
+						fk_column: fk.column.clone(),
+						is_historical: other.is_historical,
+					},
+				);
+			}
+		}
+	}
+
+	ctx
 }
 
 // ── Value helpers ─────────────────────────────────────────────────────────────

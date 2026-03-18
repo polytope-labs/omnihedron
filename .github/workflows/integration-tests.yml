@@ -80,7 +80,7 @@ jobs:
           done
 
       - name: Run integration tests
-        run: cargo test --test integration_test -- --nocapture
+        run: cargo test --tests -- --nocapture
 
       # ── Query-limit tests (Rust without --unsafe-mode) ─────────────────────
       - name: Stop Rust service (unsafe)
@@ -115,7 +115,7 @@ jobs:
           done
 
       - name: Run query-limit tests
-        run: cargo test --test integration_test test_query_limit -- --ignored --nocapture
+        run: cargo test --test test_limits -- --ignored --nocapture
 
       - name: Show service logs on failure
         if: failure()

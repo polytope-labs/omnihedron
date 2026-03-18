@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Data model for PostgreSQL schema introspection results.
 //!
 //! These structs are populated by [`super::queries`] at startup and on every
@@ -31,6 +46,25 @@ impl TableInfo {
 	/// (excludes internal SubQuery columns such as `_block_range` and `_id`).
 	pub fn public_columns(&self) -> impl Iterator<Item = &ColumnInfo> {
 		self.columns.iter().filter(|c| !is_internal_column(&c.name))
+	}
+
+	/// Returns `true` if the given column is covered by a single-column unique constraint,
+	/// indicating a one-to-one relationship when used as a foreign key.
+	pub fn is_column_unique(&self, col: &str) -> bool {
+		self.unique_constraints.iter().any(|uc| uc.len() == 1 && uc[0] == col)
+	}
+
+	/// Returns `true` if this table is a junction table (many-to-many link):
+	/// exactly 2 foreign keys, and no public columns other than `id` and the FK columns.
+	pub fn is_junction_table(&self) -> bool {
+		if self.foreign_keys.len() != 2 {
+			return false;
+		}
+		let fk_cols: std::collections::HashSet<&str> =
+			self.foreign_keys.iter().map(|fk| fk.column.as_str()).collect();
+		self.public_columns()
+			.filter(|c| c.name != "id" && !fk_cols.contains(c.name.as_str()))
+			.count() == 0
 	}
 }
 

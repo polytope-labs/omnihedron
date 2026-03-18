@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Metadata resolver — `_metadata` and `_metadatas` query fields.
 //!
 //! Reads from the `_metadata` key/value table present in every SubQuery
@@ -36,6 +51,14 @@ fn try_reparse_json_string(v: Value) -> Value {
 
 use crate::config::Config;
 
+/// Cached default metadata table name (no chainId).
+static DEFAULT_METADATA_TABLE: std::sync::OnceLock<tokio::sync::Mutex<Option<String>>> =
+	std::sync::OnceLock::new();
+
+fn default_cache() -> &'static tokio::sync::Mutex<Option<String>> {
+	DEFAULT_METADATA_TABLE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
 /// Find the most appropriate metadata table in the given schema.
 /// Priority:
 ///   1. Plain `_metadata` (single-chain projects)
@@ -46,6 +69,14 @@ async fn find_metadata_table(
 	schema: &str,
 	chain_id: Option<&str>,
 ) -> Option<String> {
+	// Return cached default table if no chainId requested
+	if chain_id.is_none() {
+		let cache = default_cache().lock().await;
+		if let Some(ref cached) = *cache {
+			return Some(cached.clone());
+		}
+	}
+
 	let sql = "SELECT table_name FROM information_schema.tables \
                WHERE table_schema = $1 \
                  AND (table_name = '_metadata' OR table_name LIKE '_metadata_0x%') \
@@ -59,7 +90,11 @@ async fn find_metadata_table(
 
 	// Prefer plain _metadata
 	if tables.iter().any(|t| t == "_metadata") {
-		return Some("_metadata".to_string());
+		let result = "_metadata".to_string();
+		if chain_id.is_none() {
+			*default_cache().lock().await = Some(result.clone());
+		}
+		return Some(result);
 	}
 
 	// If chainId requested, try to find matching table by querying 'chain' key
@@ -69,7 +104,6 @@ async fn find_metadata_table(
 				format!(r#"SELECT value FROM "{schema}"."{table}" WHERE key = 'chain' LIMIT 1"#);
 			if let Ok(row) = client.query_opt(&check_sql, &[]).await {
 				if let Some(row) = row {
-					// value column is jsonb
 					let val: Option<Value> = row.try_get::<_, Value>(0).ok();
 					let chain_val = val.as_ref().and_then(|v| v.as_str()).unwrap_or("");
 					if chain_val == cid {
@@ -81,7 +115,11 @@ async fn find_metadata_table(
 	}
 
 	// Fallback: first table
-	Some(tables.into_iter().next().unwrap())
+	let result = tables.into_iter().next().unwrap();
+	if chain_id.is_none() {
+		*default_cache().lock().await = Some(result.clone());
+	}
+	Some(result)
 }
 
 pub async fn resolve_metadata(
@@ -167,6 +205,11 @@ pub async fn resolve_metadata(
 	meta.insert("dbSize".to_string(), json!(db_size.to_string()));
 	meta.insert("queryNodeVersion".to_string(), json!(env!("CARGO_PKG_VERSION")));
 
+	// Merge fields from --indexer HTTP API (if configured)
+	if let Some(ref indexer_url) = cfg.indexer {
+		merge_indexer_metadata(&mut meta, indexer_url).await;
+	}
+
 	Ok(Some(Value::Object(meta)))
 }
 
@@ -230,4 +273,40 @@ pub async fn resolve_metadatas(
 		"nodes": nodes,
 		"edges": edges,
 	})))
+}
+
+/// Fetch metadata from the indexer HTTP API and merge into the existing metadata map.
+/// Matches TS `GetMetadataPlugin.ts` behaviour: GET `{indexer_url}/meta` and `/health`.
+async fn merge_indexer_metadata(meta: &mut serde_json::Map<String, Value>, indexer_url: &str) {
+	let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()
+	{
+		Ok(c) => c,
+		Err(_) => return,
+	};
+
+	// Fetch /meta
+	let meta_url = format!("{}/meta", indexer_url.trim_end_matches('/'));
+	if let Ok(resp) = client.get(&meta_url).send().await {
+		if let Ok(body) = resp.json::<Value>().await {
+			if let Some(obj) = body.as_object() {
+				for (k, v) in obj {
+					// Only merge fields not already present from DB
+					if !meta.contains_key(k) {
+						meta.insert(k.clone(), v.clone());
+					}
+				}
+			}
+		}
+	}
+
+	// Fetch /health for indexerHealthy
+	let health_url = format!("{}/health", indexer_url.trim_end_matches('/'));
+	match client.get(&health_url).send().await {
+		Ok(resp) => {
+			meta.insert("indexerHealthy".to_string(), json!(resp.status().is_success()));
+		},
+		Err(_) => {
+			meta.insert("indexerHealthy".to_string(), json!(false));
+		},
+	}
 }

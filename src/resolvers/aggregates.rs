@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Aggregate resolver — count, sum, min, max, avg, stddev, variance.
 //!
 //! [`resolve_aggregates`] executes a single `SELECT COUNT(*), SUM(col), ...`
@@ -340,18 +355,25 @@ pub async fn resolve_grouped_aggregates(
 	let mut groups: Vec<Value> = Vec::with_capacity(rows.len());
 
 	for row in &rows {
-		// Build `keys` object from grouped columns (use the column name as the lookup key).
+		// Build `keys` as an array of string values (matches PostGraphile's `[String!]` type).
 		let keys: Value = if parsed_items.is_empty() {
 			Value::Null
 		} else {
 			let raw = row_to_json(row);
-			let mut keys_map = serde_json::Map::new();
-			for item in &parsed_items {
-				let field_name = crate::schema::inflector::to_camel_case(&item.col);
-				let v = raw.get(item.col.as_str()).cloned().unwrap_or(Value::Null);
-				keys_map.insert(field_name, v);
-			}
-			Value::Object(keys_map)
+			let arr: Vec<Value> = parsed_items
+				.iter()
+				.map(|item| {
+					let v = raw.get(item.col.as_str()).cloned().unwrap_or(Value::Null);
+					match v {
+						Value::String(s) => Value::String(s),
+						Value::Number(n) => Value::String(n.to_string()),
+						Value::Bool(b) => Value::String(b.to_string()),
+						Value::Null => Value::String(String::new()),
+						other => Value::String(other.to_string()),
+					}
+				})
+				.collect();
+			Value::Array(arr)
 		};
 
 		// distinctCount

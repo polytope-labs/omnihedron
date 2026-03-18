@@ -4637,14 +4637,14 @@ ALTER TABLE app.test_authors ADD CONSTRAINT test_authors_id_unique UNIQUE (id);
 CREATE TABLE app.test_books (
     id text NOT NULL,
     title text NOT NULL,
-    author_id text NOT NULL,
+    creator_id text NOT NULL,
     _id uuid NOT NULL,
     _block_range int8range NOT NULL
 );
 
 ALTER TABLE app.test_books ADD CONSTRAINT test_books_pkey PRIMARY KEY (_id);
-ALTER TABLE app.test_books ADD CONSTRAINT test_books_author_id_fkey
-    FOREIGN KEY (author_id) REFERENCES app.test_authors(id);
+ALTER TABLE app.test_books ADD CONSTRAINT test_books_creator_id_fkey
+    FOREIGN KEY (creator_id) REFERENCES app.test_authors(id);
 
 -- One author visible at all block heights.
 INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
@@ -4654,7 +4654,7 @@ INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
 -- book-1 v1: visible at blocks [100, 500).
 -- book-1 v2: visible at blocks [500, ∞).
 -- book-2: always visible [0, ∞).
-INSERT INTO app.test_books (_id, id, title, author_id, _block_range) VALUES
+INSERT INTO app.test_books (_id, id, title, creator_id, _block_range) VALUES
     ('22222222-2222-2222-2222-222222222201'::uuid,
      'book-1', 'Book One v1', 'author-alice', '[100,500)'::int8range),
     ('22222222-2222-2222-2222-222222222202'::uuid,

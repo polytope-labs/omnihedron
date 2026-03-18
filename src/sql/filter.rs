@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! GraphQL filter input → SQL `WHERE` clause translation.
 //!
 //! [`build_filter_sql`] recursively walks the nested filter object supplied
@@ -8,6 +23,40 @@
 //! Column names are always sourced from schema introspection and are never
 //! derived from user input.
 
+use std::collections::HashMap;
+
+/// Metadata for a forward relation filter (FK on this table → foreign table).
+#[derive(Clone, Debug)]
+pub struct ForwardRelInfo {
+	pub schema: String,
+	pub foreign_table: String,
+	pub fk_column: String,
+	pub foreign_pk: String, // usually "id"
+	pub is_historical: bool,
+}
+
+/// Metadata for a backward relation filter (FK on child table → this table).
+#[derive(Clone, Debug)]
+pub struct BackwardRelInfo {
+	pub schema: String,
+	pub child_table: String,
+	pub fk_column: String, // column in child table referencing parent
+	pub is_historical: bool,
+}
+
+/// Context for relation-aware filter SQL generation.
+#[derive(Clone, Debug, Default)]
+pub struct FilterContext {
+	/// Maps `"{camelName}Exists"` → FK column (snake_case) for existence checks.
+	pub exists_fields: HashMap<String, String>,
+	/// Maps camelCase field name → forward relation metadata.
+	pub forward_relations: HashMap<String, ForwardRelInfo>,
+	/// Maps camelCase backward relation field name → backward relation metadata.
+	pub backward_relations: HashMap<String, BackwardRelInfo>,
+	/// Counter for generating unique sub-query aliases.
+	pub sub_alias_counter: usize,
+}
+
 /// Translate a GraphQL filter input object into a SQL WHERE clause fragment
 /// and a list of bound parameters.
 ///
@@ -17,6 +66,16 @@ pub fn build_filter_sql(
 	filter: &serde_json::Value,
 	table_alias: &str,
 	param_offset: &mut usize,
+) -> (Vec<String>, Vec<serde_json::Value>) {
+	build_filter_sql_ctx(filter, table_alias, param_offset, &mut FilterContext::default())
+}
+
+/// Like [`build_filter_sql`] but with a [`FilterContext`] for relation-aware filtering.
+pub fn build_filter_sql_ctx(
+	filter: &serde_json::Value,
+	table_alias: &str,
+	param_offset: &mut usize,
+	ctx: &mut FilterContext,
 ) -> (Vec<String>, Vec<serde_json::Value>) {
 	let mut conditions = vec![];
 	let mut params = vec![];
@@ -33,7 +92,7 @@ pub fn build_filter_sql(
 					let mut sub_parts = vec![];
 					for sub in arr {
 						let (sub_conds, sub_params) =
-							build_filter_sql(sub, table_alias, param_offset);
+							build_filter_sql_ctx(sub, table_alias, param_offset, ctx);
 						if !sub_conds.is_empty() {
 							sub_parts.push(format!("({})", sub_conds.join(" AND ")));
 						}
@@ -48,7 +107,7 @@ pub fn build_filter_sql(
 					let mut sub_parts = vec![];
 					for sub in arr {
 						let (sub_conds, sub_params) =
-							build_filter_sql(sub, table_alias, param_offset);
+							build_filter_sql_ctx(sub, table_alias, param_offset, ctx);
 						if !sub_conds.is_empty() {
 							sub_parts.push(format!("({})", sub_conds.join(" AND ")));
 						}
@@ -59,14 +118,89 @@ pub fn build_filter_sql(
 					}
 				},
 			"not" => {
-				let (sub_conds, sub_params) = build_filter_sql(value, table_alias, param_offset);
+				let (sub_conds, sub_params) =
+					build_filter_sql_ctx(value, table_alias, param_offset, ctx);
 				if !sub_conds.is_empty() {
 					conditions.push(format!("NOT ({})", sub_conds.join(" AND ")));
 				}
 				params.extend(sub_params);
 			},
 			field_name => {
-				// field_name is a camelCase column name from the filter input
+				// ── {relation}Exists boolean filter ───────────────────────
+				if let Some(fk_col) = ctx.exists_fields.get(field_name).cloned() {
+					if let Some(b) = value.as_bool() {
+						if b {
+							conditions.push(format!("{table_alias}.\"{fk_col}\" IS NOT NULL"));
+						} else {
+							conditions.push(format!("{table_alias}.\"{fk_col}\" IS NULL"));
+						}
+					}
+					continue;
+				}
+
+				// ── Forward relation filter ───────────────────────────────
+				if let Some(rel) = ctx.forward_relations.get(field_name).cloned() {
+					ctx.sub_alias_counter += 1;
+					let sub_alias = format!("sub{}", ctx.sub_alias_counter);
+					let (sub_conds, sub_params) =
+						build_filter_sql_ctx(value, &sub_alias, param_offset, ctx);
+					if !sub_conds.is_empty() {
+						let hist_cond = if rel.is_historical {
+							format!(" AND {sub_alias}._block_range @> {}::bigint", i64::MAX)
+						} else {
+							String::new()
+						};
+						conditions.push(format!(
+							"EXISTS (SELECT 1 FROM \"{}\".\"{}\" AS {sub_alias} WHERE {sub_alias}.\"{}\" = {table_alias}.\"{}\" AND {}{hist_cond})",
+							rel.schema, rel.foreign_table, rel.foreign_pk, rel.fk_column,
+							sub_conds.join(" AND ")
+						));
+					}
+					params.extend(sub_params);
+					continue;
+				}
+
+				// ── Backward relation filter (some/none/every) ───────────
+				if let Some(rel) = ctx.backward_relations.get(field_name).cloned() {
+					let hist_cond = if rel.is_historical {
+						format!(" AND {{alias}}._block_range @> {}::bigint", i64::MAX)
+					} else {
+						String::new()
+					};
+					if let Some(obj) = value.as_object() {
+						for (quantifier, sub_filter) in obj {
+							ctx.sub_alias_counter += 1;
+							let sub_alias = format!("sub{}", ctx.sub_alias_counter);
+							let (sub_conds, sub_params) =
+								build_filter_sql_ctx(sub_filter, &sub_alias, param_offset, ctx);
+							if sub_conds.is_empty() {
+								continue;
+							}
+							let joined = sub_conds.join(" AND ");
+							let hc = hist_cond.replace("{alias}", &sub_alias);
+							let sql = match quantifier.as_str() {
+								"some" => format!(
+									"EXISTS (SELECT 1 FROM \"{}\".\"{}\" AS {sub_alias} WHERE {sub_alias}.\"{}\" = {table_alias}.\"id\"{hc} AND {joined})",
+									rel.schema, rel.child_table, rel.fk_column
+								),
+								"none" => format!(
+									"NOT EXISTS (SELECT 1 FROM \"{}\".\"{}\" AS {sub_alias} WHERE {sub_alias}.\"{}\" = {table_alias}.\"id\"{hc} AND {joined})",
+									rel.schema, rel.child_table, rel.fk_column
+								),
+								"every" => format!(
+									"NOT EXISTS (SELECT 1 FROM \"{}\".\"{}\" AS {sub_alias} WHERE {sub_alias}.\"{}\" = {table_alias}.\"id\"{hc} AND NOT ({joined}))",
+									rel.schema, rel.child_table, rel.fk_column
+								),
+								_ => continue,
+							};
+							conditions.push(sql);
+							params.extend(sub_params);
+						}
+					}
+					continue;
+				}
+
+				// ── Scalar column filter ──────────────────────────────────
 				let col = camel_to_snake(field_name);
 				if let Some(ops) = value.as_object() {
 					for (op, op_val) in ops {

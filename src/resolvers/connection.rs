@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! List query resolver — the primary GraphQL connection field handler.
 //!
 //! [`resolve_connection`] handles all `{entities}(...)` root query fields,
@@ -19,7 +34,7 @@ use crate::{
 	config::Config,
 	schema::{cursor::encode_cursor, inflector::to_camel_case},
 	sql::{
-		filter::build_filter_sql,
+		filter::build_filter_sql_ctx,
 		pagination::{PaginationArgs, resolve_pagination},
 	},
 };
@@ -27,22 +42,40 @@ use crate::{
 /// Resolve a connection (list) query for the given table.
 /// Returns a plain `serde_json::Value` so nested field resolvers can use
 /// `ctx.parent_value.try_downcast_ref::<serde_json::Value>()`.
-pub async fn resolve_connection(
+///
+/// Accepts a [`FilterContext`] for relation-aware filtering (exists, forward, some/none/every).
+pub async fn resolve_connection_ctx(
 	ctx: &ResolverContext<'_>,
 	pool: &Pool,
 	table: &str,
 	cfg: &Config,
 	is_historical: bool,
 	columns: &[String],
+	filter_ctx: &crate::sql::filter::FilterContext,
 ) -> async_graphql::Result<Option<Value>> {
 	// ── Extract arguments ─────────────────────────────────────────────────────
-	let first = ctx.args.get("first").and_then(|v| v.i64().ok()).map(|n| n as usize);
-	let last = ctx.args.get("last").and_then(|v| v.i64().ok()).map(|n| n as usize);
+	// Match TS: first/last of 0 is treated as "not specified" (JS falsy: !0 === true).
+	let first = ctx
+		.args
+		.get("first")
+		.and_then(|v| v.i64().ok())
+		.map(|n| n.max(0) as usize)
+		.filter(|&n| n > 0);
+	let last = ctx
+		.args
+		.get("last")
+		.and_then(|v| v.i64().ok())
+		.map(|n| n.max(0) as usize)
+		.filter(|&n| n > 0);
 	let after = ctx.args.get("after").and_then(|v| v.string().ok()).map(str::to_string);
 	let before = ctx.args.get("before").and_then(|v| v.string().ok()).map(str::to_string);
-	let offset = ctx.args.get("offset").and_then(|v| v.i64().ok()).map(|n| n as usize);
-	let block_height: Option<String> =
-		ctx.args.get("blockHeight").and_then(|v| v.string().ok()).map(str::to_string);
+	let offset = ctx.args.get("offset").and_then(|v| v.i64().ok()).map(|n| n.max(0) as usize);
+	let block_height: Option<String> = ctx
+		.args
+		.get("blockHeight")
+		.or_else(|| ctx.args.get("timestamp"))
+		.and_then(|v| v.string().ok())
+		.map(str::to_string);
 
 	let filter_val: Option<Value> = ctx
 		.args
@@ -60,31 +93,44 @@ pub async fn resolve_connection(
 
 	let schema = &cfg.name;
 
-	let requested = first.or(last).unwrap_or(cfg.query_limit);
-	let limit = if cfg.unsafe_mode { requested } else { requested.min(cfg.query_limit) };
+	// Match TS behaviour: `--unsafe` removes the *default* limit when no first/last is
+	// given (returning all rows), but explicit first/last values are ALWAYS clamped to
+	// query_limit.  See PgConnectionArgFirstLastBeforeAfter.ts.
+	let limit: Option<usize> = if first.is_some() || last.is_some() {
+		// Explicit first/last — always clamp to query_limit.
+		Some(first.or(last).unwrap().min(cfg.query_limit))
+	} else if cfg.unsafe_mode {
+		// No first/last + unsafe → no limit (return all rows).
+		None
+	} else {
+		// No first/last + safe → default to query_limit.
+		Some(cfg.query_limit)
+	};
 
 	// ── WHERE clauses ─────────────────────────────────────────────────────────
 	let mut conditions: Vec<String> = vec![];
 	let mut params: Vec<Value> = vec![];
 	let mut param_offset: usize = 0;
 
-	if let Some(height) = &block_height {
+	if is_historical {
+		// Match PostGraphile: always use `_block_range @> N::bigint`.
+		// Default blockHeight = MAX_INT64 (only matches rows with open upper bound).
+		let bh = block_height.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(i64::MAX);
 		param_offset += 1;
 		conditions.push(format!("t._block_range @> ${param_offset}::bigint"));
-		params.push(json!(height.parse::<i64>().unwrap_or(i64::MAX)));
-	} else if is_historical {
-		// No blockHeight specified for a historical table — return only the latest version.
-		conditions.push("upper_inf(t._block_range)".to_string());
+		params.push(json!(bh));
 	}
 
 	if let Some(f) = filter_val {
-		let (filter_conds, filter_params) = build_filter_sql(&f, "t", &mut param_offset);
+		let mut fctx = filter_ctx.clone();
+		let (filter_conds, filter_params) =
+			build_filter_sql_ctx(&f, "t", &mut param_offset, &mut fctx);
 		conditions.extend(filter_conds);
 		params.extend(filter_params);
 	}
 
 	// ── ORDER BY ──────────────────────────────────────────────────────────────
-	let order_clauses = parse_orderby(order_by_gql.as_ref());
+	let order_clauses = parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema));
 	let order_cols: Vec<String> = extract_order_cols(&order_clauses);
 
 	// ── PAGINATION ────────────────────────────────────────────────────────────
@@ -124,12 +170,29 @@ pub async fn resolve_connection(
 		_ => "",
 	};
 
-	let forward_order_clause = if order_clauses.is_empty() {
-		format!("ORDER BY t.id ASC{nulls_suffix}")
-	} else {
-		let clauses_with_nulls: Vec<String> =
-			order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect();
-		format!("ORDER BY {}", clauses_with_nulls.join(", "))
+	let forward_order_clause = {
+		let mut clauses: Vec<String> = if order_clauses.is_empty() {
+			vec![format!("t.id ASC{nulls_suffix}")]
+		} else {
+			order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect()
+		};
+		// PostGraphile appends `_id ASC` as a unique tiebreaker for historical tables
+		// to ensure deterministic ordering when multiple versions share the same id.
+		if is_historical && !clauses.iter().any(|c| c.contains("t._id ")) {
+			clauses.push("t._id ASC".to_string());
+		}
+		// PostgreSQL requires DISTINCT ON columns to be leading ORDER BY columns.
+		if !distinct_cols.is_empty() {
+			let leading: Vec<String> = distinct_cols
+				.iter()
+				.filter(|dc| !clauses.iter().any(|c| c.starts_with(&format!("t.{dc} "))))
+				.map(|dc| format!("t.{dc} ASC{nulls_suffix}"))
+				.collect();
+			if !leading.is_empty() {
+				clauses.splice(0..0, leading);
+			}
+		}
+		format!("ORDER BY {}", clauses.join(", "))
 	};
 
 	// For backward pagination (`last`), reverse each ORDER BY direction so the
@@ -166,10 +229,14 @@ pub async fn resolve_connection(
 		// For non-DISTINCT queries embed COUNT(*) OVER() to get the total in a
 		// single round-trip. For DISTINCT queries the window function fires before
 		// deduplication and would overcount, so use the separate count query.
+		let limit_clause = match limit {
+			Some(n) => format!("LIMIT {n}"),
+			None => String::new(),
+		};
 		let (sql, use_window_count) = if distinct_cols.is_empty() {
 			(
 				format!(
-					r#"SELECT {select_cols}, COUNT(*) OVER() AS __total_count FROM "{schema}"."{table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
+					r#"SELECT {select_cols}, COUNT(*) OVER() AS __total_count FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
 					pagination.offset
 				),
 				true,
@@ -177,7 +244,7 @@ pub async fn resolve_connection(
 		} else {
 			(
 				format!(
-					r#"SELECT {distinct_clause}{select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
+					r#"SELECT {distinct_clause}{select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
 					pagination.offset
 				),
 				false,
@@ -185,6 +252,9 @@ pub async fn resolve_connection(
 		};
 
 		debug!(sql = %sql, "Executing connection query");
+		if cfg.query_explain {
+			run_explain(&client, &sql, &pg_refs).await;
+		}
 		let rows = client.query(&sql, &pg_refs).await?;
 		let total = if use_window_count {
 			rows.first()
@@ -226,15 +296,19 @@ pub async fn resolve_connection(
 		edges.reverse();
 	}
 
+	let _row_count = nodes.len();
 	let (has_next, has_prev) = if pagination.is_backwards {
-		// `last`: we're at the tail of the set.
-		// hasPreviousPage = there are more rows before our window.
-		// hasNextPage = only true if a `before` cursor was provided (we're not at the very end).
-		let has_prev = total as usize > limit || before.is_some();
+		let has_prev = match limit {
+			Some(l) => total as usize > l || before.is_some(),
+			None => before.is_some(),
+		};
 		let has_next = before.is_some();
 		(has_next, has_prev)
 	} else {
-		let has_next = (pagination.offset + limit) < total as usize;
+		let has_next = match limit {
+			Some(l) => (pagination.offset + l) < total as usize,
+			None => false, // no limit → all rows fetched
+		};
 		let has_prev = pagination.offset > 0 || after.is_some();
 		(has_next, has_prev)
 	};
@@ -502,7 +576,7 @@ mod tests {
 /// Reverse every ASC/DESC direction in an `ORDER BY ...` clause string.
 /// Used for backward pagination (`last`): we reverse the sort so the DB gives
 /// us the last N rows of the logical set, then we un-reverse the result.
-fn reverse_order_clause(clause: &str) -> String {
+pub fn reverse_order_clause(clause: &str) -> String {
 	// clause looks like "ORDER BY t.id ASC" or "ORDER BY t.col1 ASC, t.col2 DESC"
 	let prefix = "ORDER BY ";
 	let terms = clause.trim_start_matches(prefix);
@@ -524,9 +598,17 @@ fn reverse_order_clause(clause: &str) -> String {
 	format!("{prefix}{reversed}")
 }
 
-fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
-	// async-graphql may not coerce a single enum value into a list for dynamic
-	// schema arguments, so accept both List and bare Enum/String forms.
+pub fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
+	parse_orderby_with_schema(val, None)
+}
+
+/// Parse orderBy enum values into SQL ORDER BY clauses.
+/// When `schema` is provided, aggregate orderBy values (containing `_BY_`)
+/// are expanded into correlated subqueries.
+pub fn parse_orderby_with_schema(
+	val: Option<&async_graphql::Value>,
+	schema: Option<&str>,
+) -> Vec<String> {
 	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
 		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) =>
@@ -543,27 +625,73 @@ fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
 			if s == "NATURAL" {
 				return None;
 			}
-			let (col_upper, dir) = if s.ends_with("_ASC") {
+			let (body, dir) = if s.ends_with("_ASC") {
 				(&s[..s.len() - 4], "ASC")
 			} else if s.ends_with("_DESC") {
 				(&s[..s.len() - 5], "DESC")
 			} else {
 				return None;
 			};
-			let col = col_upper.to_lowercase();
+
+			// ── Aggregate orderBy: detect _BY_ pattern ───────────────
+			if let Some(schema) = schema {
+				if let Some(by_idx) = body.find("_BY_") {
+					let child_table = body[..by_idx].to_lowercase();
+					let after_by = &body[by_idx + 4..]; // after "_BY_"
+					// Find the FK column: everything up to _COUNT or _{AGG}_{COL}
+					if let Some(agg_sql) = parse_aggregate_order(schema, &child_table, after_by) {
+						return Some(format!("{agg_sql} {dir}"));
+					}
+				}
+			}
+
+			// ── Plain column orderBy ─────────────────────────────────
+			let col = body.to_lowercase();
 			Some(format!("t.{col} {dir}"))
 		})
 		.collect()
 }
 
-fn extract_order_cols(clauses: &[String]) -> Vec<String> {
+/// Parse the aggregate part of an orderBy enum value and return a SQL expression.
+/// `after_by` is e.g. `"AUTHOR_ID_COUNT"` or `"AUTHOR_ID_SUM_BLOCK_NUMBER"`.
+fn parse_aggregate_order(schema: &str, child_table: &str, after_by: &str) -> Option<String> {
+	// Split into FK part and aggregate part. The FK column is everything before
+	// the aggregate keyword (COUNT, SUM, AVERAGE, MIN, MAX).
+	let agg_keywords = ["_COUNT", "_SUM_", "_AVERAGE_", "_MIN_", "_MAX_"];
+	for kw in &agg_keywords {
+		if let Some(idx) = after_by.find(kw) {
+			let fk_col = after_by[..idx].to_lowercase();
+			if *kw == "_COUNT" {
+				return Some(format!(
+					"(SELECT COUNT(*) FROM \"{schema}\".\"{child_table}\" AS _agg WHERE _agg.\"{fk_col}\" = t.\"id\")"
+				));
+			}
+			// Extract agg function and column
+			let rest = &after_by[idx + kw.len()..]; // e.g. "BLOCK_NUMBER" for SUM_BLOCK_NUMBER
+			let agg_col = rest.to_lowercase();
+			let pg_func = match *kw {
+				"_SUM_" => "SUM",
+				"_AVERAGE_" => "AVG",
+				"_MIN_" => "MIN",
+				"_MAX_" => "MAX",
+				_ => return None,
+			};
+			return Some(format!(
+				"(SELECT {pg_func}(_agg.\"{agg_col}\") FROM \"{schema}\".\"{child_table}\" AS _agg WHERE _agg.\"{fk_col}\" = t.\"id\")"
+			));
+		}
+	}
+	None
+}
+
+pub fn extract_order_cols(clauses: &[String]) -> Vec<String> {
 	clauses
 		.iter()
 		.filter_map(|c| c.trim_start_matches("t.").split_whitespace().next().map(str::to_string))
 		.collect()
 }
 
-fn parse_distinct(val: Option<&async_graphql::Value>) -> Vec<String> {
+pub fn parse_distinct(val: Option<&async_graphql::Value>) -> Vec<String> {
 	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
 		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) =>
@@ -727,4 +855,22 @@ pub fn json_to_pg_params(params: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> 
 			}
 		})
 		.collect()
+}
+
+/// Execute `EXPLAIN` on a query and log the plan at INFO level.
+pub async fn run_explain(
+	client: &deadpool_postgres::Object,
+	sql: &str,
+	params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) {
+	let explain_sql = format!("EXPLAIN {sql}");
+	match client.query(&explain_sql, params).await {
+		Ok(rows) => {
+			let plan: Vec<String> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
+			tracing::info!(sql = %sql, plan = %plan.join("\n"), "EXPLAIN");
+		},
+		Err(e) => {
+			tracing::warn!(error = %e, sql = %sql, "EXPLAIN failed");
+		},
+	}
 }

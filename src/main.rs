@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 mod config;
 mod db;
 mod hot_reload;
@@ -43,9 +58,13 @@ async fn main() -> anyhow::Result<()> {
 	let enums = introspect_enums(&pool, &schema_name).await?;
 	info!(tables = tables.len(), enums = enums.len(), "Introspection complete");
 
+	// ── Detect historical mode ────────────────────────────────────────────────
+	let historical_arg = detect_historical_mode(&pool, &schema_name).await;
+	info!(historical_arg = %historical_arg, "Historical argument name");
+
 	// ── Build GraphQL schema ──────────────────────────────────────────────────
 	info!("Building GraphQL schema...");
-	let gql_schema = build_schema(&tables, &enums, pool.clone(), cfg.clone())?;
+	let gql_schema = build_schema(&tables, &enums, pool.clone(), cfg.clone(), &historical_arg)?;
 	let shared_schema: SharedSchema = Arc::new(RwLock::new(gql_schema));
 	info!("GraphQL schema built successfully");
 
@@ -70,6 +89,29 @@ async fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
+/// Query `_metadata` for `historicalStateEnabled`. Returns `"timestamp"` if the
+/// project uses timestamp-based history, otherwise `"blockHeight"`.
+async fn detect_historical_mode(pool: &deadpool_postgres::Pool, schema: &str) -> String {
+	let client = match pool.get().await {
+		Ok(c) => c,
+		Err(_) => return "blockHeight".to_string(),
+	};
+	// Try all metadata tables (plain _metadata or _metadata_0x*)
+	let sql = format!(
+		r#"SELECT value FROM "{schema}"."_metadata" WHERE key = 'historicalStateEnabled' LIMIT 1"#,
+	);
+	if let Ok(row) = client.query_opt(&sql, &[]).await {
+		if let Some(row) = row {
+			if let Ok(val) = row.try_get::<_, serde_json::Value>(0) {
+				if val.as_str() == Some("timestamp") {
+					return "timestamp".to_string();
+				}
+			}
+		}
+	}
+	"blockHeight".to_string()
+}
+
 fn setup_logging(cfg: &Config) {
 	let level = match cfg.log_level.as_str() {
 		"fatal" | "error" => "error",
@@ -81,7 +123,9 @@ fn setup_logging(cfg: &Config) {
 		_ => "info",
 	};
 
-	let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+	// RUST_LOG takes precedence; fallback: omnihedron + tower_http at configured level
+	let filter = EnvFilter::try_from_default_env()
+		.unwrap_or_else(|_| EnvFilter::new(format!("omnihedron={level},tower_http={level}")));
 
 	if cfg.output_fmt == "json" {
 		tracing_subscriber::registry()

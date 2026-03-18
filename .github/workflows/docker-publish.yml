@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -58,6 +58,7 @@ jobs:
             type=raw,value=${{ steps.cargo_version.outputs.version }}
             type=raw,value=${{ steps.cargo_version.outputs.minor }}
             type=raw,value=${{ steps.cargo_version.outputs.major }}
+            type=raw,value=latest
             # short SHA for traceability
             type=sha,prefix=sha-,format=short
 
@@ -82,3 +83,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.cargo_version.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.POLYTOPE_GITHUB_TOKEN }}

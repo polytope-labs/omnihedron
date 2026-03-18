@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Schema change listener task.
 //!
 //! [`start_schema_listener`] spawns a long-running Tokio task that:
@@ -119,7 +134,28 @@ async fn try_build_schema(
 ) -> anyhow::Result<async_graphql::dynamic::Schema> {
 	let tables = introspect_schema(pool, &cfg.name).await?;
 	let enums = introspect_enums(pool, &cfg.name).await?;
-	build_schema(&tables, &enums, pool.clone(), cfg.clone())
+	// Detect historical mode on every rebuild (it may have changed).
+	let hist_arg = detect_historical_mode(pool, &cfg.name).await;
+	build_schema(&tables, &enums, pool.clone(), cfg.clone(), &hist_arg)
+}
+
+/// Query `_metadata` for `historicalStateEnabled`.
+async fn detect_historical_mode(pool: &Pool, schema: &str) -> String {
+	let client = match pool.get().await {
+		Ok(c) => c,
+		Err(_) => return "blockHeight".to_string(),
+	};
+	let sql = format!(
+		r#"SELECT value FROM "{schema}"."_metadata" WHERE key = 'historicalStateEnabled' LIMIT 1"#,
+	);
+	if let Ok(Some(row)) = client.query_opt(&sql, &[]).await {
+		if let Ok(val) = row.try_get::<_, serde_json::Value>(0) {
+			if val.as_str() == Some("timestamp") {
+				return "timestamp".to_string();
+			}
+		}
+	}
+	"blockHeight".to_string()
 }
 
 async fn rebuild_schema(pool: Arc<Pool>, schema_lock: Arc<RwLock<Schema>>, cfg: Arc<Config>) {

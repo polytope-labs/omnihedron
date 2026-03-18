@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Aggregate type registration for the `async-graphql` dynamic schema.
 //!
 //! [`register_aggregate_types`] generates the `{Entity}Aggregates` object type
@@ -217,11 +232,18 @@ pub fn register_grouped_aggregate_types(
 
 	let mut agg_group_obj = Object::new(&agg_group_type_name).field(Field::new(
 		"keys",
-		TypeRef::named(&type_name),
+		TypeRef::named_nn_list_nn(TypeRef::STRING),
 		|ctx| {
 			FieldFuture::new(async move {
 				let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
-				Ok(parent.get("keys").cloned().map(FieldValue::owned_any))
+				match parent.get("keys") {
+					Some(serde_json::Value::Array(arr)) => {
+						let list: Vec<GqlValue> =
+							arr.iter().map(|v| GqlValue::String(json_val_to_string(v))).collect();
+						Ok(Some(FieldValue::list(list.into_iter().map(FieldValue::value))))
+					},
+					_ => Ok(Some(FieldValue::list(std::iter::empty::<FieldValue>()))),
+				}
 			})
 		},
 	));
@@ -242,4 +264,15 @@ pub fn register_grouped_aggregate_types(
 
 	builder = builder.register(agg_group_obj);
 	(builder, agg_group_type_name, group_by_enum_name)
+}
+
+/// Convert a serde_json::Value to a String for `keys` output.
+fn json_val_to_string(v: &serde_json::Value) -> String {
+	match v {
+		serde_json::Value::String(s) => s.clone(),
+		serde_json::Value::Number(n) => n.to_string(),
+		serde_json::Value::Bool(b) => b.to_string(),
+		serde_json::Value::Null => String::new(),
+		other => other.to_string(),
+	}
 }

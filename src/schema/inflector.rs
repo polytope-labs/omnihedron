@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Polytope Labs.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /// Convert a `snake_case` database name to `camelCase` for GraphQL fields.
 ///
 /// Mirrors `graphile-build`'s `formatInsideUnderscores(camelCase)` behaviour:
@@ -315,12 +330,40 @@ pub fn table_to_single_field(table: &str) -> String {
 
 /// Build the backward-relation field name on the parent type.
 ///
-/// child_table=`transfers`, fk_column=`account_id`
-///   → `transfersByAccountId`
+/// Forward relation field name (PostGraphile simplify inflector convention).
+///
+/// Strips `_id`/`_uuid`/`_fk` suffixes from the FK column name and camelCases.
+///
+/// Examples:
+///   fk_column=`author_id` → `author`
+///   fk_column=`account_id` → `account`
+///   fk_column=`parent_hash` → `parentHash`
+pub fn forward_relation_field(fk_column: &str) -> String {
+	let base = strip_fk_suffix(fk_column);
+	to_camel_case(base)
+}
+
+/// Backward relation field name.
+///
+/// Format: `{childTableCamel}By{FkColumnPascal}`
+///
+/// Examples:
+///   child_table=`test_books`, fk_column=`author_id` → `testBooksByAuthorId`
+///   child_table=`transfers`, fk_column=`account_id` → `transfersByAccountId`
 pub fn backward_relation_field(child_table: &str, fk_column: &str) -> String {
 	let table_part = to_camel_case(child_table);
 	let col_part = to_pascal_case(&to_camel_case(fk_column));
 	format!("{table_part}By{col_part}")
+}
+
+/// Strip FK-style suffixes (`_id`, `_uuid`, `_fk`, etc.) from a column name.
+fn strip_fk_suffix(col: &str) -> &str {
+	for suffix in &["_id", "_uuid", "_fk"] {
+		if let Some(stripped) = col.strip_suffix(suffix) {
+			return stripped;
+		}
+	}
+	col
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
