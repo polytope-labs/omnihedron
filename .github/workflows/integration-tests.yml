@@ -1,0 +1,102 @@
+name: Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: integration-tests-${{ github.head_ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_SERVICE_URL: http://localhost:3000
+  TS_SERVICE_URL: http://localhost:3001
+  SCHEMA_NAME: app
+
+jobs:
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
+
+      - name: Start PostgreSQL and TypeScript service
+        run: docker compose -f docker/docker-compose.ci.yml up -d --wait subql-query-ts
+
+      - name: Wait for TypeScript service
+        run: |
+          echo "Waiting for TypeScript service..."
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 3 \
+                 -X POST \
+                 -H "Content-Type: application/json" \
+                 -d '{"query":"{ __typename }"}' \
+                 http://localhost:3001/graphql > /dev/null 2>&1; then
+              echo "TypeScript service is ready."
+              break
+            fi
+            echo "  attempt $i/60..."
+            sleep 2
+          done
+
+      - name: Build Rust binary
+        run: cargo build --release --bin omnihedron
+
+      - name: Start Rust service
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5433"
+          DB_USER: postgres
+          DB_PASS: postgres
+          DB_DATABASE: indexer
+        run: |
+          ./target/release/omnihedron \
+            --name app \
+            --port 3000 \
+            --unsafe-mode \
+            &
+          echo $! > .omnihedron.pid
+
+      - name: Wait for Rust service
+        run: |
+          echo "Waiting for Rust service..."
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 3 http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Rust service is ready."
+              break
+            fi
+            echo "  attempt $i/30..."
+            sleep 1
+          done
+
+      - name: Run integration tests
+        run: cargo test --test integration_test -- --nocapture
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          echo "=== TypeScript service logs ==="
+          docker compose -f docker/docker-compose.ci.yml logs subql-query-ts || true
+          echo "=== PostgreSQL logs ==="
+          docker compose -f docker/docker-compose.ci.yml logs postgres || true
+
+      - name: Stop Rust service
+        if: always()
+        run: |
+          if [ -f .omnihedron.pid ]; then
+            kill "$(cat .omnihedron.pid)" 2>/dev/null || true
+          fi
+
+      - name: Tear down Docker services
+        if: always()
+        run: docker compose -f docker/docker-compose.ci.yml down -v

@@ -1,0 +1,84 @@
+name: Publish Docker image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: polytopelabs/omnihedron
+
+jobs:
+  build-and-push:
+    name: Build & push
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache key includes OS and Cargo.lock so a lockfile change busts it
+          key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
+
+      - name: Read version from Cargo.toml
+        id: cargo_version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f1-2)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "major=${MAJOR}"     >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}"     >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release --bin omnihedron
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            # full semver from Cargo.toml  →  1.2.3, 1.2, 1
+            type=raw,value=${{ steps.cargo_version.outputs.version }}
+            type=raw,value=${{ steps.cargo_version.outputs.minor }}
+            type=raw,value=${{ steps.cargo_version.outputs.major }}
+            # short SHA for traceability
+            type=sha,prefix=sha-,format=short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+            username: ${{ secrets.DOCKER_USERNAME }}
+            password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse Docker layer cache between runs via GitHub Actions cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64

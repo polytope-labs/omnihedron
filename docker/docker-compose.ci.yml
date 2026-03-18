@@ -1,0 +1,49 @@
+services:
+  # ── PostgreSQL 17 ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17
+    container_name: subql-postgres
+    environment:
+      POSTGRES_DB: indexer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ── One-shot fixture restore ──────────────────────────────────────────────────
+  db-fixture:
+    image: postgres:17
+    container_name: subql-db-fixture
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ../tests/fixtures:/fixtures:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "postgres", "-d", "indexer", "-f", "/fixtures/test_db.sql"]
+    restart: "no"
+
+  # ── TypeScript @subql/query ───────────────────────────────────────────────────
+  subql-query-ts:
+    image: subquerynetwork/subql-query:latest
+    container_name: subql-query-ts
+    depends_on:
+      db-fixture:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+    ports:
+      - "3001:3001"
+    command: ["--name", "app", "--port", "3001", "--unsafe"]
+    restart: unless-stopped

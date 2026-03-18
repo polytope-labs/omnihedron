@@ -1,0 +1,6 @@
+/target
+
+testnet-indexer-db.dump
+
+.env
+.env.*
