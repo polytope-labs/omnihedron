@@ -1,0 +1,94 @@
+services:
+  # ── PostgreSQL 17 ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17
+    container_name: subql-postgres
+    environment:
+      POSTGRES_DB: indexer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../testnet-indexer-db.dump:/tmp/dump.dump:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ── One-shot restore container (skips if DB already populated) ────────────────
+  db-restore:
+    image: postgres:17
+    container_name: subql-db-restore
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ../testnet-indexer-db.dump:/tmp/dump.dump:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        COUNT=$(psql -h postgres -U postgres -d indexer -t -c \
+          "SELECT COUNT(*) FROM information_schema.tables \
+           WHERE table_schema NOT IN ('public','information_schema','pg_catalog') \
+           AND table_schema NOT LIKE 'pg_%';" | tr -d '[:space:]')
+        if [ "$${COUNT:-0}" -gt "0" ]; then
+          echo "==> DB already restored ($$COUNT tables). Skipping."
+        else
+          echo "==> Restoring dump (this takes several minutes)..."
+          pg_restore -h postgres -U postgres -d indexer \
+            --no-owner --no-privileges \
+            /tmp/dump.dump || true
+          echo "==> Restore complete."
+        fi
+    restart: "no"
+
+  # ── TypeScript @subql/query ───────────────────────────────────────────────────
+  subql-query-ts:
+    image: subquerynetwork/subql-query:latest
+    container_name: subql-query-ts
+    depends_on:
+      db-restore:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+    ports:
+      - "3001:3001"
+    command: ["--name", "${SCHEMA_NAME:-app}", "--port", "3001", "--unsafe"]
+    restart: unless-stopped
+
+  # ── Rust omnihedron ───────────────────────────────────────────────────────────
+  omnihedron:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: omnihedron:latest
+    container_name: omnihedron
+    depends_on:
+      db-restore:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+      OMNIHEDRON_LOG_LEVEL: debug
+    ports:
+      - "3000:3000"
+    command: ["--name", "${SCHEMA_NAME:-app}", "--port", "3000", "--unsafe-mode"]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: subql_postgres_data

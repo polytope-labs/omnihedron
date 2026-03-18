@@ -1,0 +1,66 @@
+[package]
+name = "omnihedron"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "omnihedron"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-full", "cors", "trace", "set-header"] }
+
+# GraphQL
+async-graphql = { version = "7", features = ["dynamic-schema", "dataloader", "chrono", "uuid"] }
+async-graphql-axum = "7"
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+futures = "0.3"
+futures-util = "0.3"
+
+# PostgreSQL
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Utilities
+anyhow = "1"
+base64 = "0.22"
+sha2 = "0.10"
+blake2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+regex = "1"
+once_cell = "1"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+thiserror = "1"
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+pretty_assertions = "1"
