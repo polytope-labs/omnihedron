@@ -45,8 +45,18 @@ async fn main() -> anyhow::Result<()> {
 	info!(version = env!("CARGO_PKG_VERSION"), "Starting omnihedron");
 
 	// ── Database ──────────────────────────────────────────────────────────────
+	// Match TS: use DB_HOST_READ for queries ONLY when subscriptions are disabled.
+	// When subscriptions are enabled, all connections go to the primary (LISTEN/NOTIFY
+	// only works on the primary).
 	let db_cfg = DbConfig::from_env()?;
-	let pool = Arc::new(create_pool(&db_cfg, &cfg, false)?);
+	let for_subscription = cfg.subscription;
+	let pool = Arc::new(create_pool(&db_cfg, &cfg, for_subscription)?);
+	if !for_subscription && db_cfg.host_read.is_some() {
+		info!(
+			host = %db_cfg.host_read.as_deref().unwrap_or(""),
+			"Using read replica for queries"
+		);
+	}
 
 	// ── Schema discovery ──────────────────────────────────────────────────────
 	let schema_name = discover_schema(&pool, &cfg.name).await?;

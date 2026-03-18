@@ -26,7 +26,7 @@ Docker Hub: `polytopelabs/omnihedron`
 ## Key architectural facts
 
 - **Dynamic schema** — `async-graphql`'s `dynamic` module builds the entire GraphQL schema at runtime from PostgreSQL introspection. No code generation, no compile-time schema.
-- **Schema hot reload** — a dedicated PostgreSQL connection `LISTEN`s on the SubQuery schema channel. When a `schema_updated` notification arrives, introspection reruns and the schema is atomically swapped behind an `Arc<RwLock<Schema>>`. **NOT YET IMPLEMENTED.**
+- **Schema hot reload** — a dedicated PostgreSQL connection `LISTEN`s on the SubQuery schema channel. When a `schema_updated` notification arrives, introspection reruns and the schema is atomically swapped behind an `Arc<RwLock<Schema>>`. In-flight requests are unaffected.
 - **SQL safety** — all user-supplied values use parameterised `$N` placeholders. Column and table names come from introspection and are never interpolated from user input.
 - **PostGraphile compatibility** — naming conventions, cursor encoding (base64 JSON), `nodeId` field, `{entity}ByNodeId` root queries, `Node` interface all match PostGraphile exactly.
 
@@ -72,9 +72,36 @@ Docker Hub: `polytopelabs/omnihedron`
 - Hex enum type naming — `pg_enum_type_to_gql_name` replicates PostGraphile's `coerceToGraphQLName` + lodash `upperCamelCase` with digit→letter word boundaries (for SubQuery's blake2 10-char hash enum names)
 - `_MetadatasEdge` type registered with `cursor` + `node` fields; `_Metadatas` exposes `edges` field
 - Cursor-based pagination (`after`/`before`) with explicit `orderBy` — `parse_orderby` and `parse_distinct` accept both `List` and bare `Enum`/`String` values since async-graphql dynamic schema does not auto-coerce single enum values into lists for these args
-
-### NOT YET IMPLEMENTED
-- `--query-explain` SQL EXPLAIN logging (`query_explain` field exists in config but is never read; no `EXPLAIN` queries are executed)
+- Schema hot reload (LISTEN/NOTIFY with atomic schema swap)
+- Backward relation `filter`/`orderBy`/`orderByNull`/`distinct` args
+- Forward relation field naming (PostGraphile simplify inflector: strip `_id` from FK column)
+- Backward relation field naming (`{childPlural}By{FkCol}`)
+- Relation filters: `{relation}Exists` boolean, forward relation EXISTS subquery, backward `some`/`none`/`every`
+- `FilterContext` struct for relation-aware filter SQL
+- Many-to-many junction table detection and resolver
+- Aggregate orderBy enum values with correlated subqueries
+- Historical `timestamp` mode (reads `historicalStateEnabled` from metadata)
+- `_block_range @> MAX_INT64::bigint` (matches PostGraphile default, not `upper_inf`)
+- `_id ASC` tiebreaker in ORDER BY for historical tables
+- Cache-Control headers (`public, max-age=5`)
+- HTTP request tracing with request_id (UUID prefix)
+- `query-complexity` and `max-query-complexity` response headers
+- `--indexer` metadata HTTP fallback (fetches /meta + /health)
+- `DB_HOST_READ` read replica support
+- `--query-explain` SQL EXPLAIN logging
+- Backward relation one-to-one detection (unique FK → single record)
+- BlockHeight in relation filter subqueries (_block_range @> in EXISTS)
+- Fulltext search sanitization (`sanitize_tsquery`)
+- Metadata default chain caching
+- `first+last` and `offset+last` argument rejection
+- Negative first/last/offset clamping
+- `first:0` treated as unset (matches TS JS-truthiness)
+- DISTINCT ON columns prepended to ORDER BY
+- Selective aggregate computation (only requested aggregates in SQL)
+- Apache 2.0 license headers on all files
+- Trimmed tokio features (macros, rt-multi-thread, net, sync, time)
+- RUST_LOG env filter support
+- GitHub Release with auto-generated changelog
 
 ### Notes
 - Query timeout is enforced via PostgreSQL `statement_timeout` set on every pool connection (`src/db/pool.rs`: `.options(&format!("-c statement_timeout={}", cfg.query_timeout))`). The DB kills any query exceeding the limit.
@@ -106,8 +133,8 @@ src/
     aggregates.rs          # Aggregate query execution
     metadata.rs            # _metadata resolver
   sql/                     # Dynamic SQL construction helpers
-  validation/              # Stubs: complexity, depth, alias, batch (not wired up)
-  hot_reload/              # Stub: LISTEN/NOTIFY schema reload (not wired up)
+  validation/              # Query validation: complexity, depth, alias, batch limits
+  hot_reload/              # LISTEN/NOTIFY schema reload with atomic schema swap
   server.rs                # axum router
 docker/
   Dockerfile               # Copies pre-built binary; build on host first
@@ -120,7 +147,15 @@ scripts/
   create_fixture.sh        # Regenerate tests/fixtures/test_db.sql from live DB
   bench_compare.sh         # Throughput benchmarks vs TypeScript
 tests/
-  integration_test.rs      # Compare Rust vs TypeScript service responses
+  common/mod.rs            # Shared test infrastructure
+  test_basics.rs           # 12 tests (health, metadata, introspection, etc.)
+  test_pagination.rs       # 8 tests (cursor, offset, last pagination)
+  test_filters.rs          # 14 tests (including enum filter)
+  test_ordering.rs         # 6 tests (multi-column, non-id ordering)
+  test_aggregates.rs       # 7 tests (sum, count, min, max, stddev, variance)
+  test_relations.rs        # 10 tests (forward, backward, nested relations)
+  test_historical.rs       # 3 tests (block height queries)
+  test_limits.rs           # 2 tests (1 ignored)
   fixtures/test_db.sql     # Minimal 1.6MB SQL fixture for CI (replaces 5.2GB dump)
 ```
 
@@ -141,7 +176,7 @@ All CLI flags accept env vars with the `OMNIHEDRON_` prefix.
 | `--query-limit` | `OMNIHEDRON_QUERY_LIMIT` | 100 | Max records per query |
 | `--query-timeout` | `OMNIHEDRON_QUERY_TIMEOUT` | 10000 | Query timeout ms (not enforced yet) |
 | `--max-connection` | `OMNIHEDRON_MAX_CONNECTION` | 10 | PostgreSQL pool size |
-| `--disable-hot-schema` | `OMNIHEDRON_DISABLE_HOT_SCHEMA` | off | Disable hot reload (moot, not implemented) |
+| `--disable-hot-schema` | `OMNIHEDRON_DISABLE_HOT_SCHEMA` | off | Disable schema hot reload |
 | `--log-level` | `OMNIHEDRON_LOG_LEVEL` | info | fatal\|error\|warn\|info\|debug\|trace |
 | `--output-fmt` | `OMNIHEDRON_OUTPUT_FMT` | colored | json\|colored |
 
@@ -261,9 +296,9 @@ The global `_global` table exists but is typically empty.
 
 ## Integration tests
 
-Tests live in `tests/integration_test.rs` and compare Rust vs TypeScript service responses.
+Tests are split across 8 files in `tests/` with shared infrastructure in `tests/common/mod.rs`. They compare Rust vs TypeScript service responses.
 
-**What's tested (39 tests total):**
+**What's tested (62 tests total, 61 + 1 ignored):**
 
 **Rust + TS comparison tests (both services must be running):**
 - `test_health` — `/health` returns 2xx; TypeScript `/graphql` responds to `{ __typename }`
@@ -355,7 +390,7 @@ bash scripts/start_services.sh    # Rust on :3000, TypeScript on :3001
 
 # Run tests
 cargo test --lib                  # unit tests
-cargo test --test integration_test # requires both services running
+cargo test                        # requires both services running (62 tests across 8 files)
 
 # Format (nightly required)
 cargo +nightly fmt --all

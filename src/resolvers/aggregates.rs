@@ -37,23 +37,6 @@ fn is_native_number(gql_type: &str) -> bool {
 	matches!(gql_type, "Int" | "Float")
 }
 
-/// Strip trailing zeros after the decimal point to match PostgreSQL's text output
-/// as seen from PostGraphile (which serialises float8 results via JavaScript Number.toString()).
-/// `"1538352495634.5580"` → `"1538352495634.558"`, `"20813155870"` → `"20813155870"`.
-fn normalize_bigfloat(s: &str) -> String {
-	if let Some(dot_pos) = s.find('.') {
-		let trimmed = s.trim_end_matches('0');
-		if trimmed.len() == dot_pos + 1 {
-			// All fractional digits were zeros — drop the dot too.
-			trimmed[..dot_pos].to_string()
-		} else {
-			trimmed.to_string()
-		}
-	} else {
-		s.to_string()
-	}
-}
-
 /// Resolve the aggregates object for a connection query.
 ///
 /// `numeric_cols` is `&[(snake_case_name, graphql_type)]` captured from introspection.
@@ -78,41 +61,78 @@ pub async fn resolve_aggregates(
 	let params: Vec<Value> =
 		agg_ctx.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
-	let mut select_parts = vec!["COUNT(*) AS \"_count\"".to_string()];
+	// ── Inspect selection set to determine which aggregates are needed ────
+	let requested: std::collections::HashSet<String> =
+		ctx.field().selection_set().map(|f| f.name().to_string()).collect();
 
-	// distinctCount for ALL columns
-	for col in all_cols {
-		select_parts.push(format!("COUNT(DISTINCT t.\"{col}\") AS \"_dc_{col}\""));
+	let wants_count = requested.contains("count");
+	let wants_distinct = requested.contains("distinctCount");
+	let wants_sum = requested.contains("sum");
+	let wants_min = requested.contains("min");
+	let wants_max = requested.contains("max");
+	let wants_avg = requested.contains("average");
+	let wants_stddev_samp = requested.contains("stddevSample");
+	let wants_stddev_pop = requested.contains("stddevPopulation");
+	let wants_var_samp = requested.contains("varianceSample");
+	let wants_var_pop = requested.contains("variancePopulation");
+
+	let mut select_parts: Vec<String> = vec![];
+
+	if wants_count {
+		select_parts.push("COUNT(*) AS \"_count\"".to_string());
 	}
 
-	// Numeric-only aggregates.
-	// - sum / avg / stddev / variance: always cast to text via numeric to normalise precision.
-	// - min / max: cast only for BigInt/BigFloat; leave as native type for Int/Float.
+	if wants_distinct {
+		for col in all_cols {
+			select_parts.push(format!("COUNT(DISTINCT t.\"{col}\") AS \"_dc_{col}\""));
+		}
+	}
+
 	for (col, gql_type) in numeric_cols {
 		let native = is_native_number(gql_type);
 
-		// sum / avg / stddev / variance — always BigFloat text
-		select_parts.push(format!(
-			"CAST(SUM(t.\"{col}\")         AS TEXT) AS \"_sum_{col}\",\
-             CAST(AVG(t.\"{col}\")         AS TEXT) AS \"_avg_{col}\",\
-             CAST(STDDEV_SAMP(t.\"{col}\") AS TEXT) AS \"_stddev_samp_{col}\",\
-             CAST(STDDEV_POP(t.\"{col}\")  AS TEXT) AS \"_stddev_pop_{col}\",\
-             CAST(VAR_SAMP(t.\"{col}\")::numeric    AS TEXT) AS \"_var_samp_{col}\",\
-             CAST(VAR_POP(t.\"{col}\")::numeric     AS TEXT) AS \"_var_pop_{col}\""
-		));
-
-		// min / max — native for Int/Float, text for BigFloat/BigInt
-		if native {
+		if wants_sum {
+			select_parts.push(format!("CAST(SUM(t.\"{col}\") AS TEXT) AS \"_sum_{col}\""));
+		}
+		if wants_avg {
+			select_parts.push(format!("CAST(AVG(t.\"{col}\") AS TEXT) AS \"_avg_{col}\""));
+		}
+		if wants_stddev_samp {
+			select_parts
+				.push(format!("CAST(STDDEV_SAMP(t.\"{col}\") AS TEXT) AS \"_stddev_samp_{col}\""));
+		}
+		if wants_stddev_pop {
+			select_parts
+				.push(format!("CAST(STDDEV_POP(t.\"{col}\") AS TEXT) AS \"_stddev_pop_{col}\""));
+		}
+		if wants_var_samp {
 			select_parts.push(format!(
-				"MIN(t.\"{col}\") AS \"_min_{col}\",\
-                 MAX(t.\"{col}\") AS \"_max_{col}\""
-			));
-		} else {
-			select_parts.push(format!(
-				"CAST(MIN(t.\"{col}\") AS TEXT) AS \"_min_{col}\",\
-                 CAST(MAX(t.\"{col}\") AS TEXT) AS \"_max_{col}\""
+				"CAST(VAR_SAMP(t.\"{col}\")::numeric AS TEXT) AS \"_var_samp_{col}\""
 			));
 		}
+		if wants_var_pop {
+			select_parts
+				.push(format!("CAST(VAR_POP(t.\"{col}\")::numeric AS TEXT) AS \"_var_pop_{col}\""));
+		}
+		if wants_min {
+			if native {
+				select_parts.push(format!("MIN(t.\"{col}\") AS \"_min_{col}\""));
+			} else {
+				select_parts.push(format!("CAST(MIN(t.\"{col}\") AS TEXT) AS \"_min_{col}\""));
+			}
+		}
+		if wants_max {
+			if native {
+				select_parts.push(format!("MAX(t.\"{col}\") AS \"_max_{col}\""));
+			} else {
+				select_parts.push(format!("CAST(MAX(t.\"{col}\") AS TEXT) AS \"_max_{col}\""));
+			}
+		}
+	}
+
+	// Fallback: if nothing specific requested, at least return count
+	if select_parts.is_empty() {
+		select_parts.push("COUNT(*) AS \"_count\"".to_string());
 	}
 
 	let select_clause = select_parts.join(", ");
@@ -157,7 +177,7 @@ pub async fn resolve_aggregates(
 				row.try_get::<_, Option<String>>(key.as_str())
 					.ok()
 					.flatten()
-					.map(|s| Value::String(normalize_bigfloat(&s)))
+					.map(|s| Value::String(s))
 					.unwrap_or(Value::Null)
 			}};
 		}
@@ -294,37 +314,67 @@ pub async fn resolve_grouped_aggregates(
 		select_parts.push(item.select_expr.clone());
 	}
 
-	// COUNT(*) aggregate.
+	// ── Inspect selection set to only compute requested aggregates ────────
+	let requested: std::collections::HashSet<String> =
+		ctx.field().selection_set().map(|f| f.name().to_string()).collect();
+
+	let wants_distinct = requested.contains("distinctCount");
+	let wants_sum = requested.contains("sum");
+	let wants_min = requested.contains("min");
+	let wants_max = requested.contains("max");
+	let wants_avg = requested.contains("average");
+	let wants_stddev_samp = requested.contains("stddevSample");
+	let wants_stddev_pop = requested.contains("stddevPopulation");
+	let wants_var_samp = requested.contains("varianceSample");
+	let wants_var_pop = requested.contains("variancePopulation");
+
 	select_parts.push("COUNT(*) AS \"_count\"".to_string());
 
-	// distinctCount for ALL columns.
-	for col in all_cols {
-		select_parts.push(format!("COUNT(DISTINCT t.\"{col}\") AS \"_dc_{col}\""));
+	if wants_distinct {
+		for col in all_cols {
+			select_parts.push(format!("COUNT(DISTINCT t.\"{col}\") AS \"_dc_{col}\""));
+		}
 	}
 
-	// Numeric aggregates.
 	for (col, gql_type) in numeric_cols {
 		let native = is_native_number(gql_type);
 
-		select_parts.push(format!(
-			"CAST(SUM(t.\"{col}\")         AS TEXT) AS \"_sum_{col}\",\
-             CAST(AVG(t.\"{col}\")         AS TEXT) AS \"_avg_{col}\",\
-             CAST(STDDEV_SAMP(t.\"{col}\") AS TEXT) AS \"_stddev_samp_{col}\",\
-             CAST(STDDEV_POP(t.\"{col}\")  AS TEXT) AS \"_stddev_pop_{col}\",\
-             CAST(VAR_SAMP(t.\"{col}\")::numeric    AS TEXT) AS \"_var_samp_{col}\",\
-             CAST(VAR_POP(t.\"{col}\")::numeric     AS TEXT) AS \"_var_pop_{col}\""
-		));
-
-		if native {
+		if wants_sum {
+			select_parts.push(format!("CAST(SUM(t.\"{col}\") AS TEXT) AS \"_sum_{col}\""));
+		}
+		if wants_avg {
+			select_parts.push(format!("CAST(AVG(t.\"{col}\") AS TEXT) AS \"_avg_{col}\""));
+		}
+		if wants_stddev_samp {
+			select_parts
+				.push(format!("CAST(STDDEV_SAMP(t.\"{col}\") AS TEXT) AS \"_stddev_samp_{col}\""));
+		}
+		if wants_stddev_pop {
+			select_parts
+				.push(format!("CAST(STDDEV_POP(t.\"{col}\") AS TEXT) AS \"_stddev_pop_{col}\""));
+		}
+		if wants_var_samp {
 			select_parts.push(format!(
-				"MIN(t.\"{col}\") AS \"_min_{col}\",\
-                 MAX(t.\"{col}\") AS \"_max_{col}\""
+				"CAST(VAR_SAMP(t.\"{col}\")::numeric AS TEXT) AS \"_var_samp_{col}\""
 			));
-		} else {
-			select_parts.push(format!(
-				"CAST(MIN(t.\"{col}\") AS TEXT) AS \"_min_{col}\",\
-                 CAST(MAX(t.\"{col}\") AS TEXT) AS \"_max_{col}\""
-			));
+		}
+		if wants_var_pop {
+			select_parts
+				.push(format!("CAST(VAR_POP(t.\"{col}\")::numeric AS TEXT) AS \"_var_pop_{col}\""));
+		}
+		if wants_min {
+			if native {
+				select_parts.push(format!("MIN(t.\"{col}\") AS \"_min_{col}\""));
+			} else {
+				select_parts.push(format!("CAST(MIN(t.\"{col}\") AS TEXT) AS \"_min_{col}\""));
+			}
+		}
+		if wants_max {
+			if native {
+				select_parts.push(format!("MAX(t.\"{col}\") AS \"_max_{col}\""));
+			} else {
+				select_parts.push(format!("CAST(MAX(t.\"{col}\") AS TEXT) AS \"_max_{col}\""));
+			}
 		}
 	}
 
@@ -405,7 +455,7 @@ pub async fn resolve_grouped_aggregates(
 					row.try_get::<_, Option<String>>(key.as_str())
 						.ok()
 						.flatten()
-						.map(|s| Value::String(normalize_bigfloat(&s)))
+						.map(|s| Value::String(s))
 						.unwrap_or(Value::Null)
 				}};
 			}
