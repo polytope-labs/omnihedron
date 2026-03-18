@@ -64,6 +64,101 @@ pub fn to_pascal_case(s: &str) -> String {
 	}
 }
 
+/// Convert a raw PostgreSQL enum type name (which may be a 10-char blake2 hex
+/// hash with no `_` separators) to a valid GraphQL type name, matching
+/// PostGraphile's `coerceToGraphQLName` + `upperCamelCase` behaviour.
+///
+/// Rules (mirrors PostGraphile exactly):
+/// 1. If the name starts with a digit, prefix with `_` (GraphQL names must start with `[_A-Za-z]`).
+/// 2. Preserve any remaining leading underscores.
+/// 3. Within the inner content, split on both `_` **and** digit→letter transitions (lodash
+///    `words()` behaviour) and capitalise the first character of each word.
+/// 4. Uppercase the first non-underscore character of the result.
+///
+/// Examples:
+///   `869e90c211`  → `_869E90C211`
+///   `1c84cbf86c`  → `_1C84Cbf86C`
+///   `31415d4fcd`  → `_31415D4Fcd`
+///   `order_status` → `OrderStatus`  (ordinary snake_case still works)
+pub fn pg_enum_type_to_gql_name(pg_name: &str) -> String {
+	// Step 1 — coerceToGraphQLName: prepend _ if leading digit.
+	let name: &str;
+	let owned;
+	if pg_name.starts_with(|c: char| c.is_ascii_digit()) {
+		owned = format!("_{pg_name}");
+		name = &owned;
+	} else {
+		name = pg_name;
+	}
+
+	// Step 2 — preserve leading underscores.
+	let leading_len = name.chars().take_while(|&c| c == '_').count();
+	let leading = &name[..leading_len];
+	let inner = &name[leading_len..];
+
+	// Step 3 — camelCase the inner content with digit→letter word boundaries.
+	let camel = camel_case_digit_aware(inner);
+
+	// Step 4 — upperFirst the camel result.
+	let upper = match camel.chars().next() {
+		None => camel,
+		Some(first) => first.to_uppercase().collect::<String>() + &camel[first.len_utf8()..],
+	};
+
+	format!("{leading}{upper}")
+}
+
+/// `camelCase` variant that splits on both `_` and digit→letter transitions.
+/// Mirrors lodash `_.camelCase` / `_.words()` behaviour for hex-like strings.
+///
+/// Words are joined as: first word lowercase, subsequent words title-cased.
+fn camel_case_digit_aware(s: &str) -> String {
+	let mut words: Vec<String> = Vec::new();
+	let mut current = String::new();
+	let mut prev_was_digit = false;
+
+	for ch in s.chars() {
+		if ch == '_' {
+			if !current.is_empty() {
+				words.push(current.clone());
+				current.clear();
+			}
+			prev_was_digit = false;
+		} else if prev_was_digit && ch.is_ascii_alphabetic() {
+			// digit→letter transition: treat as word boundary
+			if !current.is_empty() {
+				words.push(current.clone());
+				current.clear();
+			}
+			current.push(ch);
+			prev_was_digit = false;
+		} else {
+			current.push(ch);
+			prev_was_digit = ch.is_ascii_digit();
+		}
+	}
+	if !current.is_empty() {
+		words.push(current);
+	}
+
+	words
+		.iter()
+		.enumerate()
+		.map(|(i, word)| {
+			if i == 0 {
+				word.to_lowercase()
+			} else {
+				let mut chars = word.chars();
+				match chars.next() {
+					None => String::new(),
+					Some(first) =>
+						first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+				}
+			}
+		})
+		.collect()
+}
+
 /// Convert a `snake_case` column name to `SCREAMING_SNAKE_CASE` for OrderBy
 /// and Distinct enum values.
 ///
@@ -443,6 +538,24 @@ mod tests {
 	#[test]
 	fn backward_rel() {
 		assert_eq!(backward_relation_field("transfers", "account_id"), "transfersByAccountId");
+	}
+
+	#[test]
+	fn pg_enum_gql_name() {
+		// blake2 hashes that start with a digit — must be prefixed with _
+		// and have digit→letter transitions capitalized (matches PostGraphile)
+		assert_eq!(pg_enum_type_to_gql_name("869e90c211"), "_869E90C211");
+		assert_eq!(pg_enum_type_to_gql_name("1c84cbf86c"), "_1C84Cbf86C");
+		assert_eq!(pg_enum_type_to_gql_name("31415d4fcd"), "_31415D4Fcd");
+		assert_eq!(pg_enum_type_to_gql_name("72ce17d1cf"), "_72Ce17D1Cf");
+		assert_eq!(pg_enum_type_to_gql_name("69ec6d2f99"), "_69Ec6D2F99");
+		assert_eq!(pg_enum_type_to_gql_name("318f1d9a29"), "_318F1D9A29");
+		assert_eq!(pg_enum_type_to_gql_name("167d3578e1"), "_167D3578E1");
+		// Hash that starts with a letter — no _ prefix needed
+		assert_eq!(pg_enum_type_to_gql_name("fcabdfcd05"), "Fcabdfcd05");
+		// Ordinary snake_case enum type still works
+		assert_eq!(pg_enum_type_to_gql_name("order_status"), "OrderStatus");
+		assert_eq!(pg_enum_type_to_gql_name("transfer_type"), "TransferType");
 	}
 
 	#[test]

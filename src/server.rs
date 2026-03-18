@@ -19,7 +19,7 @@ use axum::{
 	Router,
 	body::Bytes,
 	extract::{State, WebSocketUpgrade},
-	http::{HeaderMap, StatusCode},
+	http::StatusCode,
 	middleware,
 	response::{Html, IntoResponse, Json, Response},
 	routing::{get, post},
@@ -30,6 +30,7 @@ use tower_http::{
 	compression::CompressionLayer,
 	cors::{Any, CorsLayer},
 };
+use tracing::{debug, warn};
 
 use crate::{
 	config::Config,
@@ -78,11 +79,7 @@ pub fn build_router(state: AppState) -> Router {
 		.with_state(state)
 }
 
-async fn graphql_handler(
-	State(state): State<AppState>,
-	headers: HeaderMap,
-	body: Bytes,
-) -> Response {
+async fn graphql_handler(State(state): State<AppState>, body: Bytes) -> Response {
 	// Detect batch (JSON array) vs single request
 	let body_val: Value = match serde_json::from_slice(&body) {
 		Ok(v) => v,
@@ -92,7 +89,6 @@ async fn graphql_handler(
 	};
 
 	if body_val.is_array() {
-		// Batch request
 		let items = body_val.as_array().unwrap();
 		let schema = state.schema.read().await;
 		let mut responses = Vec::with_capacity(items.len());
@@ -100,23 +96,26 @@ async fn graphql_handler(
 			let gql_req: GqlRequest = match serde_json::from_value(item.clone()) {
 				Ok(r) => r,
 				Err(e) => {
-					responses.push(
-						serde_json::to_value(GqlResponse::from_errors(vec![ServerError::new(
-							format!("Invalid request: {e}"),
-							None,
-						)]))
-						.unwrap_or(Value::Null),
-					);
+					let err_resp = GqlResponse::from_errors(vec![ServerError::new(
+						format!("Invalid request: {e}"),
+						None,
+					)]);
+					match serde_json::to_value(err_resp) {
+						Ok(v) => responses.push(v),
+						Err(e) => warn!(error = %e, "Failed to serialize error response"),
+					}
 					continue;
 				},
 			};
 			let resp = execute_single(&schema, &state.cfg, gql_req).await;
-			responses.push(serde_json::to_value(&resp).unwrap_or(Value::Null));
+			match serde_json::to_value(&resp) {
+				Ok(v) => responses.push(v),
+				Err(e) => warn!(error = %e, "Failed to serialize GraphQL response"),
+			}
 		}
 		return Json(Value::Array(responses)).into_response();
 	}
 
-	// Single request — re-use the normal flow via axum extractor
 	let gql_req: GqlRequest = match serde_json::from_value(body_val) {
 		Ok(r) => r,
 		Err(e) => {
@@ -125,14 +124,17 @@ async fn graphql_handler(
 		},
 	};
 
-	// Check GET-based forwarding via query params isn't needed here; body is always present
-	let _ = headers; // headers available if needed later
 	let schema = state.schema.read().await;
 	let resp: GraphQLResponse = execute_single(&schema, &state.cfg, gql_req).await.into();
 	resp.into_response()
 }
 
 async fn execute_single(schema: &Schema, cfg: &Config, inner: GqlRequest) -> GqlResponse {
+	let start = std::time::Instant::now();
+	let operation = inner.operation_name.as_deref().unwrap_or("<anonymous>").to_string();
+	// Collapse whitespace for a compact single-line query preview
+	let query_preview: String = inner.query.split_whitespace().collect::<Vec<_>>().join(" ");
+
 	// Pre-execution validation (unless unsafe mode)
 	if !cfg.unsafe_mode {
 		if let Ok(doc) = parse_query(&inner.query) {
@@ -164,7 +166,18 @@ async fn execute_single(schema: &Schema, cfg: &Config, inner: GqlRequest) -> Gql
 
 	// Inject schema name into request context for resolvers
 	let request = inner.data(cfg.name.clone());
-	schema.execute(request).await
+	let resp = schema.execute(request).await;
+
+	let has_errors = !resp.errors.is_empty();
+	debug!(
+		operation = %operation,
+		duration_ms = start.elapsed().as_millis(),
+		has_errors,
+		query = %query_preview,
+		"GraphQL request completed"
+	);
+
+	resp
 }
 
 async fn graphql_ws_handler(

@@ -65,10 +65,19 @@ Docker Hub: `polytopelabs/omnihedron`
 - GraphQL variables
 - `/health` endpoint
 - `cargo +nightly fmt` formatting enforced in CI
+- Selective `SELECT` — only columns referenced in the query are fetched (`filter_columns_by_request`). Uses `ctx.field().selection_set()` to iterate the direct children of the connection field, then drills into `nodes { … }` and `edges { node { … } }` to collect the entity field names. **Important:** the correct async-graphql 7.x API is `ctx.field().selection_set()` (not `ctx.look_ahead().field("nodes").selection_fields()` — `.selection_fields()` returns the matched node itself, not its children; use `.exists()` for boolean presence checks).
+- Count-only fast-path — queries with no `nodes`/`edges` selection skip the row fetch entirely. `has_node_selection` uses `ctx.look_ahead().field("nodes").exists()` which correctly traverses the current field's selection set in async-graphql 7.x dynamic schema.
+- Window function `COUNT(*) OVER()` — total count and rows fetched in a single SQL round-trip (non-DISTINCT queries)
+- `TextParam` wrapper in `json_to_pg_params` — sends all numeric and array JSON values as PostgreSQL text-format parameters (accepts any server type, uses `Format::Text`). This avoids OID mismatch errors when filtering on INT4/NUMERIC/JSONB columns with parameterised queries.
+- Hex enum type naming — `pg_enum_type_to_gql_name` replicates PostGraphile's `coerceToGraphQLName` + lodash `upperCamelCase` with digit→letter word boundaries (for SubQuery's blake2 10-char hash enum names)
+- `_MetadatasEdge` type registered with `cursor` + `node` fields; `_Metadatas` exposes `edges` field
+- Cursor-based pagination (`after`/`before`) with explicit `orderBy` — `parse_orderby` and `parse_distinct` accept both `List` and bare `Enum`/`String` values since async-graphql dynamic schema does not auto-coerce single enum values into lists for these args
 
 ### NOT YET IMPLEMENTED
-- Query timeout enforcement (`--query-timeout` flag exists in config but is never applied to query execution)
-- `--query-explain` SQL EXPLAIN logging
+- `--query-explain` SQL EXPLAIN logging (`query_explain` field exists in config but is never read; no `EXPLAIN` queries are executed)
+
+### Notes
+- Query timeout is enforced via PostgreSQL `statement_timeout` set on every pool connection (`src/db/pool.rs`: `.options(&format!("-c statement_timeout={}", cfg.query_timeout))`). The DB kills any query exceeding the limit.
 
 ---
 
@@ -180,6 +189,8 @@ All naming logic lives in `src/schema/inflector.rs`. Must match PostGraphile's `
 - Consecutive uppercase: `CumulativeVolumeUSDS` → `CumulativeVolumeUsds`
 - Last uppercase in PascalCase determines where `s`/`S` suffix goes
 
+**Enum type names (PostgreSQL → GraphQL):** `pg_enum_type_to_gql_name` in `inflector.rs` replicates PostGraphile's exact chain: prepend `_` if name starts with a digit (`coerceToGraphQLName`), then apply lodash-style `upperCamelCase` with digit→letter transitions as word boundaries. This correctly handles SubQuery's blake2 10-char hex hash names (e.g. `869e90c211` → `_869E90C211`). Note: this logic is **separate** from `to_camel_case` — the digit→letter split only applies to the enum fallback path, not to regular column/table name inflection.
+
 **Table → field names:**
 - `transfers` → type `Transfer`, connection query `transfers`, single `transfer`
 - OrderBy enum: `COLUMN_NAME_ASC` / `COLUMN_NAME_DESC`
@@ -194,7 +205,7 @@ All naming logic lives in `src/schema/inflector.rs`. Must match PostGraphile's `
 
 Both use base64-encoded JSON, matching PostGraphile exactly.
 
-**Cursor:** `base64({"id": "<pk_value>"})` — currently encodes only the primary key. Multi-column ordering pagination has a known gap: cursors should include all order-by fields as tiebreakers but currently only include `id`. This means cursor pagination may return duplicate rows when ordering by a non-unique column.
+**Cursor:** `base64({"id": "<pk_value>"})` — encodes only the primary key. Cursor-based pagination works for `id`-ordered queries. Multi-column ordering (ordering by non-PK columns) may return duplicate rows at page boundaries since the cursor only includes `id`; this is a known limitation but sufficient for the primary use case.
 
 **nodeId:** `base64(["TypeName", pkValue])` — e.g., `base64(["Transfer", "abc123"])`.
 `{entity}ByNodeId` queries decode this and look up `WHERE t.id = $1`.
@@ -205,12 +216,16 @@ Both use base64-encoded JSON, matching PostGraphile exactly.
 
 **List query (connection resolver):**
 ```sql
-SELECT * FROM "{schema}"."{table}" AS t
+SELECT t."id", t."col1", ..., COUNT(*) OVER() AS __total_count
+FROM "{schema}"."{table}" AS t
 [WHERE upper_inf(t._block_range)]      -- historical tables, no blockHeight arg
 [WHERE t._block_range @> $N::bigint]   -- historical tables, with blockHeight arg
 [WHERE {filter_clauses}]
 [ORDER BY t.id ASC]                    -- default; replaced by orderBy arg
 LIMIT $N OFFSET $N
+-- Only columns referenced in nodes/edges selection are fetched (ctx.field().selection_set() drill-down).
+-- COUNT(*) OVER() fetches total count in one round-trip (omitted for DISTINCT queries).
+-- If query has no nodes/edges selection, row fetch is skipped entirely (count-only fast-path).
 ```
 
 **Distinct:**
@@ -249,9 +264,10 @@ The global `_global` table exists but is typically empty.
 Tests live in `tests/integration_test.rs` and compare Rust vs TypeScript service responses.
 
 **What's tested:**
+**Rust + TS comparison tests (both services must be running):**
 - `test_health` — `/health` returns 2xx; TypeScript `/graphql` responds to `{ __typename }`
 - `test_metadata` — `_metadata(chainId: "11155111")` returns matching data from both services
-- `test_introspection_types` — full schema type set matches (716 types); excludes `__*`, `_Global*`, `_Metadata*`, `_Multi*`, `Having*`, `*AggregatesFilter`, `*GroupBy`, `*DistinctCountAggregates`, `*AggregateFilter`, `*ToMany*`
+- `test_introspection_types` — full schema type set matches (725 types); excludes only PostGraphile aggregate helper types: `__*`, `Having*`, `*AggregatesFilter`, `*GroupBy`, `*DistinctCountAggregates`, `*AggregateFilter`, `*ToMany*`
 - `test_first_entity_list` — first connection field discovered via introspection; `first: 5` returns matching nodes
 - `test_pagination` — page 1 → page 2 cursor, verifies no overlap between pages
 - `test_order_by` — `orderBy: ID_ASC` returns lexicographically sorted results on both services
@@ -259,6 +275,19 @@ Tests live in `tests/integration_test.rs` and compare Rust vs TypeScript service
 - `test_aggregates` — aggregates field responds without error (values not strictly compared)
 - `test_batch_query` — POST with JSON array of 2 queries returns array of 2 results
 - `test_query_with_variables` — GraphQL variable `$count: Int!` correctly applied
+- `test_filter_equalto` — `filter: { chain: { equalTo: "KUSAMA-4009" } }` returns 20 matching rows; TS/Rust compared
+- `test_filter_comparison` — `filter: { blockNumber: { greaterThan: 2156000 } }` on INT4 column; exercises `TextParam` fix
+- `test_filter_in` — `filter: { id: { in: [...] } }` returns exactly 3 named fixture rows; uses JSONB parameter via `TextParam`
+- `test_filter_string_ops` — `filter: { id: { startsWith: "0x2c5edd" } }` returns 1 row; LIKE operator
+- `test_filter_logical` — `and`/`or` logical filter operators combining chain and blockNumber conditions
+- `test_orderby_non_id` — `orderBy: BLOCK_NUMBER_ASC` returns ascending block number order on both services
+- `test_distinct` — `distinct: [CHAIN]` collapses 20 same-chain rows to 1; both services return chain="KUSAMA-4009"
+
+**Rust-only tests (probe only the Rust service):**
+- `test_count_only` — query with only `totalCount` (no `nodes`/`edges`) returns valid count
+- `test_total_count_accuracy` — `totalCount` with `first: 1000` equals actual `nodes.length` (verifies window function COUNT)
+- `test_numeric_aggregates` — `sum`/`min`/`max`/`average` on `blockNumber` and `amount` columns; all results are strings
+- `test_blockheight` — `blockHeight: "9999999999999"` returns all 20 rows; `blockHeight: "1729590000000"` returns exactly 1 row (Rust-only feature, TS rejects blockHeight)
 
 **Test infrastructure:**
 - `sort_nodes()` — recursively sorts arrays of objects by `id` field for deterministic comparison
@@ -266,6 +295,19 @@ Tests live in `tests/integration_test.rs` and compare Rust vs TypeScript service
 - Tests skip (with `eprintln!("SKIP:")`) if services not reachable — they don't fail CI when services are down
 
 **Fixture:** `tests/fixtures/test_db.sql` (1.6MB) — full schema DDL + all `_metadata_*` rows + 20 rows per entity table. Regenerate with `bash scripts/create_fixture.sh` when the real schema changes (requires the full DB running).
+
+---
+
+## Known divergences from PostGraphile
+
+These are intentional or accepted differences from the TypeScript `@subql/query` behaviour.
+
+| Area | PostGraphile behaviour | omnihedron behaviour |
+|---|---|---|
+| `aggregates { count }` | `count` does **not** exist on `{Entity}Aggregates` — PostGraphile's pg-aggregates plugin omits it | `count: BigInt!` **is** present on `{Entity}Aggregates`. Use `aggregates { count }` to get a filtered row count alongside other aggregate fields. |
+| Counting entities | Use `connection { totalCount }` | Same — `{ assetTeleporteds { totalCount } }` works on both and hits the count-only fast-path (no rows fetched). |
+
+**Consequence for tests:** `test_aggregates` uses `distinctCount { id }` instead of `count` so the query is valid on both services. If you add a Rust-only aggregates test, `aggregates { count }` is safe to use.
 
 ---
 

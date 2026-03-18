@@ -28,7 +28,8 @@ pub fn create_pool(db: &DbConfig, cfg: &Config, for_subscription: bool) -> Resul
 		.port(db.port)
 		.user(&db.user)
 		.password(db.password.as_str())
-		.dbname(&db.database);
+		.dbname(&db.database)
+		.options(&format!("-c statement_timeout={}", cfg.query_timeout));
 
 	let manager = Manager::from_config(
 		pg_config,

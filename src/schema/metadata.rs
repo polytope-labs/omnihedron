@@ -102,6 +102,23 @@ pub fn register_metadata_types(builder: SchemaBuilder) -> SchemaBuilder {
 		.field(json_field("deployments", "JSON"))
 		.field(str_field("historicalStateEnabled"));
 
+	let metadatas_edge = Object::new("_MetadatasEdge")
+		.field(Field::new("cursor", TypeRef::named_nn("Cursor"), |ctx| {
+			FieldFuture::new(async move {
+				let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
+				Ok(parent
+					.get("cursor")
+					.and_then(|v| v.as_str())
+					.map(|s| GqlValue::String(s.to_string())))
+			})
+		}))
+		.field(Field::new("node", TypeRef::named("_Metadata"), |ctx| {
+			FieldFuture::new(async move {
+				let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
+				Ok(parent.get("node").cloned().map(|v| FieldValue::owned_any(v)))
+			})
+		}));
+
 	let metadatas = Object::new("_Metadatas")
 		.field(Field::new("totalCount", TypeRef::named_nn(TypeRef::INT), |ctx| {
 			FieldFuture::new(async move {
@@ -117,7 +134,19 @@ pub fn register_metadata_types(builder: SchemaBuilder) -> SchemaBuilder {
 					parent.get("nodes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 				Ok(Some(FieldValue::list(nodes.into_iter().map(FieldValue::owned_any))))
 			})
+		}))
+		.field(Field::new("edges", TypeRef::named_nn_list("_MetadatasEdge"), |ctx| {
+			FieldFuture::new(async move {
+				let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
+				let edges: Vec<serde_json::Value> =
+					parent.get("edges").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+				Ok(Some(FieldValue::list(edges.into_iter().map(FieldValue::owned_any))))
+			})
 		}));
 
-	builder.register(table_estimate).register(metadata).register(metadatas)
+	builder
+		.register(table_estimate)
+		.register(metadata)
+		.register(metadatas_edge)
+		.register(metadatas)
 }

@@ -84,8 +84,20 @@ fn setup_logging(cfg: &Config) {
 	let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
 	if cfg.output_fmt == "json" {
-		tracing_subscriber::registry().with(filter).with(fmt::layer().json()).init();
+		tracing_subscriber::registry()
+			.with(filter)
+			.with(fmt::layer().json().with_file(false).with_line_number(false).with_target(false))
+			.init();
 	} else {
-		tracing_subscriber::registry().with(filter).with(fmt::layer().pretty()).init();
+		tracing_subscriber::registry()
+			.with(filter)
+			.with(
+				fmt::layer()
+					.compact()
+					.with_file(false)
+					.with_line_number(false)
+					.with_target(false),
+			)
+			.init();
 	}
 }

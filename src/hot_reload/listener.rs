@@ -74,9 +74,10 @@ async fn listen_for_changes(
 		loop {
 			let msg = futures::future::poll_fn(|cx| connection.poll_message(cx)).await;
 			match msg {
-				Some(Ok(AsyncMessage::Notification(n))) => {
-					let _ = tx.send(n).await;
-				},
+				Some(Ok(AsyncMessage::Notification(n))) =>
+					if let Err(e) = tx.send(n).await {
+						warn!(error = %e, "Failed to forward schema change notification");
+					},
 				Some(Ok(_)) => {}, // Notice or other message
 				Some(Err(_)) | None => break,
 			}
@@ -112,33 +113,33 @@ async fn listen_for_changes(
 	}
 }
 
+async fn try_build_schema(
+	pool: &Arc<Pool>,
+	cfg: &Arc<Config>,
+) -> anyhow::Result<async_graphql::dynamic::Schema> {
+	let tables = introspect_schema(pool, &cfg.name).await?;
+	let enums = introspect_enums(pool, &cfg.name).await?;
+	build_schema(&tables, &enums, pool.clone(), cfg.clone())
+}
+
 async fn rebuild_schema(pool: Arc<Pool>, schema_lock: Arc<RwLock<Schema>>, cfg: Arc<Config>) {
 	const MAX_RETRIES: u32 = 5;
-	let mut attempt = 0;
-	loop {
-		attempt += 1;
-		match introspect_schema(&pool, &cfg.name).await {
-			Ok(tables) => match introspect_enums(&pool, &cfg.name).await {
-				Ok(enums) => match build_schema(&tables, &enums, pool.clone(), cfg.clone()) {
-					Ok(new_schema) => {
-						let mut lock = schema_lock.write().await;
-						*lock = new_schema;
-						info!("Schema successfully rebuilt");
-						return;
-					},
-					Err(e) => error!(error = %e, attempt, "Failed to build schema"),
-				},
-				Err(e) => error!(error = %e, attempt, "Failed to introspect enums"),
+	for attempt in 1..=MAX_RETRIES {
+		match try_build_schema(&pool, &cfg).await {
+			Ok(new_schema) => {
+				*schema_lock.write().await = new_schema;
+				info!("Schema successfully rebuilt");
+				return;
 			},
-			Err(e) => error!(error = %e, attempt, "Failed to introspect schema"),
+			Err(e) => {
+				error!(error = %e, attempt, "Failed to rebuild schema");
+				if attempt < MAX_RETRIES {
+					tokio::time::sleep(Duration::from_secs(10)).await;
+				}
+			},
 		}
-
-		if attempt >= MAX_RETRIES {
-			error!("Giving up schema rebuild after {MAX_RETRIES} attempts");
-			return;
-		}
-		tokio::time::sleep(Duration::from_secs(10)).await;
 	}
+	error!("Giving up schema rebuild after {MAX_RETRIES} attempts");
 }
 
 /// Compute the PostgreSQL LISTEN channel name.

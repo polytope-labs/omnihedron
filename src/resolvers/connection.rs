@@ -6,15 +6,18 @@
 //! SQL query, executing it, and assembling the `{Entity}Connection` response
 //! (nodes, edges, pageInfo, totalCount).
 
+use std::collections::HashSet;
+
 use async_graphql::dynamic::ResolverContext;
+use bytes::BytesMut;
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{Format, IsNull, ToSql, Type};
 use tracing::debug;
 
 use crate::{
 	config::Config,
-	schema::cursor::encode_cursor,
+	schema::{cursor::encode_cursor, inflector::to_camel_case},
 	sql::{
 		filter::build_filter_sql,
 		pagination::{PaginationArgs, resolve_pagination},
@@ -30,6 +33,7 @@ pub async fn resolve_connection(
 	table: &str,
 	cfg: &Config,
 	is_historical: bool,
+	columns: &[String],
 ) -> async_graphql::Result<Option<Value>> {
 	// ── Extract arguments ─────────────────────────────────────────────────────
 	let first = ctx.args.get("first").and_then(|v| v.i64().ok()).map(|n| n as usize);
@@ -114,11 +118,6 @@ pub async fn resolve_connection(
 		format!("ORDER BY {}", order_clauses.join(", "))
 	};
 
-	let sql = format!(
-		r#"SELECT {distinct_clause}t.* FROM "{schema}"."{table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
-		pagination.offset
-	);
-
 	let count_sql =
 		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{table}" AS t {where_clause}"#);
 
@@ -129,17 +128,63 @@ pub async fn resolve_connection(
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	debug!(sql = %sql, "Executing connection query");
-	let rows = client.query(&sql, &pg_refs).await?;
-	let total_row = client.query_one(&count_sql, &pg_refs).await?;
-	let total: i64 = total_row.get("total");
+	// If the client only requested totalCount/pageInfo with no node fields,
+	// skip fetching rows entirely and run only the count query.
+	let needs_rows = has_node_selection(ctx);
+
+	let (rows, total) = if !needs_rows {
+		debug!(count_sql = %count_sql, "Executing count-only query");
+		let row = client.query_one(&count_sql, &pg_refs).await?;
+		(vec![], row.get::<_, i64>("total"))
+	} else {
+		// Build a selective column list from the GraphQL lookahead.
+		let select_cols =
+			build_select_cols(ctx, columns, &order_cols, &distinct_cols, is_historical);
+
+		// For non-DISTINCT queries embed COUNT(*) OVER() to get the total in a
+		// single round-trip. For DISTINCT queries the window function fires before
+		// deduplication and would overcount, so use the separate count query.
+		let (sql, use_window_count) = if distinct_cols.is_empty() {
+			(
+				format!(
+					r#"SELECT {select_cols}, COUNT(*) OVER() AS __total_count FROM "{schema}"."{table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
+					pagination.offset
+				),
+				true,
+			)
+		} else {
+			(
+				format!(
+					r#"SELECT {distinct_clause}{select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
+					pagination.offset
+				),
+				false,
+			)
+		};
+
+		debug!(sql = %sql, "Executing connection query");
+		let rows = client.query(&sql, &pg_refs).await?;
+		let total = if use_window_count {
+			rows.first()
+				.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
+				.unwrap_or(0)
+		} else {
+			let total_row = client.query_one(&count_sql, &pg_refs).await?;
+			total_row.get("total")
+		};
+		(rows, total)
+	};
 
 	// ── Build response ────────────────────────────────────────────────────────
 	let mut nodes: Vec<Value> = vec![];
 	let mut edges: Vec<Value> = vec![];
 
 	for row in &rows {
-		let node = row_to_json(row);
+		let mut node = row_to_json(row);
+		// Strip the synthetic window-count column — it must not appear in GraphQL output.
+		if let Value::Object(ref mut map) = node {
+			map.remove("__total_count");
+		}
 		let cursor_fields: Vec<(&str, Value)> =
 			vec![("id", node.get("id").cloned().unwrap_or(json!(null)))];
 		let cursor = encode_cursor(&cursor_fields);
@@ -178,9 +223,235 @@ pub async fn resolve_connection(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Returns true if the query requests any node/edge row data.
+/// False means the client only wants totalCount/pageInfo — no rows needed.
+///
+/// Uses `ctx.look_ahead().field("nodes").exists()` which is the correct
+/// async-graphql 7.x API for presence checks in dynamic schema — `.exists()`
+/// walks into the current field's selection set looking for the named sub-field.
+/// Note: `.selection_fields()` returns the *matched field node itself* (name =
+/// "nodes"), not its children — use `.exists()` for boolean checks and
+/// `ctx.field().selection_set()` to iterate children.
+fn has_node_selection(ctx: &ResolverContext<'_>) -> bool {
+	ctx.look_ahead().field("nodes").exists() || ctx.look_ahead().field("edges").exists()
+}
+
+/// Build a selective `SELECT` column list from the GraphQL selection.
+///
+/// Uses `ctx.field().selection_set()` to iterate the direct children of the
+/// current connection field (e.g. `nodes`, `edges`, `totalCount`), then drills
+/// into `nodes { ... }` and `edges { node { ... } }` to collect the entity
+/// field names actually requested by the client.
+///
+/// Always includes `id` (cursor generation), any orderBy/distinct columns, and
+/// `_block_range` for historical tables.
+fn build_select_cols(
+	ctx: &ResolverContext<'_>,
+	columns: &[String],
+	order_cols: &[String],
+	distinct_cols: &[String],
+	is_historical: bool,
+) -> String {
+	let mut requested: HashSet<String> = HashSet::new();
+
+	// Iterate the direct children of the connection field (nodes, edges, totalCount …)
+	for top in ctx.field().selection_set() {
+		match top.name() {
+			"nodes" => {
+				// nodes { id chain blockNumber … }
+				for child in top.selection_set() {
+					requested.insert(child.name().to_string());
+				}
+			},
+			"edges" => {
+				// edges { node { id chain … } }
+				for node_field in top.selection_set().filter(|f| f.name() == "node") {
+					for child in node_field.selection_set() {
+						requested.insert(child.name().to_string());
+					}
+				}
+			},
+			_ => {},
+		}
+	}
+
+	filter_columns_by_request(&requested, columns, order_cols, distinct_cols, is_historical)
+}
+
+/// Pure column-selection logic: given a set of requested camelCase GraphQL field
+/// names, returns a comma-separated `t."col"` SELECT list.
+///
+/// Rules (in priority order):
+/// 1. `id` is always included (cursor generation).
+/// 2. Any column whose camelCase name (or raw name) appears in `requested`.
+/// 3. All `order_cols` and `distinct_cols` (needed for ORDER BY / DISTINCT ON).
+/// 4. `_block_range` for historical tables (needed in WHERE clause).
+///
+/// If `requested` is empty (shouldn't happen in practice) only `t."id"` is returned.
+pub fn filter_columns_by_request(
+	requested: &HashSet<String>,
+	columns: &[String],
+	order_cols: &[String],
+	distinct_cols: &[String],
+	is_historical: bool,
+) -> String {
+	if requested.is_empty() {
+		return "t.\"id\"".to_string();
+	}
+
+	let mut selected: Vec<String> = Vec::new();
+	let mut included: HashSet<String> = HashSet::new();
+
+	let mut add = |col: &str| {
+		if included.insert(col.to_string()) {
+			selected.push(format!("t.\"{}\"", col));
+		}
+	};
+
+	add("id");
+
+	for col in columns {
+		if col == "id" {
+			continue;
+		}
+		if requested.contains(&to_camel_case(col)) || requested.contains(col.as_str()) {
+			add(col);
+		}
+	}
+
+	for col in order_cols.iter().chain(distinct_cols.iter()) {
+		add(col);
+	}
+
+	if is_historical {
+		add("_block_range");
+	}
+
+	selected.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashSet;
+
+	use super::filter_columns_by_request;
+
+	fn set(items: &[&str]) -> HashSet<String> {
+		items.iter().map(|s| s.to_string()).collect()
+	}
+
+	fn cols(items: &[&str]) -> Vec<String> {
+		items.iter().map(|s| s.to_string()).collect()
+	}
+
+	#[test]
+	fn always_includes_id() {
+		let result =
+			filter_columns_by_request(&set(&["id"]), &cols(&["id", "name"]), &[], &[], false);
+		assert!(result.contains("t.\"id\""), "id should always be first: {result}");
+	}
+
+	#[test]
+	fn selects_requested_camel_case_columns() {
+		// "blockNumber" → column "block_number"
+		let result = filter_columns_by_request(
+			&set(&["blockNumber"]),
+			&cols(&["id", "block_number", "amount"]),
+			&[],
+			&[],
+			false,
+		);
+		assert!(result.contains("t.\"block_number\""), "block_number not in: {result}");
+		assert!(!result.contains("t.\"amount\""), "amount should not be in: {result}");
+	}
+
+	#[test]
+	fn does_not_duplicate_id() {
+		// id is in both required-always and requested set
+		let result = filter_columns_by_request(
+			&set(&["id", "amount"]),
+			&cols(&["id", "amount"]),
+			&[],
+			&[],
+			false,
+		);
+		let id_count = result.matches("t.\"id\"").count();
+		assert_eq!(id_count, 1, "id should appear exactly once: {result}");
+	}
+
+	#[test]
+	fn includes_order_cols_even_if_not_requested() {
+		let result = filter_columns_by_request(
+			&set(&["id"]),
+			&cols(&["id", "created_at", "amount"]),
+			&cols(&["created_at"]),
+			&[],
+			false,
+		);
+		assert!(result.contains("t.\"created_at\""), "order col should be included: {result}");
+		assert!(!result.contains("t.\"amount\""), "unrequested col should be absent: {result}");
+	}
+
+	#[test]
+	fn includes_distinct_cols_even_if_not_requested() {
+		let result = filter_columns_by_request(
+			&set(&["id"]),
+			&cols(&["id", "category", "value"]),
+			&[],
+			&cols(&["category"]),
+			false,
+		);
+		assert!(result.contains("t.\"category\""), "distinct col should be included: {result}");
+		assert!(!result.contains("t.\"value\""), "unrequested col should be absent: {result}");
+	}
+
+	#[test]
+	fn historical_table_includes_block_range() {
+		let result = filter_columns_by_request(
+			&set(&["id"]),
+			&cols(&["id", "amount"]),
+			&[],
+			&[],
+			true, // is_historical
+		);
+		assert!(result.contains("t.\"_block_range\""), "_block_range missing: {result}");
+	}
+
+	#[test]
+	fn non_historical_table_excludes_block_range() {
+		let result =
+			filter_columns_by_request(&set(&["id"]), &cols(&["id", "amount"]), &[], &[], false);
+		assert!(!result.contains("_block_range"), "_block_range should be absent: {result}");
+	}
+
+	#[test]
+	fn empty_requested_returns_id_only() {
+		let result =
+			filter_columns_by_request(&set(&[]), &cols(&["id", "name", "amount"]), &[], &[], false);
+		assert_eq!(result, "t.\"id\"");
+	}
+
+	#[test]
+	fn raw_snake_case_name_also_matches() {
+		// If the client sends the raw snake_case name (not camelCase), it should still match.
+		let result = filter_columns_by_request(
+			&set(&["block_number"]),
+			&cols(&["id", "block_number"]),
+			&[],
+			&[],
+			false,
+		);
+		assert!(result.contains("t.\"block_number\""), "snake_case match failed: {result}");
+	}
+}
+
 fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
-	let arr = match val {
+	// async-graphql may not coerce a single enum value into a list for dynamic
+	// schema arguments, so accept both List and bare Enum/String forms.
+	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
+		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) =>
+			vec![v.clone()],
 		_ => return vec![],
 	};
 	arr.iter()
@@ -214,8 +485,10 @@ fn extract_order_cols(clauses: &[String]) -> Vec<String> {
 }
 
 fn parse_distinct(val: Option<&async_graphql::Value>) -> Vec<String> {
-	let arr = match val {
+	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
+		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) =>
+			vec![v.clone()],
 		_ => return vec![],
 	};
 	arr.iter()
@@ -312,6 +585,35 @@ pub fn pg_col_to_json(
 	}
 }
 
+/// A PostgreSQL parameter that sends its value as a text-encoded string and
+/// accepts any server type.  PostgreSQL will apply its text input function to
+/// coerce the value to whatever the column / expression expects (INT4, NUMERIC,
+/// BIGINT, etc.).  This avoids the OID mismatch that occurs when the driver
+/// sends a binary-encoded i64 for a column the server typed as INT4.
+#[derive(Debug)]
+struct TextParam(String);
+
+impl ToSql for TextParam {
+	fn to_sql(
+		&self,
+		_ty: &Type,
+		buf: &mut BytesMut,
+	) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+		buf.extend_from_slice(self.0.as_bytes());
+		Ok(IsNull::No)
+	}
+
+	fn accepts(_ty: &Type) -> bool {
+		true
+	}
+
+	fn encode_format(&self, _ty: &Type) -> Format {
+		Format::Text
+	}
+
+	tokio_postgres::types::to_sql_checked!();
+}
+
 pub fn json_to_pg_params(params: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> {
 	params
 		.iter()
@@ -319,16 +621,14 @@ pub fn json_to_pg_params(params: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> 
 			match v {
 				Value::Null => Box::new(Option::<String>::None),
 				Value::Bool(b) => Box::new(*b),
-				Value::Number(n) =>
-					if let Some(i) = n.as_i64() {
-						Box::new(i)
-					} else if let Some(f) = n.as_f64() {
-						Box::new(f)
-					} else {
-						Box::new(n.to_string())
-					},
+				// Send numbers as text so PostgreSQL can coerce to any column type
+				// (INT4, NUMERIC, BIGINT, etc.) without OID mismatch errors.
+				Value::Number(n) => Box::new(TextParam(n.to_string())),
 				Value::String(s) => Box::new(s.clone()),
-				Value::Array(_) | Value::Object(_) => Box::new(v.to_string()),
+				// Arrays / objects are serialised to JSON text (used by `in` filter
+				// which casts $N::jsonb on the SQL side).  TextParam accepts any
+				// server type (including JSONB) and sends bytes in text format.
+				Value::Array(_) | Value::Object(_) => Box::new(TextParam(v.to_string())),
 			}
 		})
 		.collect()

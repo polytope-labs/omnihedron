@@ -13,14 +13,16 @@ use crate::{
 };
 
 /// Register all aggregate types for a given entity table.
-/// Returns `(builder, aggregate_type_name, numeric_col_names_snake_case)`.
+/// Returns `(builder, aggregate_type_name, numeric_col_names_snake_case,
+/// all_public_col_names_snake_case)`.
 pub fn register_aggregate_types(
 	table: &TableInfo,
 	mut builder: SchemaBuilder,
-) -> (SchemaBuilder, String, Vec<String>) {
+) -> (SchemaBuilder, String, Vec<String>, Vec<String>) {
 	let type_name = to_pascal_case(&singularize(&table.name));
 	let agg_type_name = format!("{type_name}Aggregates");
 
+	let all_cols: Vec<String> = table.public_columns().map(|c| c.name.clone()).collect();
 	let numeric_cols: Vec<String> = table
 		.public_columns()
 		.filter(|c| pg_type_to_graphql(&c.pg_type, &c.udt_name).1)
@@ -127,5 +129,5 @@ pub fn register_aggregate_types(
 	}
 
 	builder = builder.register(agg_obj);
-	(builder, agg_type_name, numeric_cols)
+	(builder, agg_type_name, numeric_cols, all_cols)
 }

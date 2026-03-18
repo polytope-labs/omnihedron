@@ -75,16 +75,19 @@ pub fn build_schema(
 		let pool_clone = pool.clone();
 		let cfg_clone = cfg.clone();
 		let is_historical = table.is_historical;
+		let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
 
 		// Connection (list) query
 		let mut conn_field = Field::new(&connection_field, TypeRef::named_nn(&connection_type), {
 			let pool = pool_clone.clone();
 			let table_name = table.name.clone();
 			let cfg = cfg_clone.clone();
+			let col_names = col_names.clone();
 			move |ctx| {
 				let pool = pool.clone();
 				let table_name = table_name.clone();
 				let cfg = cfg.clone();
+				let col_names = col_names.clone();
 				FieldFuture::new(async move {
 					let maybe = resolvers::connection::resolve_connection(
 						&ctx,
@@ -92,6 +95,7 @@ pub fn build_schema(
 						&table_name,
 						&cfg,
 						is_historical,
+						&col_names,
 					)
 					.await?;
 					Ok(maybe.map(FieldValue::owned_any))
@@ -492,17 +496,20 @@ fn register_table_types(
 		}));
 
 	if cfg.aggregate {
-		let (new_builder, agg_type_name, numeric_cols) = register_aggregate_types(table, builder);
+		let (new_builder, agg_type_name, numeric_cols, all_cols) =
+			register_aggregate_types(table, builder);
 		builder = new_builder;
 
 		let pool_agg = pool.clone();
 		conn_obj =
 			conn_obj.field(Field::new("aggregates", TypeRef::named(&agg_type_name), move |ctx| {
 				let pool = pool_agg.clone();
-				let cols = numeric_cols.clone();
+				let num_cols = numeric_cols.clone();
+				let all = all_cols.clone();
 				FieldFuture::new(async move {
 					let maybe =
-						resolvers::aggregates::resolve_aggregates(&ctx, &pool, &cols).await?;
+						resolvers::aggregates::resolve_aggregates(&ctx, &pool, &num_cols, &all)
+							.await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			}));

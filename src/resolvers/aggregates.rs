@@ -26,6 +26,7 @@ pub async fn resolve_aggregates(
 	ctx: &ResolverContext<'_>,
 	pool: &Pool,
 	numeric_cols: &[String],
+	all_cols: &[String],
 ) -> async_graphql::Result<Option<Value>> {
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
 
@@ -42,11 +43,17 @@ pub async fn resolve_aggregates(
 
 	// Build SELECT list:
 	//   COUNT(*) as _count
-	//   COUNT(DISTINCT col) as _distinct_count_{col}
-	//   CAST(SUM(col) AS TEXT) as _sum_{col}
-	//   ... for each numeric column
+	//   COUNT(DISTINCT col) as _dc_{col} — for all columns
+	//   CAST(SUM(col) AS TEXT) as _sum_{col} — numeric columns only
+	//   ... etc
 	let mut select_parts = vec!["COUNT(*) AS \"_count\"".to_string()];
 
+	// distinctCount for ALL columns
+	for col in all_cols {
+		select_parts.push(format!("COUNT(DISTINCT t.\"{col}\") AS \"_dc_{col}\""));
+	}
+
+	// Numeric-only aggregates
 	for col in numeric_cols {
 		let q = format!(
 			"CAST(SUM(t.\"{col}\") AS TEXT) AS \"_sum_{col}\",\
@@ -56,8 +63,7 @@ pub async fn resolve_aggregates(
              CAST(STDDEV_SAMP(t.\"{col}\") AS TEXT) AS \"_stddev_samp_{col}\",\
              CAST(STDDEV_POP(t.\"{col}\") AS TEXT)  AS \"_stddev_pop_{col}\",\
              CAST(VAR_SAMP(t.\"{col}\") AS TEXT)    AS \"_var_samp_{col}\",\
-             CAST(VAR_POP(t.\"{col}\") AS TEXT)     AS \"_var_pop_{col}\",\
-             COUNT(DISTINCT t.\"{col}\") AS \"_distinct_{col}\""
+             CAST(VAR_POP(t.\"{col}\") AS TEXT)     AS \"_var_pop_{col}\""
 		);
 		select_parts.push(q);
 	}
@@ -92,6 +98,15 @@ pub async fn resolve_aggregates(
 	let mut var_pop_map = serde_json::Map::new();
 	let mut distinct_map = serde_json::Map::new();
 
+	// distinctCount for ALL columns
+	for col in all_cols {
+		let field_name = crate::schema::inflector::to_camel_case(col);
+		let dc_key = format!("_dc_{col}");
+		let distinct_val: i64 = row.try_get(dc_key.as_str()).unwrap_or(0);
+		distinct_map.insert(field_name, json!(distinct_val.to_string()));
+	}
+
+	// Numeric-only aggregates
 	for col in numeric_cols {
 		let field_name = crate::schema::inflector::to_camel_case(col);
 
@@ -113,9 +128,6 @@ pub async fn resolve_aggregates(
 		stddev_pop_map.insert(field_name.clone(), get_str!("_stddev_pop"));
 		var_samp_map.insert(field_name.clone(), get_str!("_var_samp"));
 		var_pop_map.insert(field_name.clone(), get_str!("_var_pop"));
-
-		let distinct_val: i64 = row.try_get(&format!("_distinct_{col}") as &str).unwrap_or(0);
-		distinct_map.insert(field_name, json!(distinct_val.to_string()));
 	}
 
 	Ok(Some(json!({

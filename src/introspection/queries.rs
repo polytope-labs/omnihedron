@@ -4,7 +4,7 @@ use super::{
 	model::{ColumnInfo, EnumInfo, ForeignKey, TableInfo, is_internal_table},
 	types::pg_type_to_graphql,
 };
-use crate::schema::inflector::to_pascal_case;
+use crate::schema::inflector::pg_enum_type_to_gql_name;
 use anyhow::Result;
 use deadpool_postgres::Pool;
 use tracing::debug;
@@ -99,7 +99,7 @@ pub async fn introspect_enums(pool: &Pool, schema: &str) -> Result<Vec<EnumInfo>
 			let display_name = comment
 				.as_deref()
 				.and_then(extract_enum_name)
-				.unwrap_or_else(|| to_pascal_case(&pg_type_name));
+				.unwrap_or_else(|| pg_enum_type_to_gql_name(&pg_type_name));
 
 			EnumInfo { pg_type_name, display_name, values }
 		})

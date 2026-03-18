@@ -8,7 +8,7 @@
 use async_graphql::dynamic::ResolverContext;
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::Config;
 
@@ -88,7 +88,10 @@ pub async fn resolve_metadata(
 	debug!(table = %table, "Fetching metadata from table");
 
 	let sql = format!(r#"SELECT key, value FROM "{schema}"."{table}""#);
-	let rows = client.query(&sql, &[]).await.unwrap_or_default();
+	let rows = client.query(&sql, &[]).await.map_err(|e| {
+		warn!(error = %e, table = %table, "Failed to query metadata table");
+		e
+	})?;
 
 	let mut meta = serde_json::Map::new();
 	for row in &rows {
@@ -109,7 +112,10 @@ pub async fn resolve_metadata(
             SELECT table_name FROM information_schema.tables WHERE table_schema = $1
           )
     "#;
-	let est_rows = client.query(estimate_sql, &[&schema.as_str()]).await.unwrap_or_default();
+	let est_rows = client.query(estimate_sql, &[&schema.as_str()]).await.unwrap_or_else(|e| {
+		warn!(error = %e, "Failed to query row count estimates");
+		vec![]
+	});
 	let estimates: Vec<Value> = est_rows
 		.iter()
 		.map(|r| {
@@ -121,8 +127,13 @@ pub async fn resolve_metadata(
 
 	// DB size
 	let size_sql = "SELECT pg_database_size(current_database()) AS db_size";
-	let size_row = client.query_one(size_sql, &[]).await.ok();
-	let db_size: i64 = size_row.as_ref().and_then(|r| r.try_get("db_size").ok()).unwrap_or(0);
+	let db_size: i64 = match client.query_one(size_sql, &[]).await {
+		Ok(row) => row.try_get("db_size").unwrap_or(0),
+		Err(e) => {
+			warn!(error = %e, "Failed to query database size");
+			0
+		},
+	};
 
 	meta.insert("rowCountEstimate".to_string(), Value::Array(estimates));
 	meta.insert("dbSize".to_string(), json!(db_size.to_string()));
@@ -145,7 +156,10 @@ pub async fn resolve_metadatas(
                  AND (table_name = '_metadata' OR table_name LIKE '_metadata_0x%' \
                       OR table_name LIKE '_multi_metadata_%') \
                ORDER BY table_name";
-	let table_rows = client.query(sql, &[&schema.as_str()]).await.unwrap_or_default();
+	let table_rows = client.query(sql, &[&schema.as_str()]).await.map_err(|e| {
+		warn!(error = %e, "Failed to list metadata tables");
+		e
+	})?;
 	let metadata_tables: Vec<String> = table_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 	let total_count = metadata_tables.len();
 
@@ -153,7 +167,10 @@ pub async fn resolve_metadatas(
 	let mut nodes: Vec<Value> = Vec::new();
 	for table in &metadata_tables {
 		let q = format!(r#"SELECT key, value FROM "{schema}"."{table}""#);
-		let rows = client.query(&q, &[]).await.unwrap_or_default();
+		let rows = client.query(&q, &[]).await.unwrap_or_else(|e| {
+			warn!(error = %e, table = %table, "Failed to query metadata table");
+			vec![]
+		});
 		let mut meta = serde_json::Map::new();
 		for row in &rows {
 			let key: String = row.get(0);
