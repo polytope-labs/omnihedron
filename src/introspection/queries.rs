@@ -34,15 +34,21 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 	let enum_map: HashMap<String, String> =
 		enums.into_iter().map(|e| (e.pg_type_name, e.display_name)).collect();
 
-	// ── 1. List tables ───────────────────────────────────────────────────────
+	// ── 1. List tables (with table comments for historical smart tags) ───────
 	let table_rows = client
 		.query(
 			r#"
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = $1
-              AND table_type IN ('BASE TABLE', 'VIEW')
-            ORDER BY table_name
+            SELECT t.table_name,
+                   obj_description(c.oid, 'pg_class') AS table_comment
+            FROM information_schema.tables t
+            LEFT JOIN pg_catalog.pg_class c
+              ON c.relname = t.table_name
+              AND c.relnamespace = (
+                SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = t.table_schema
+              )
+            WHERE t.table_schema = $1
+              AND t.table_type IN ('BASE TABLE', 'VIEW')
+            ORDER BY t.table_name
             "#,
 			&[&schema],
 		)
@@ -54,6 +60,16 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 		.filter(|n| !is_internal_table(n))
 		.collect();
 
+	// Build a map of table_name → table_comment for smart tag extraction.
+	let table_comments: HashMap<String, String> = table_rows
+		.iter()
+		.filter_map(|r| {
+			let name: String = r.get("table_name");
+			let comment: Option<String> = r.get("table_comment");
+			comment.map(|c| (name, c))
+		})
+		.collect();
+
 	debug!(schema, table_count = table_names.len(), "Introspecting tables");
 
 	let mut tables = Vec::with_capacity(table_names.len());
@@ -61,9 +77,25 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 	for table_name in &table_names {
 		let columns = fetch_columns(&client, schema, table_name, &enum_map).await?;
 		let primary_keys = fetch_primary_keys(&client, schema, table_name).await?;
-		let foreign_keys = fetch_foreign_keys(&client, schema, table_name).await?;
+		let mut foreign_keys = fetch_foreign_keys(&client, schema, table_name).await?;
 		let unique_constraints = fetch_unique_constraints(&client, schema, table_name).await?;
 		let is_historical = columns.iter().any(|c| c.name == "_block_range");
+
+		// For historical tables, SubQuery stores smart tags in table comments
+		// (not constraint comments). Parse them and apply to matching FKs.
+		if let Some(comment) = table_comments.get(table_name) {
+			let table_tags = super::model::SmartTags::from_table_comment(comment);
+			for (fk_col, tags) in table_tags {
+				if let Some(fk) = foreign_keys.iter_mut().find(|fk| fk.column == fk_col) {
+					if fk.smart_tags.foreign_field_name.is_none() {
+						fk.smart_tags.foreign_field_name = tags.foreign_field_name;
+					}
+					if fk.smart_tags.single_foreign_field_name.is_none() {
+						fk.smart_tags.single_foreign_field_name = tags.single_foreign_field_name;
+					}
+				}
+			}
+		}
 
 		tables.push(TableInfo {
 			name: table_name.clone(),
