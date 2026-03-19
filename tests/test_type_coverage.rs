@@ -73,11 +73,7 @@ async fn get_type_coverage_node(client: &TestClient, id: &str) -> Value {
     "#
 	);
 	let resp = client.query(&query).await;
-	assert!(
-		!has_graphql_errors(&resp),
-		"type_coverage query returned errors: {}",
-		resp
-	);
+	assert!(!has_graphql_errors(&resp), "type_coverage query returned errors: {}", resp);
 	let nodes = resp
 		.pointer("/data/typeCoverages/nodes")
 		.and_then(|v| v.as_array())
@@ -327,10 +323,7 @@ async fn test_uuid_serialization() {
 	}
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
-	assert_eq!(
-		node["colUuid"],
-		serde_json::json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
-	);
+	assert_eq!(node["colUuid"], serde_json::json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"));
 }
 
 #[tokio::test]
@@ -366,10 +359,7 @@ async fn test_inet_serialization() {
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
 	let val = node["colInet"].as_str().expect("colInet should be a string");
-	assert!(
-		val.contains("192.168.1.1"),
-		"colInet = '{val}', expected '192.168.1.1'"
-	);
+	assert!(val.contains("192.168.1.1"), "colInet = '{val}', expected '192.168.1.1'");
 }
 
 #[tokio::test]
@@ -381,10 +371,7 @@ async fn test_cidr_serialization() {
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
 	let val = node["colCidr"].as_str().expect("colCidr should be a string");
-	assert!(
-		val.contains("10.0.0.0"),
-		"colCidr = '{val}', expected to contain '10.0.0.0'"
-	);
+	assert!(val.contains("10.0.0.0"), "colCidr = '{val}', expected to contain '10.0.0.0'");
 }
 
 #[tokio::test]
@@ -561,10 +548,7 @@ async fn test_uuid_array_serialization() {
 	}
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
-	assert_eq!(
-		node["colUuidArr"],
-		serde_json::json!(["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"])
-	);
+	assert_eq!(node["colUuidArr"], serde_json::json!(["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"]));
 }
 
 #[tokio::test]
@@ -575,9 +559,7 @@ async fn test_timestamp_array_serialization() {
 	}
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
-	let arr = node["colTimestampArr"]
-		.as_array()
-		.expect("colTimestampArr should be an array");
+	let arr = node["colTimestampArr"].as_array().expect("colTimestampArr should be an array");
 	assert_eq!(arr.len(), 2);
 	assert!(arr[0].as_str().unwrap().starts_with("2024-01-15T10:30:00"));
 	assert!(arr[1].as_str().unwrap().starts_with("2024-06-15T12:00:00"));
@@ -606,10 +588,7 @@ async fn test_date_array_serialization() {
 	}
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
-	assert_eq!(
-		node["colDateArr"],
-		serde_json::json!(["2024-01-15", "2024-06-15"])
-	);
+	assert_eq!(node["colDateArr"], serde_json::json!(["2024-01-15", "2024-06-15"]));
 }
 
 #[tokio::test]
@@ -693,23 +672,51 @@ async fn test_all_nulls() {
 	let node = get_type_coverage_node(&client, "type-test-null").await;
 
 	let fields = [
-		"colBool", "colInt2", "colInt4", "colInt8",
-		"colFloat4", "colFloat8", "colNumeric",
-		"colText", "colVarchar", "colBpchar",
-		"colBytea", "colJson", "colJsonb",
-		"colTimestamp", "colTimestamptz", "colDate", "colTime",
-		"colInterval", "colUuid",
-		"colBit", "colVarbit",
-		"colInet", "colCidr", "colMacaddr",
-		"colPoint", "colBox",
-		"colEnum", "colOid",
-		"colBoolArr", "colInt2Arr", "colInt4Arr", "colInt8Arr",
-		"colFloat4Arr", "colFloat8Arr",
-		"colTextArr", "colNumericArr", "colUuidArr",
-		"colTimestampArr", "colTimestamptzArr",
-		"colDateArr", "colTimeArr",
-		"colJsonbArr", "colByteaArr",
-		"colInetArr", "colMacaddrArr",
+		"colBool",
+		"colInt2",
+		"colInt4",
+		"colInt8",
+		"colFloat4",
+		"colFloat8",
+		"colNumeric",
+		"colText",
+		"colVarchar",
+		"colBpchar",
+		"colBytea",
+		"colJson",
+		"colJsonb",
+		"colTimestamp",
+		"colTimestamptz",
+		"colDate",
+		"colTime",
+		"colInterval",
+		"colUuid",
+		"colBit",
+		"colVarbit",
+		"colInet",
+		"colCidr",
+		"colMacaddr",
+		"colPoint",
+		"colBox",
+		"colEnum",
+		"colOid",
+		"colBoolArr",
+		"colInt2Arr",
+		"colInt4Arr",
+		"colInt8Arr",
+		"colFloat4Arr",
+		"colFloat8Arr",
+		"colTextArr",
+		"colNumericArr",
+		"colUuidArr",
+		"colTimestampArr",
+		"colTimestamptzArr",
+		"colDateArr",
+		"colTimeArr",
+		"colJsonbArr",
+		"colByteaArr",
+		"colInetArr",
+		"colMacaddrArr",
 	];
 
 	for field in &fields {

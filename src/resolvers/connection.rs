@@ -922,16 +922,15 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!({"x": v.x(), "y": v.y()})),
-		Type::BOX => row
-			.try_get::<_, Option<geo_types::Rect<f64>>>(idx)
-			.ok()
-			.flatten()
-			.map_or(Value::Null, |v| {
+		Type::BOX => row.try_get::<_, Option<geo_types::Rect<f64>>>(idx).ok().flatten().map_or(
+			Value::Null,
+			|v| {
 				json!({
 					"x1": v.min().x, "y1": v.min().y,
 					"x2": v.max().x, "y2": v.max().y,
 				})
-			}),
+			},
+		),
 		Type::PATH => row
 			.try_get::<_, Option<geo_types::LineString<f64>>>(idx)
 			.ok()
@@ -980,11 +979,11 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(v)),
-		Type::INT8_ARRAY => row
-			.try_get::<_, Option<Vec<i64>>>(idx)
-			.ok()
-			.flatten()
-			.map_or(Value::Null, |v| Value::Array(v.iter().map(|n| json!(n.to_string())).collect())),
+		Type::INT8_ARRAY => {
+			row.try_get::<_, Option<Vec<i64>>>(idx).ok().flatten().map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|n| json!(n.to_string())).collect())
+			})
+		},
 		Type::FLOAT4_ARRAY => row
 			.try_get::<_, Option<Vec<f32>>>(idx)
 			.ok()
@@ -1073,8 +1072,14 @@ pub fn pg_col_to_json(
 		// Remaining array types (TIMETZ, INTERVAL, BIT, VARBIT, geometric, range,
 		// MACADDR8, OID, CHAR) — rare in SubQuery schemas. Use text-encoded fallback
 		// which works because arrays send element text representations.
-		Type::TIMETZ_ARRAY | Type::INTERVAL_ARRAY | Type::BIT_ARRAY | Type::VARBIT_ARRAY |
-		Type::MACADDR8_ARRAY | Type::OID_ARRAY | Type::CHAR_ARRAY | Type::CIDR_ARRAY => {
+		Type::TIMETZ_ARRAY
+		| Type::INTERVAL_ARRAY
+		| Type::BIT_ARRAY
+		| Type::VARBIT_ARRAY
+		| Type::MACADDR8_ARRAY
+		| Type::OID_ARRAY
+		| Type::CHAR_ARRAY
+		| Type::CIDR_ARRAY => {
 			// These don't have convenient Vec<T> FromSql impls. Return null for arrays
 			// of exotic types — they're essentially unused in SubQuery schemas.
 			tracing::warn!(
@@ -1118,11 +1123,19 @@ impl<'a> tokio_postgres::types::FromSql<'a> for CidrBinary {
 		let addr_bytes = &raw[4..];
 		let addr_str = match family {
 			2 if addr_bytes.len() >= 4 => {
-				format!("{}.{}.{}.{}/{}", addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3], prefix_len)
+				format!(
+					"{}.{}.{}.{}/{}",
+					addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3], prefix_len
+				)
 			},
 			3 if addr_bytes.len() >= 16 => {
 				let segs: Vec<String> = (0..8)
-					.map(|i| format!("{:x}", u16::from_be_bytes([addr_bytes[i * 2], addr_bytes[i * 2 + 1]])))
+					.map(|i| {
+						format!(
+							"{:x}",
+							u16::from_be_bytes([addr_bytes[i * 2], addr_bytes[i * 2 + 1]])
+						)
+					})
 					.collect();
 				format!("{}/{}", segs.join(":"), prefix_len)
 			},
@@ -1158,7 +1171,10 @@ impl<'a> tokio_postgres::types::FromSql<'a> for IntervalBinary {
 			parts.push(format!("{years} year{}", if years.abs() != 1 { "s" } else { "" }));
 		}
 		if remaining_months != 0 {
-			parts.push(format!("{remaining_months} mon{}", if remaining_months.abs() != 1 { "s" } else { "" }));
+			parts.push(format!(
+				"{remaining_months} mon{}",
+				if remaining_months.abs() != 1 { "s" } else { "" }
+			));
 		}
 		if days != 0 {
 			parts.push(format!("{days} day{}", if days.abs() != 1 { "s" } else { "" }));

@@ -87,7 +87,7 @@ pub fn build_filter_sql_ctx(
 
 	for (key, value) in obj {
 		match key.as_str() {
-			"and" =>
+			"and" => {
 				if let Some(arr) = value.as_array() {
 					let mut sub_parts = vec![];
 					for sub in arr {
@@ -101,8 +101,9 @@ pub fn build_filter_sql_ctx(
 					if !sub_parts.is_empty() {
 						conditions.push(format!("({})", sub_parts.join(" AND ")));
 					}
-				},
-			"or" =>
+				}
+			},
+			"or" => {
 				if let Some(arr) = value.as_array() {
 					let mut sub_parts = vec![];
 					for sub in arr {
@@ -116,7 +117,8 @@ pub fn build_filter_sql_ctx(
 					if !sub_parts.is_empty() {
 						conditions.push(format!("({})", sub_parts.join(" OR ")));
 					}
-				},
+				}
+			},
 			"not" => {
 				let (sub_conds, sub_params) =
 					build_filter_sql_ctx(value, table_alias, param_offset, ctx);
@@ -414,7 +416,7 @@ fn build_op_condition(
 			*param_offset += 1;
 			Some((format!("lower({qualified}) >= lower(${})", param_offset), Some(value.clone())))
 		},
-		"inInsensitive" =>
+		"inInsensitive" => {
 			if let Some(arr) = value.as_array() {
 				if arr.is_empty() {
 					return Some(("FALSE".to_string(), None));
@@ -429,8 +431,9 @@ fn build_op_condition(
 				))
 			} else {
 				None
-			},
-		"notInInsensitive" =>
+			}
+		},
+		"notInInsensitive" => {
 			if let Some(arr) = value.as_array() {
 				if arr.is_empty() {
 					return None;
@@ -445,7 +448,8 @@ fn build_op_condition(
 				))
 			} else {
 				None
-			},
+			}
+		},
 		"distinctFrom" => {
 			*param_offset += 1;
 			Some((format!("{qualified} IS DISTINCT FROM ${}", param_offset), Some(value.clone())))

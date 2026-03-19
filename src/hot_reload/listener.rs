@@ -88,10 +88,11 @@ async fn listen_for_changes(
 		loop {
 			let msg = futures::future::poll_fn(|cx| connection.poll_message(cx)).await;
 			match msg {
-				Some(Ok(AsyncMessage::Notification(n))) =>
+				Some(Ok(AsyncMessage::Notification(n))) => {
 					if let Err(e) = tx.send(n).await {
 						warn!(error = %e, "Failed to forward schema change notification");
-					},
+					}
+				},
 				Some(Ok(_)) => {}, // Notice or other message
 				Some(Err(_)) | None => break,
 			}

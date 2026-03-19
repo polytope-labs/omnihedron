@@ -77,14 +77,14 @@ async fn test_metadata() {
 
 	// Both should have data without errors
 	assert!(
-		ts_resp.get("errors").is_none() ||
-			ts_resp["errors"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+		ts_resp.get("errors").is_none()
+			|| ts_resp["errors"].as_array().map(|a| a.is_empty()).unwrap_or(true),
 		"TS returned errors: {:?}",
 		ts_resp.get("errors")
 	);
 	assert!(
-		rust_resp.get("errors").is_none() ||
-			rust_resp["errors"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+		rust_resp.get("errors").is_none()
+			|| rust_resp["errors"].as_array().map(|a| a.is_empty()).unwrap_or(true),
 		"Rust returned errors: {:?}",
 		rust_resp.get("errors")
 	);
