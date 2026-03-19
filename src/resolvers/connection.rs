@@ -34,7 +34,7 @@ use crate::{
 	config::Config,
 	schema::{cursor::encode_cursor, inflector::to_camel_case},
 	sql::{
-		filter::build_filter_sql_ctx,
+		filter::{FilterContext, build_filter_sql_ctx},
 		pagination::{PaginationArgs, resolve_pagination},
 	},
 };
@@ -130,7 +130,7 @@ pub async fn resolve_connection_ctx(
 	}
 
 	// ── ORDER BY ──────────────────────────────────────────────────────────────
-	let order_clauses = parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema));
+	let order_clauses = parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema), Some(filter_ctx));
 	let order_cols: Vec<String> = extract_order_cols(&order_clauses);
 
 	// ── PAGINATION ────────────────────────────────────────────────────────────
@@ -599,15 +599,18 @@ pub fn reverse_order_clause(clause: &str) -> String {
 }
 
 pub fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
-	parse_orderby_with_schema(val, None)
+	parse_orderby_with_schema(val, None, None)
 }
 
 /// Parse orderBy enum values into SQL ORDER BY clauses.
 /// When `schema` is provided, aggregate orderBy values (containing `_BY_`)
 /// are expanded into correlated subqueries.
+/// When `filter_ctx` is provided, forward-relation scalar ordering (double
+/// underscore `__` pattern) is also supported.
 pub fn parse_orderby_with_schema(
 	val: Option<&async_graphql::Value>,
 	schema: Option<&str>,
+	filter_ctx: Option<&FilterContext>,
 ) -> Vec<String> {
 	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
@@ -633,12 +636,35 @@ pub fn parse_orderby_with_schema(
 				return None;
 			};
 
-			// ── Aggregate orderBy: detect _BY_ pattern ───────────────
+			// ── Relation orderBy: detect _BY_ pattern ────────────────
 			if let Some(schema) = schema {
 				if let Some(by_idx) = body.find("_BY_") {
-					let child_table = body[..by_idx].to_lowercase();
 					let after_by = &body[by_idx + 4..]; // after "_BY_"
-					// Find the FK column: everything up to _COUNT or _{AGG}_{COL}
+
+					// Forward relation scalar: double underscore `__` separates
+					// FK column from target column on the parent table.
+					// Pattern: {TABLE}_BY_{FK_COL}__{TARGET_COL}
+					if let Some(dunder_idx) = after_by.find("__") {
+						let fk_col = after_by[..dunder_idx].to_lowercase();
+						let target_col = after_by[dunder_idx + 2..].to_lowercase();
+						if let Some(fctx) = filter_ctx {
+							if let Some(info) = fctx
+								.forward_relations
+								.values()
+								.find(|r| r.fk_column == fk_col)
+							{
+								let sql = format!(
+									"(SELECT _rel.\"{}\" FROM \"{}\".\"{}\" AS _rel WHERE _rel.\"{}\" = t.\"{}\")",
+									target_col, schema, info.foreign_table, info.foreign_pk, fk_col
+								);
+								return Some(format!("{sql} {dir}"));
+							}
+						}
+					}
+
+					// Backward relation aggregate: single underscores with
+					// aggregate keywords (COUNT, SUM, AVERAGE, MIN, MAX).
+					let child_table = body[..by_idx].to_lowercase();
 					if let Some(agg_sql) = parse_aggregate_order(schema, &child_table, after_by) {
 						return Some(format!("{agg_sql} {dir}"));
 					}
@@ -687,7 +713,14 @@ fn parse_aggregate_order(schema: &str, child_table: &str, after_by: &str) -> Opt
 pub fn extract_order_cols(clauses: &[String]) -> Vec<String> {
 	clauses
 		.iter()
-		.filter_map(|c| c.trim_start_matches("t.").split_whitespace().next().map(str::to_string))
+		.filter_map(|c| {
+			// Subquery expressions (aggregate / forward-relation ordering) are
+			// self-contained and don't require an extra column in the SELECT list.
+			if c.starts_with('(') {
+				return None;
+			}
+			c.trim_start_matches("t.").split_whitespace().next().map(str::to_string)
+		})
 		.collect()
 }
 
