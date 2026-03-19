@@ -72,15 +72,15 @@ pub fn build_router(state: AppState) -> Router {
 	let cfg = state.cfg.clone();
 
 	let mut router = Router::new()
-		.route("/", post(graphql_handler).get(graphql_handler))
+		.route("/", post(graphql_post_handler))
 		.route("/health", get(health_handler));
-
-	if cfg.subscription {
-		router = router.route("/ws", get(graphql_ws_handler));
-	}
 
 	if cfg.playground {
 		router = router.route("/", get(graphiql_handler));
+	}
+
+	if cfg.subscription {
+		router = router.route("/ws", get(graphql_ws_handler));
 	}
 
 	// Batch query limit middleware
@@ -118,7 +118,7 @@ pub fn build_router(state: AppState) -> Router {
 		.with_state(state)
 }
 
-async fn graphql_handler(State(state): State<AppState>, body: Bytes) -> Response {
+async fn graphql_post_handler(State(state): State<AppState>, body: Bytes) -> Response {
 	// Detect batch (JSON array) vs single request
 	let body_val: Value = match serde_json::from_slice(&body) {
 		Ok(v) => v,
