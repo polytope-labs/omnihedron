@@ -72,6 +72,10 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 
 	debug!(schema, table_count = table_names.len(), "Introspecting tables");
 
+	for (table, comment) in &table_comments {
+		tracing::trace!(table = %table, comment = %comment, "Table comment with smart tags");
+	}
+
 	let mut tables = Vec::with_capacity(table_names.len());
 
 	for table_name in &table_names {
@@ -81,18 +85,31 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 		let unique_constraints = fetch_unique_constraints(&client, schema, table_name).await?;
 		let is_historical = columns.iter().any(|c| c.name == "_block_range");
 
-		// For historical tables, SubQuery stores smart tags in table comments
-		// (not constraint comments). Parse them and apply to matching FKs.
+		// For historical tables, SubQuery stores smart tags AND virtual FK
+		// definitions in table comments (no actual FK constraints in the DB).
+		// Parse these to create synthetic ForeignKey entries.
 		if let Some(comment) = table_comments.get(table_name) {
-			let table_tags = super::model::SmartTags::from_table_comment(comment);
-			for (fk_col, tags) in table_tags {
-				if let Some(fk) = foreign_keys.iter_mut().find(|fk| fk.column == fk_col) {
+			let virtual_fks = super::model::SmartTags::from_table_comment_full(comment);
+			for vfk in virtual_fks {
+				if let Some(fk) = foreign_keys.iter_mut().find(|fk| fk.column == vfk.fk_column) {
+					// Real FK constraint exists — just apply the smart tags.
 					if fk.smart_tags.foreign_field_name.is_none() {
-						fk.smart_tags.foreign_field_name = tags.foreign_field_name;
+						fk.smart_tags.foreign_field_name = vfk.tags.foreign_field_name;
 					}
 					if fk.smart_tags.single_foreign_field_name.is_none() {
-						fk.smart_tags.single_foreign_field_name = tags.single_foreign_field_name;
+						fk.smart_tags.single_foreign_field_name =
+							vfk.tags.single_foreign_field_name;
 					}
+				} else if let Some(ref foreign_table) = vfk.foreign_table {
+					// No real FK constraint — create a synthetic one from the comment.
+					// This is the normal case for historical tables.
+					foreign_keys.push(ForeignKey {
+						constraint_name: format!("{}_{}_fkey_virtual", table_name, vfk.fk_column),
+						column: vfk.fk_column,
+						foreign_table: foreign_table.clone(),
+						foreign_column: vfk.foreign_pk.unwrap_or_else(|| "id".to_string()),
+						smart_tags: vfk.tags,
+					});
 				}
 			}
 		}
