@@ -875,7 +875,8 @@ pub fn pg_col_to_json(
 				.map_or(Value::Null, |v| json!(v.0))
 		},
 		Type::INTERVAL => {
-			// PG interval binary: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months (i32).
+			// PG interval binary: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months
+			// (i32).
 			row.try_get::<_, Option<IntervalBinary>>(idx)
 				.ok()
 				.flatten()
@@ -979,11 +980,10 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(v)),
-		Type::INT8_ARRAY => {
+		Type::INT8_ARRAY =>
 			row.try_get::<_, Option<Vec<i64>>>(idx).ok().flatten().map_or(Value::Null, |v| {
 				Value::Array(v.iter().map(|n| json!(n.to_string())).collect())
-			})
-		},
+			}),
 		Type::FLOAT4_ARRAY => row
 			.try_get::<_, Option<Vec<f32>>>(idx)
 			.ok()
@@ -1072,14 +1072,14 @@ pub fn pg_col_to_json(
 		// Remaining array types (TIMETZ, INTERVAL, BIT, VARBIT, geometric, range,
 		// MACADDR8, OID, CHAR) — rare in SubQuery schemas. Use text-encoded fallback
 		// which works because arrays send element text representations.
-		Type::TIMETZ_ARRAY
-		| Type::INTERVAL_ARRAY
-		| Type::BIT_ARRAY
-		| Type::VARBIT_ARRAY
-		| Type::MACADDR8_ARRAY
-		| Type::OID_ARRAY
-		| Type::CHAR_ARRAY
-		| Type::CIDR_ARRAY => {
+		Type::TIMETZ_ARRAY |
+		Type::INTERVAL_ARRAY |
+		Type::BIT_ARRAY |
+		Type::VARBIT_ARRAY |
+		Type::MACADDR8_ARRAY |
+		Type::OID_ARRAY |
+		Type::CHAR_ARRAY |
+		Type::CIDR_ARRAY => {
 			// These don't have convenient Vec<T> FromSql impls. Return null for arrays
 			// of exotic types — they're essentially unused in SubQuery schemas.
 			tracing::warn!(
@@ -1149,8 +1149,8 @@ impl<'a> tokio_postgres::types::FromSql<'a> for CidrBinary {
 	}
 }
 
-/// Decode INTERVAL binary format: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months (i32).
-/// Produces a PostgreSQL-style interval string like "1 year 2 mons 3 days 04:05:06".
+/// Decode INTERVAL binary format: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months
+/// (i32). Produces a PostgreSQL-style interval string like "1 year 2 mons 3 days 04:05:06".
 struct IntervalBinary(String);
 impl<'a> tokio_postgres::types::FromSql<'a> for IntervalBinary {
 	fn from_sql(

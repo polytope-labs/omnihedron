@@ -46,16 +46,14 @@ fn selection_depth(
 	let mut max = current;
 	for sel in items {
 		let depth = match &sel.node {
-			Selection::Field(f) => {
+			Selection::Field(f) =>
 				if f.node.selection_set.node.items.is_empty() {
 					current + 1
 				} else {
 					selection_depth(&f.node.selection_set.node.items, fragments, current + 1)
-				}
-			},
-			Selection::InlineFragment(f) => {
-				selection_depth(&f.node.selection_set.node.items, fragments, current)
-			},
+				},
+			Selection::InlineFragment(f) =>
+				selection_depth(&f.node.selection_set.node.items, fragments, current),
 			Selection::FragmentSpread(spread) => {
 				if let Some(frag) = fragments.get(&spread.node.fragment_name.node) {
 					selection_depth(&frag.node.selection_set.node.items, fragments, current)

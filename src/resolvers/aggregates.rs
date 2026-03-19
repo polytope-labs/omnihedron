@@ -296,12 +296,10 @@ pub async fn resolve_grouped_aggregates(
 			Some(async_graphql::Value::List(items)) => items
 				.iter()
 				.filter_map(|item| match item {
-					async_graphql::Value::Enum(name) => {
-						Some(GroupByParsed::from_raw(&name.as_str().to_lowercase()))
-					},
-					async_graphql::Value::String(s) => {
-						Some(GroupByParsed::from_raw(&s.to_lowercase()))
-					},
+					async_graphql::Value::Enum(name) =>
+						Some(GroupByParsed::from_raw(&name.as_str().to_lowercase())),
+					async_graphql::Value::String(s) =>
+						Some(GroupByParsed::from_raw(&s.to_lowercase())),
 					_ => None,
 				})
 				.collect(),
