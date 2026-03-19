@@ -25,7 +25,7 @@ use async_graphql::dynamic::ResolverContext;
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
-use tracing::debug;
+use tracing::trace;
 
 use crate::{
 	config::Config,
@@ -89,7 +89,7 @@ pub async fn resolve_forward_relation(
 		r#"SELECT * FROM "{schema}"."{foreign_table}" AS t {where_clause} ORDER BY t._id ASC LIMIT 1"#
 	);
 
-	debug!(sql = %sql, "Executing forward relation query");
+	trace!(sql = %sql, "Executing forward relation query");
 
 	let client = pool.get().await?;
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
@@ -324,7 +324,7 @@ pub async fn resolve_backward_relation(
 		pagination.offset
 	);
 
-	debug!(sql = %sql, "Executing backward relation query");
+	trace!(sql = %sql, "Executing backward relation query");
 
 	let client = pool.get().await?;
 	let pg_params = json_to_pg_params(&params);
@@ -438,7 +438,7 @@ pub async fn resolve_many_to_many(
 		   WHERE j."{fk_to_source}" = $1"#
 	);
 
-	debug!(sql = %sql, "Executing many-to-many relation query");
+	trace!(sql = %sql, "Executing many-to-many relation query");
 
 	let client = pool.get().await?;
 	let params: Vec<&(dyn ToSql + Sync)> = vec![&id_str];

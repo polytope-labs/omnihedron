@@ -28,7 +28,7 @@ use bytes::BytesMut;
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type};
-use tracing::debug;
+use tracing::trace;
 
 use crate::{
 	config::Config,
@@ -219,7 +219,7 @@ pub async fn resolve_connection_ctx(
 	let needs_rows = has_node_selection(ctx);
 
 	let (rows, total) = if !needs_rows {
-		debug!(count_sql = %count_sql, "Executing count-only query");
+		trace!(count_sql = %count_sql, "Executing count-only query");
 		let row = client.query_one(&count_sql, &pg_refs).await?;
 		(vec![], row.get::<_, i64>("total"))
 	} else {
@@ -252,7 +252,7 @@ pub async fn resolve_connection_ctx(
 			)
 		};
 
-		debug!(sql = %sql, "Executing connection query");
+		trace!(sql = %sql, "Executing connection query");
 		if cfg.query_explain {
 			run_explain(&client, &sql, &pg_refs).await;
 		}

@@ -23,7 +23,7 @@ use async_graphql::dynamic::ResolverContext;
 use deadpool_postgres::Pool;
 use serde_json::Value;
 use tokio_postgres::types::ToSql;
-use tracing::debug;
+use tracing::trace;
 
 use crate::{config::Config, resolvers::connection::row_to_json, schema::cursor::decode_node_id};
 
@@ -46,7 +46,7 @@ pub async fn resolve_single(
 	let schema = &cfg.name;
 	let sql = format!(r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t.id = $1 LIMIT 1"#);
 
-	debug!(sql = %sql, "Executing single query");
+	trace!(sql = %sql, "Executing single query");
 
 	let client = pool.get().await?;
 	let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(id)];
@@ -92,7 +92,7 @@ pub async fn resolve_by_node_id(
 	let sql =
 		format!(r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t."_id"::text = $1 LIMIT 1"#);
 
-	debug!(sql = %sql, "Executing byNodeId query");
+	trace!(sql = %sql, "Executing byNodeId query");
 
 	let client = pool.get().await?;
 	let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(pk_str)];
