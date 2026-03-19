@@ -27,7 +27,7 @@ services:
       PGPASSWORD: postgres
     volumes:
       - ../tests/fixtures:/fixtures:ro
-    entrypoint: ["psql", "-h", "postgres", "-U", "postgres", "-d", "indexer", "-f", "/fixtures/test_db.sql"]
+    entrypoint: ["/bin/sh", "-c", "psql -h postgres -U postgres -d indexer -f /fixtures/test_db.sql && psql -h postgres -U postgres -d indexer -f /fixtures/type_coverage.sql"]
     restart: "no"
 
   # ── TypeScript @subql/query ───────────────────────────────────────────────────
