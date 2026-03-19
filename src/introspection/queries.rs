@@ -72,12 +72,8 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 
 	debug!(schema, table_count = table_names.len(), "Introspecting tables");
 
-	// Log tables with smart tag comments for debugging.
 	for (table, comment) in &table_comments {
-		tracing::info!(table = %table, comment = %comment, "Table comment with smart tags");
-	}
-	if table_comments.is_empty() {
-		tracing::info!("No table comments found with smart tags");
+		tracing::trace!(table = %table, comment = %comment, "Table comment with smart tags");
 	}
 
 	let mut tables = Vec::with_capacity(table_names.len());
