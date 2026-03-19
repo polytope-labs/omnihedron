@@ -287,7 +287,7 @@ async fn test_historical_nested_relation() {
 			testAuthors(blockHeight: "200") {
 				nodes {
 					id
-					testBooksByCreatorId {
+					books {
 						nodes { id title }
 					}
 				}
@@ -314,9 +314,9 @@ async fn test_historical_nested_relation() {
 	assert!(!authors_200.is_empty(), "expected at least one test author at blockHeight 200");
 
 	let books_200 = authors_200[0]
-		.pointer("/testBooksByCreatorId/nodes")
+		.pointer("/books/nodes")
 		.and_then(|v| v.as_array())
-		.expect("testBooksByCreatorId nodes missing");
+		.expect("books nodes missing");
 
 	let titles_200: Vec<&str> = books_200.iter().filter_map(|b| b["title"].as_str()).collect();
 
@@ -343,7 +343,7 @@ async fn test_historical_nested_relation() {
 			testAuthors(blockHeight: "600") {
 				nodes {
 					id
-					testBooksByCreatorId {
+					books {
 						nodes { id title }
 					}
 				}
@@ -370,9 +370,9 @@ async fn test_historical_nested_relation() {
 	assert!(!authors_600.is_empty(), "expected at least one test author at blockHeight 600");
 
 	let books_600 = authors_600[0]
-		.pointer("/testBooksByCreatorId/nodes")
+		.pointer("/books/nodes")
 		.and_then(|v| v.as_array())
-		.expect("testBooksByCreatorId nodes missing at blockHeight 600");
+		.expect("books nodes missing at blockHeight 600");
 
 	let titles_600: Vec<&str> = books_600.iter().filter_map(|b| b["title"].as_str()).collect();
 

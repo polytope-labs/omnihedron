@@ -49,14 +49,13 @@ async fn test_backward_relation() {
 	let rust_client = TestClient::new(&rust_url());
 	let ts_client = TestClient::new(&ts_url());
 
-	let query = r#"{ testAuthor(id: "author-alice") { id name testBooksByCreatorId { nodes { id title } totalCount } } }"#;
+	let query =
+		r#"{ testAuthor(id: "author-alice") { id name books { nodes { id title } totalCount } } }"#;
 
 	let ts = ts_client.query(query).await;
 	let rust = rust_client.query(query).await;
 
-	let conn = rust
-		.pointer("/data/testAuthor/testBooksByCreatorId")
-		.expect("connection missing");
+	let conn = rust.pointer("/data/testAuthor/books").expect("connection missing");
 	let total = conn["totalCount"].as_i64().expect("totalCount");
 	assert_eq!(total, 2, "Alice should have 2 books");
 
@@ -73,14 +72,12 @@ async fn test_backward_relation_filter() {
 	let rust_client = TestClient::new(&rust_url());
 	let ts_client = TestClient::new(&ts_url());
 
-	let query = r#"{ testAuthor(id: "author-alice") { testBooksByCreatorId(filter: { title: { equalTo: "Book Two" } }) { nodes { id title } totalCount } } }"#;
+	let query = r#"{ testAuthor(id: "author-alice") { books(filter: { title: { equalTo: "Book Two" } }) { nodes { id title } totalCount } } }"#;
 
 	let ts = ts_client.query(query).await;
 	let rust = rust_client.query(query).await;
 
-	let conn = rust
-		.pointer("/data/testAuthor/testBooksByCreatorId")
-		.expect("connection missing");
+	let conn = rust.pointer("/data/testAuthor/books").expect("connection missing");
 	assert_eq!(conn["totalCount"], 1);
 
 	compare_responses("backward relation filter", &ts, &rust);
@@ -96,7 +93,7 @@ async fn test_backward_relation_orderby() {
 	let rust_client = TestClient::new(&rust_url());
 	let ts_client = TestClient::new(&ts_url());
 
-	let query = r#"{ testAuthor(id: "author-alice") { testBooksByCreatorId(orderBy: TITLE_DESC) { nodes { id title } } } }"#;
+	let query = r#"{ testAuthor(id: "author-alice") { books(orderBy: TITLE_DESC) { nodes { id title } } } }"#;
 
 	let ts = ts_client.query(query).await;
 	let rust = rust_client.query(query).await;
@@ -116,7 +113,7 @@ async fn test_backward_relation_pagination() {
 
 	let query = r#"{
         testAuthor(id: "author-alice") {
-            testBooksByCreatorId(first: 1) {
+            books(first: 1) {
                 nodes { id title }
                 totalCount
                 pageInfo { hasNextPage hasPreviousPage }
@@ -126,9 +123,7 @@ async fn test_backward_relation_pagination() {
 	let ts = ts_client.query(query).await;
 	let rust = rust_client.query(query).await;
 
-	let conn = rust
-		.pointer("/data/testAuthor/testBooksByCreatorId")
-		.expect("connection missing");
+	let conn = rust.pointer("/data/testAuthor/books").expect("connection missing");
 	assert_eq!(conn["totalCount"], 2, "totalCount should be 2");
 
 	compare_responses("backward relation pagination", &ts, &rust);
@@ -206,7 +201,7 @@ async fn test_relation_some_filter() {
 	let ts_client = TestClient::new(&ts_url());
 
 	let query = r#"{
-        testAuthors(filter: { testBooksByCreatorId: { some: { title: { equalTo: "Book Two" } } } }) {
+        testAuthors(filter: { books: { some: { title: { equalTo: "Book Two" } } } }) {
             nodes { id name }
             totalCount
         }
@@ -234,7 +229,7 @@ async fn test_relation_none_filter() {
 	let ts_client = TestClient::new(&ts_url());
 
 	let query = r#"{
-        testAuthors(filter: { testBooksByCreatorId: { none: { title: { equalTo: "Book Two" } } } }) {
+        testAuthors(filter: { books: { none: { title: { equalTo: "Book Two" } } } }) {
             nodes { id name }
             totalCount
         }
@@ -262,7 +257,7 @@ async fn test_relation_every_filter() {
 	let ts_client = TestClient::new(&ts_url());
 
 	let query = r#"{
-        testAuthors(filter: { testBooksByCreatorId: { every: { title: { startsWith: "Book" } } } }) {
+        testAuthors(filter: { books: { every: { title: { startsWith: "Book" } } } }) {
             nodes { id name }
             totalCount
         }
