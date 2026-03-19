@@ -66,6 +66,7 @@ jobs:
             --name app \
             --port 3000 \
             --unsafe-mode \
+            --playground \
             &
           echo $! > .omnihedron.pid
 
@@ -103,6 +104,7 @@ jobs:
           ./target/release/omnihedron \
             --name app \
             --port 3000 \
+            --playground \
             &
           echo $! > .omnihedron.pid
 
