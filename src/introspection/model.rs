@@ -156,18 +156,15 @@ impl SmartTags {
 		tags
 	}
 
-	/// Parse all smart tag groups from a table comment (historical mode).
+	/// Parse all virtual FK definitions from a table comment (historical mode).
 	///
-	/// In historical mode, SubQuery stores all FK smart tags as a single table
-	/// comment with newline-separated groups. Each group contains `|`-separated
-	/// tags for one FK, including a `@foreignKey (col) REFERENCES "table" (id)`
-	/// that identifies which FK the tags belong to.
+	/// In historical mode, SubQuery stores FK definitions AND smart tags as table
+	/// comments (no actual FK constraints in the DB). Each line contains
+	/// `|`-separated tags for one FK, including `@foreignKey (col) REFERENCES table (id)`.
 	///
-	/// Returns `Vec<(fk_column, SmartTags)>` where `fk_column` is extracted from
-	/// the `@foreignKey` tag.
-	pub fn from_table_comment(comment: &str) -> Vec<(String, SmartTags)> {
+	/// Returns `Vec<VirtualForeignKey>` with full FK info.
+	pub fn from_table_comment_full(comment: &str) -> Vec<VirtualForeignKey> {
 		let mut results = Vec::new();
-		// Each line represents one FK's tag set.
 		for line in comment.lines() {
 			let line = line.trim();
 			if line.is_empty() {
@@ -175,6 +172,8 @@ impl SmartTags {
 			}
 			let mut tags = SmartTags::default();
 			let mut fk_column: Option<String> = None;
+			let mut foreign_table: Option<String> = None;
+			let mut foreign_pk: Option<String> = None;
 
 			for segment in line.split('|') {
 				let segment = segment.trim();
@@ -190,12 +189,31 @@ impl SmartTags {
 						tags.single_foreign_field_name = Some(parts[1].trim().to_string());
 					},
 					"@foreignKey" => {
-						// Format: "(col_name) REFERENCES ..."
-						// Extract column name from parentheses.
-						if let Some(start) = parts[1].find('(') {
-							if let Some(end) = parts[1][start..].find(')') {
-								fk_column =
-									Some(parts[1][start + 1..start + end].trim().to_string());
+						// Format: "(col_name) REFERENCES table_name (pk_col)"
+						let val = parts[1].trim();
+						if let Some(start) = val.find('(') {
+							if let Some(end) = val[start..].find(')') {
+								fk_column = Some(val[start + 1..start + end].trim().to_string());
+							}
+						}
+						if let Some(ref_idx) = val.find("REFERENCES") {
+							let after_ref = val[ref_idx + "REFERENCES".len()..].trim();
+							let table_end = after_ref
+								.find('(')
+								.unwrap_or(after_ref.len())
+								.min(after_ref.find(' ').unwrap_or(after_ref.len()));
+							let table = after_ref[..table_end].trim().trim_matches('"').to_string();
+							if !table.is_empty() {
+								foreign_table = Some(table);
+							}
+							if let Some(pk_start) = after_ref.find('(') {
+								if let Some(pk_end) = after_ref[pk_start..].find(')') {
+									foreign_pk = Some(
+										after_ref[pk_start + 1..pk_start + pk_end]
+											.trim()
+											.to_string(),
+									);
+								}
 							}
 						}
 					},
@@ -204,13 +222,20 @@ impl SmartTags {
 			}
 
 			if let Some(col) = fk_column {
-				if tags.foreign_field_name.is_some() || tags.single_foreign_field_name.is_some() {
-					results.push((col, tags));
-				}
+				results.push(VirtualForeignKey { fk_column: col, foreign_table, foreign_pk, tags });
 			}
 		}
 		results
 	}
+}
+
+/// A virtual FK definition parsed from a table comment.
+#[derive(Debug, Clone)]
+pub struct VirtualForeignKey {
+	pub fk_column: String,
+	pub foreign_table: Option<String>,
+	pub foreign_pk: Option<String>,
+	pub tags: SmartTags,
 }
 
 /// A PostgreSQL function created by SubQuery's `@fullText` directive.
