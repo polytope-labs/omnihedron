@@ -190,13 +190,14 @@ pub async fn resolve_backward_relation(
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
 	let parent_id = match parent.get("id") {
 		Some(v) if !v.is_null() => v.clone(),
-		_ =>
+		_ => {
 			return Ok(Some(json!({
 				"nodes": [],
 				"edges": [],
 				"pageInfo": { "hasNextPage": false, "hasPreviousPage": false },
 				"totalCount": 0,
-			}))),
+			})));
+		},
 	};
 
 	let inherited_height: Option<String> =
@@ -397,13 +398,14 @@ pub async fn resolve_many_to_many(
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
 	let parent_id = match parent.get("id") {
 		Some(v) if !v.is_null() => v.clone(),
-		_ =>
+		_ => {
 			return Ok(Some(json!({
 				"nodes": [],
 				"edges": [],
 				"pageInfo": { "hasNextPage": false, "hasPreviousPage": false },
 				"totalCount": 0,
-			}))),
+			})));
+		},
 	};
 
 	let schema = ctx

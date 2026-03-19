@@ -166,8 +166,9 @@ fn camel_case_digit_aware(s: &str) -> String {
 				let mut chars = word.chars();
 				match chars.next() {
 					None => String::new(),
-					Some(first) =>
-						first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+					Some(first) => {
+						first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+					},
 				}
 			}
 		})
@@ -201,11 +202,11 @@ pub fn pluralize(s: &str) -> String {
 	if s.ends_with("y") && !ends_with_vowel_y(s) {
 		// category → categories
 		format!("{}ies", &s[..s.len() - 1])
-	} else if s.ends_with("s") ||
-		s.ends_with("x") ||
-		s.ends_with("z") ||
-		s.ends_with("ch") ||
-		s.ends_with("sh")
+	} else if s.ends_with("s")
+		|| s.ends_with("x")
+		|| s.ends_with("z")
+		|| s.ends_with("ch")
+		|| s.ends_with("sh")
 	{
 		format!("{s}es")
 	} else {
@@ -257,8 +258,8 @@ pub fn singularize(s: &str) -> String {
 			// Use heuristic: if the pre-"es" stem ends in a vowel+'s', it's
 			// more likely a real word (bus, status). Check letter before 's':
 			let bytes = without_es.as_bytes();
-			if bytes.len() >= 2 &&
-				matches!(bytes[bytes.len() - 2] as char, 'a' | 'e' | 'i' | 'o' | 'u')
+			if bytes.len() >= 2
+				&& matches!(bytes[bytes.len() - 2] as char, 'a' | 'e' | 'i' | 'o' | 'u')
 			{
 				without_es.to_string() // buses → bus (vowel before 's': u)
 			} else {
@@ -435,11 +436,11 @@ fn simple_plural_suffix(word: &str) -> String {
 	} else if lo.ends_with('y') && !lo.ends_with("ey") && !lo.ends_with("ay") && !lo.ends_with("oy")
 	{
 		format!("{}ies", &word[..word.len() - 1])
-	} else if lo.ends_with("ches") ||
-		lo.ends_with("shes") ||
-		lo.ends_with("xes") ||
-		lo.ends_with("zes") ||
-		lo.ends_with("ses")
+	} else if lo.ends_with("ches")
+		|| lo.ends_with("shes")
+		|| lo.ends_with("xes")
+		|| lo.ends_with("zes")
+		|| lo.ends_with("ses")
 	{
 		word.to_string() // already plural
 	} else if lo.ends_with("ch") || lo.ends_with("sh") || lo.ends_with('x') || lo.ends_with('z') {

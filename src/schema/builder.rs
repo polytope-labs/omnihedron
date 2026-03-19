@@ -866,9 +866,7 @@ fn register_table_types(
 			for col in foreign_table.public_columns() {
 				let col_upper = to_screaming_snake(&col.name);
 				orderby = orderby
-					.item(EnumItem::new(format!(
-						"{singular_upper}_BY_{fk_upper}__{col_upper}_ASC"
-					)))
+					.item(EnumItem::new(format!("{singular_upper}_BY_{fk_upper}__{col_upper}_ASC")))
 					.item(EnumItem::new(format!(
 						"{singular_upper}_BY_{fk_upper}__{col_upper}_DESC"
 					)));

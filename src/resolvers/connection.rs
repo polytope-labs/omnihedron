@@ -130,7 +130,8 @@ pub async fn resolve_connection_ctx(
 	}
 
 	// ── ORDER BY ──────────────────────────────────────────────────────────────
-	let order_clauses = parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema), Some(filter_ctx));
+	let order_clauses =
+		parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema), Some(filter_ctx));
 	let order_cols: Vec<String> = extract_order_cols(&order_clauses);
 
 	// ── PAGINATION ────────────────────────────────────────────────────────────
@@ -614,8 +615,9 @@ pub fn parse_orderby_with_schema(
 ) -> Vec<String> {
 	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
-		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) =>
-			vec![v.clone()],
+		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) => {
+			vec![v.clone()]
+		},
 		_ => return vec![],
 	};
 	arr.iter()
@@ -648,10 +650,8 @@ pub fn parse_orderby_with_schema(
 						let fk_col = after_by[..dunder_idx].to_lowercase();
 						let target_col = after_by[dunder_idx + 2..].to_lowercase();
 						if let Some(fctx) = filter_ctx {
-							if let Some(info) = fctx
-								.forward_relations
-								.values()
-								.find(|r| r.fk_column == fk_col)
+							if let Some(info) =
+								fctx.forward_relations.values().find(|r| r.fk_column == fk_col)
 							{
 								let sql = format!(
 									"(SELECT _rel.\"{}\" FROM \"{}\".\"{}\" AS _rel WHERE _rel.\"{}\" = t.\"{}\")",
@@ -727,8 +727,9 @@ pub fn extract_order_cols(clauses: &[String]) -> Vec<String> {
 pub fn parse_distinct(val: Option<&async_graphql::Value>) -> Vec<String> {
 	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
-		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) =>
-			vec![v.clone()],
+		Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) => {
+			vec![v.clone()]
+		},
 		_ => return vec![],
 	};
 	arr.iter()

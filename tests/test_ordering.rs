@@ -389,14 +389,8 @@ async fn test_orderby_related_scalar() {
 	let ts_resp = ts_client.query(query).await;
 	let rust_resp = rust_client.query(query).await;
 
-	println!(
-		"TS   orderBy related: {}",
-		serde_json::to_string_pretty(&ts_resp).unwrap()
-	);
-	println!(
-		"Rust orderBy related: {}",
-		serde_json::to_string_pretty(&rust_resp).unwrap()
-	);
+	println!("TS   orderBy related: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust orderBy related: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
 
 	// Verify Rust returns no errors
 	assert!(
@@ -422,8 +416,7 @@ async fn test_orderby_related_scalar() {
 
 	// Verify the ordering: Alice's books should come before Bob's
 	if let Some(nodes) = rust_resp.pointer("/data/testBooks/nodes").and_then(|v| v.as_array()) {
-		let creator_ids: Vec<&str> =
-			nodes.iter().filter_map(|n| n["creatorId"].as_str()).collect();
+		let creator_ids: Vec<&str> = nodes.iter().filter_map(|n| n["creatorId"].as_str()).collect();
 		// All Alice books should appear before any Bob books
 		let first_bob = creator_ids.iter().position(|id| *id == "author-bob");
 		let last_alice = creator_ids.iter().rposition(|id| *id == "author-alice");
@@ -458,8 +451,7 @@ async fn test_orderby_related_scalar() {
 	);
 
 	if let Some(nodes) = rust_desc.pointer("/data/testBooks/nodes").and_then(|v| v.as_array()) {
-		let creator_ids: Vec<&str> =
-			nodes.iter().filter_map(|n| n["creatorId"].as_str()).collect();
+		let creator_ids: Vec<&str> = nodes.iter().filter_map(|n| n["creatorId"].as_str()).collect();
 		let first_alice = creator_ids.iter().position(|id| *id == "author-alice");
 		let last_bob = creator_ids.iter().rposition(|id| *id == "author-bob");
 		if let (Some(alice_pos), Some(bob_pos)) = (first_alice, last_bob) {
