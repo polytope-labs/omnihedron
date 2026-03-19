@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup_db.sh — Start PostgreSQL 17, restore the dump, write .env.test
+# setup_db.sh — Start PostgreSQL 17, load fixture data, write .env.test
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,20 +15,19 @@ until docker compose -f docker/docker-compose.yml exec -T postgres pg_isready -U
 done
 echo "==> PostgreSQL is ready."
 
-echo "==> Checking if dump is already restored..."
+echo "==> Checking if fixture is already loaded..."
 TABLE_COUNT=$(docker compose -f docker/docker-compose.yml exec -T postgres psql -U postgres -d indexer -t -c \
   "SELECT COUNT(*) FROM information_schema.tables
    WHERE table_schema NOT IN ('public','information_schema','pg_catalog')
    AND table_schema NOT LIKE 'pg_%';" 2>/dev/null | tr -d '[:space:]')
 
 if [ "${TABLE_COUNT:-0}" -gt "0" ]; then
-  echo "==> Dump already restored ($TABLE_COUNT tables). Skipping."
+  echo "==> Fixture already loaded ($TABLE_COUNT tables). Skipping."
 else
-  echo "==> Restoring dump (5.2GB — this will take several minutes)..."
-  docker compose -f docker/docker-compose.yml exec -T postgres pg_restore \
-    -U postgres -d indexer --no-owner --no-privileges \
-    /tmp/dump.dump || true
-  echo "==> Restore complete."
+  echo "==> Loading fixture data..."
+  docker compose -f docker/docker-compose.yml exec -T postgres \
+    psql -U postgres -d indexer < "$PROJECT_ROOT/tests/fixtures/test_db.sql" || true
+  echo "==> Fixture loaded."
 fi
 
 echo "==> Discovering schema name..."

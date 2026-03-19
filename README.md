@@ -205,7 +205,7 @@ DB_DATABASE=indexer
 Helper scripts in `scripts/` manage the full Docker lifecycle:
 
 ```bash
-# First-time setup: start PostgreSQL and restore the dump
+# First-time setup: start PostgreSQL and load fixture data
 bash scripts/setup_db.sh
 
 # Build the Rust binary + Docker image and start both services

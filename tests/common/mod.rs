@@ -194,6 +194,14 @@ pub fn compare_responses(query_name: &str, ts: &Value, rust: &Value) {
 	);
 }
 
+/// Returns true if a GraphQL response contains errors.
+pub fn has_graphql_errors(resp: &Value) -> bool {
+	resp.get("errors")
+		.and_then(|e| e.as_array())
+		.map(|a| !a.is_empty())
+		.unwrap_or(false)
+}
+
 pub fn strip_field(val: &mut Value, field: &str) {
 	match val {
 		Value::Object(map) => {

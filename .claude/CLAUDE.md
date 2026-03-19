@@ -139,10 +139,10 @@ src/
   server.rs                # axum router
 docker/
   Dockerfile               # Copies pre-built binary; build on host first
-  docker-compose.yml       # Full dev stack (needs testnet-indexer-db.dump)
+  docker-compose.yml       # Dev stack (uses tests/fixtures/test_db.sql)
   docker-compose.ci.yml    # CI stack (uses tests/fixtures/test_db.sql)
 scripts/
-  setup_db.sh              # Start postgres + restore 5.2GB dump (one-time)
+  setup_db.sh              # Start postgres + load fixture data (one-time)
   start_services.sh        # Build binary + start Rust + TypeScript services
   stop_services.sh         # Stop services (--with-db to also stop postgres)
   create_fixture.sh        # Regenerate tests/fixtures/test_db.sql from live DB
@@ -157,7 +157,7 @@ tests/
   test_relations.rs        # 10 tests (forward, backward, nested relations)
   test_historical.rs       # 3 tests (block height queries)
   test_limits.rs           # 2 tests (1 ignored)
-  fixtures/test_db.sql     # Minimal 1.6MB SQL fixture for CI (replaces 5.2GB dump)
+  fixtures/test_db.sql     # Minimal 1.6MB SQL fixture
 ```
 
 ---
@@ -390,7 +390,7 @@ All workflows: `cancel-in-progress: true`.
 ## Development workflow
 
 ```bash
-# First-time setup (restores 5.2GB dump — takes ~10 min)
+# First-time setup (loads fixture data)
 bash scripts/setup_db.sh
 
 # Start both services

@@ -882,7 +882,13 @@ pub fn json_to_pg_params(params: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> 
 				// Send numbers as text so PostgreSQL can coerce to any column type
 				// (INT4, NUMERIC, BIGINT, etc.) without OID mismatch errors.
 				Value::Number(n) => Box::new(TextParam(n.to_string())),
-				Value::String(s) => Box::new(s.clone()),
+				// Send strings as text-encoded parameters so PostgreSQL can coerce
+				// to the target column type (e.g. NUMERIC, BIGINT).  BigFloat/BigInt
+				// values arrive as JSON strings from GraphQL; a native Rust String
+				// binds as PG `text` which fails binary-protocol comparison against
+				// numeric columns.  TextParam sends in text format, letting PG's
+				// text input function handle the conversion.
+				Value::String(s) => Box::new(TextParam(s.clone())),
 				// Arrays / objects are serialised to JSON text (used by `in` filter
 				// which casts $N::jsonb on the SQL side).  TextParam accepts any
 				// server type (including JSONB) and sends bytes in text format.
