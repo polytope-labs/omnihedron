@@ -50,5 +50,5 @@ wait_for "TypeScript service" "http://localhost:3001/health" "subql-query-ts"
 
 echo ""
 echo "==> Both services running."
-echo "    Rust : http://localhost:3000"
-echo "    TS   : http://localhost:3001"
+echo "    Rust : http://localhost:3000/graphql"
+echo "    TS   : http://localhost:3001/graphql"

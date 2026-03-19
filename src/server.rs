@@ -16,8 +16,8 @@
 //! HTTP server: axum router, request handling, WebSocket subscriptions, and GraphiQL playground.
 //!
 //! Exposes three endpoints:
-//! - `POST /` — single and batch GraphQL queries
-//! - `GET  /` — GraphiQL playground (when enabled)
+//! - `POST /graphql` — single and batch GraphQL queries
+//! - `GET  /graphql` — WebSocket upgrade for subscriptions (when enabled)
 //! - `GET  /health`  — liveness probe returning `200 OK`
 //!
 //! All query validation (depth, complexity, alias, batch limits) is applied
@@ -72,11 +72,11 @@ pub fn build_router(state: AppState) -> Router {
 	let cfg = state.cfg.clone();
 
 	let mut router = Router::new()
-		.route("/", post(graphql_handler).get(graphql_handler))
+		.route("/graphql", post(graphql_handler).get(graphql_handler))
 		.route("/health", get(health_handler));
 
 	if cfg.subscription {
-		router = router.route("/ws", get(graphql_ws_handler));
+		router = router.route("/graphql/ws", get(graphql_ws_handler));
 	}
 
 	if cfg.playground {
@@ -259,7 +259,12 @@ async fn graphql_ws_handler(
 }
 
 async fn graphiql_handler() -> impl IntoResponse {
-	Html(GraphiQLSource::build().endpoint("/").subscription_endpoint("/ws").finish())
+	Html(
+		GraphiQLSource::build()
+			.endpoint("/graphql")
+			.subscription_endpoint("/graphql/ws")
+			.finish(),
+	)
 }
 
 async fn health_handler() -> impl IntoResponse {

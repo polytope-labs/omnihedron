@@ -39,7 +39,7 @@ use tokio::sync::Semaphore;
 #[derive(Parser, Debug)]
 #[command(name = "bench", about = "Concurrent GraphQL benchmarking tool for omnihedron services")]
 struct BenchArgs {
-	/// Target URL (GraphQL endpoint)
+	/// Target URL (without /graphql — it's appended automatically)
 	#[arg(long, default_value = "http://localhost:3000")]
 	url: String,
 
@@ -76,7 +76,7 @@ struct RequestResult {
 async fn main() {
 	let args = BenchArgs::parse();
 
-	let graphql_url = args.url.trim_end_matches('/').to_string();
+	let graphql_url = format!("{}/graphql", args.url.trim_end_matches('/'));
 
 	println!("========================================");
 	println!(" {}", args.label);

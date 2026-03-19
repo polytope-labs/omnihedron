@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "omnihedron"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-graphql",

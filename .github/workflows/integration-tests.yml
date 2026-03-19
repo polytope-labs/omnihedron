@@ -43,7 +43,7 @@ jobs:
                  -X POST \
                  -H "Content-Type: application/json" \
                  -d '{"query":"{ __typename }"}' \
-                 http://localhost:3001 > /dev/null 2>&1; then
+                 http://localhost:3001/graphql > /dev/null 2>&1; then
               echo "TypeScript service is ready."
               break
             fi

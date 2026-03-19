@@ -59,7 +59,7 @@ pub fn services_available() -> bool {
 			"Content-Type: application/json",
 			"-d",
 			r#"{"query":"{ __typename }"}"#,
-			&ts_url(),
+			&format!("{}/graphql", ts_url()),
 		])
 		.output()
 		.map(|o| o.status.success())
@@ -99,7 +99,7 @@ impl TestClient {
 	pub async fn query_with_body(&self, body: Value) -> Value {
 		let resp = self
 			.client
-			.post(self.url.clone())
+			.post(format!("{}/graphql", self.url))
 			.header("Content-Type", "application/json")
 			.json(&body)
 			.send()
@@ -112,7 +112,7 @@ impl TestClient {
 	pub async fn batch_query(&self, bodies: &[Value]) -> Value {
 		let resp = self
 			.client
-			.post(self.url.clone())
+			.post(format!("{}/graphql", self.url))
 			.header("Content-Type", "application/json")
 			.json(&bodies)
 			.send()

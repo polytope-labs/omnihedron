@@ -33,7 +33,7 @@ run_oha() {
   local port="$2"
   local concurrency="$3"
   local query_body="$4"
-  local url="http://localhost:${port}"
+  local url="http://localhost:${port}/graphql"
 
   echo ""
   echo "--- $label | port=$port | concurrency=$concurrency | n=$TOTAL_REQUESTS ---"
@@ -47,7 +47,7 @@ run_oha() {
       -m POST \
       -H "Content-Type: application/json" \
       -d "$query_body" \
-      "http://host.docker.internal:${port}"
+      "http://host.docker.internal:${port}/graphql"
   else
     # Fallback: curl loop (sequential, not concurrent — approximation only)
     echo "(oha not available; running $TOTAL_REQUESTS sequential curl requests as fallback)"
