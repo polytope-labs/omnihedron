@@ -11,7 +11,6 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../testnet-indexer-db.dump:/tmp/dump.dump:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d indexer"]
       interval: 5s
@@ -19,33 +18,31 @@ services:
       retries: 20
       start_period: 10s
 
-  # ── One-shot restore container (skips if DB already populated) ────────────────
-  db-restore:
+  # ── One-shot fixture loader (skips if DB already populated) ─────────────────
+  db-init:
     image: postgres:17
-    container_name: subql-db-restore
+    container_name: subql-db-init
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       PGPASSWORD: postgres
     volumes:
-      - ../testnet-indexer-db.dump:/tmp/dump.dump:ro
+      - ../tests/fixtures/test_db.sql:/tmp/test_db.sql:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        COUNT=$(psql -h postgres -U postgres -d indexer -t -c \
+        COUNT=$$(psql -h postgres -U postgres -d indexer -t -c \
           "SELECT COUNT(*) FROM information_schema.tables \
            WHERE table_schema NOT IN ('public','information_schema','pg_catalog') \
            AND table_schema NOT LIKE 'pg_%';" | tr -d '[:space:]')
         if [ "$${COUNT:-0}" -gt "0" ]; then
-          echo "==> DB already restored ($$COUNT tables). Skipping."
+          echo "==> DB already loaded ($$COUNT tables). Skipping."
         else
-          echo "==> Restoring dump (this takes several minutes)..."
-          pg_restore -h postgres -U postgres -d indexer \
-            --no-owner --no-privileges \
-            /tmp/dump.dump || true
-          echo "==> Restore complete."
+          echo "==> Loading fixture data..."
+          psql -h postgres -U postgres -d indexer -f /tmp/test_db.sql
+          echo "==> Fixture loaded."
         fi
     restart: "no"
 
@@ -54,7 +51,7 @@ services:
     image: subquerynetwork/subql-query:latest
     container_name: subql-query-ts
     depends_on:
-      db-restore:
+      db-init:
         condition: service_completed_successfully
     environment:
       DB_HOST: postgres
@@ -75,7 +72,7 @@ services:
     image: omnihedron:latest
     container_name: omnihedron
     depends_on:
-      db-restore:
+      db-init:
         condition: service_completed_successfully
     environment:
       DB_HOST: postgres
