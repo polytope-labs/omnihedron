@@ -27,9 +27,9 @@ use crate::{
 		cursor::encode_node_id,
 		filters::{filter_type_for as scalar_filter_for, register_scalar_filters},
 		inflector::{
-			backward_relation_field, forward_relation_field, table_to_connection_field,
-			table_to_plural_type_name, table_to_single_field, table_to_type_name, to_camel_case,
-			to_screaming_snake,
+			backward_relation_field, forward_relation_field, singularize,
+			table_to_connection_field, table_to_plural_type_name, table_to_single_field,
+			table_to_type_name, to_camel_case, to_screaming_snake,
 		},
 		metadata::register_metadata_types,
 		subscriptions::register_subscriptions,
@@ -850,6 +850,26 @@ fn register_table_types(
 						}
 					}
 				}
+			}
+		}
+	}
+
+	// ── Forward relation scalar orderBy (pg-order-by-related) ────────────
+	// For each FK on this table, add ordering by any public column on the
+	// referenced parent table.  Uses double-underscore `__` separator to
+	// distinguish from aggregate ordering (single underscore).
+	// Pattern: {SINGULAR_FOREIGN_TABLE}_BY_{FK_COL}__{TARGET_COL}_ASC/DESC
+	for fk in &table.foreign_keys {
+		if let Some(foreign_table) = all_tables.iter().find(|t| t.name == fk.foreign_table) {
+			let singular_upper = to_screaming_snake(&singularize(&foreign_table.name));
+			let fk_upper = to_screaming_snake(&fk.column);
+			for col in foreign_table.public_columns() {
+				let col_upper = to_screaming_snake(&col.name);
+				orderby = orderby
+					.item(EnumItem::new(format!("{singular_upper}_BY_{fk_upper}__{col_upper}_ASC")))
+					.item(EnumItem::new(format!(
+						"{singular_upper}_BY_{fk_upper}__{col_upper}_DESC"
+					)));
 			}
 		}
 	}

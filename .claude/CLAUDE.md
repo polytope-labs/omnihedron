@@ -92,6 +92,7 @@ Docker Hub: `polytopelabs/omnihedron`
 - Backward relation one-to-one detection (unique FK → single record)
 - BlockHeight in relation filter subqueries (_block_range @> in EXISTS)
 - Fulltext search sanitization (`sanitize_tsquery`)
+- Forward-relation scalar ordering (`pg-order-by-related` parity): enum `{SINGULAR_TABLE}_BY_{FK_COL}__{TARGET_COL}_ASC/DESC`, generates correlated subqueries in ORDER BY
 - Metadata default chain caching
 - `first+last` and `offset+last` argument rejection
 - Negative first/last/offset clamping
@@ -151,7 +152,7 @@ tests/
   test_basics.rs           # 12 tests (health, metadata, introspection, etc.)
   test_pagination.rs       # 8 tests (cursor, offset, last pagination)
   test_filters.rs          # 14 tests (including enum filter)
-  test_ordering.rs         # 6 tests (multi-column, non-id ordering)
+  test_ordering.rs         # 7 tests (multi-column, non-id, forward-relation scalar ordering)
   test_aggregates.rs       # 7 tests (sum, count, min, max, stddev, variance)
   test_relations.rs        # 10 tests (forward, backward, nested relations)
   test_historical.rs       # 3 tests (block height queries)
@@ -298,7 +299,7 @@ The global `_global` table exists but is typically empty.
 
 Tests are split across 8 files in `tests/` with shared infrastructure in `tests/common/mod.rs`. They compare Rust vs TypeScript service responses.
 
-**What's tested (62 tests total, 61 + 1 ignored):**
+**What's tested (63 tests total, 62 + 1 ignored):**
 
 **Rust + TS comparison tests (both services must be running):**
 - `test_health` — `/health` returns 2xx; TypeScript `/graphql` responds to `{ __typename }`
@@ -329,6 +330,7 @@ Tests are split across 8 files in `tests/` with shared infrastructure in `tests/
 - `test_filter_range` — `greaterThanOrEqualTo`/`lessThanOrEqualTo` on block_number; full range → 20 rows, min value → 1 row
 - `test_filter_not` — logical `not: { chain: { equalTo: "POLKADOT" } }` matches all 20 rows
 - `test_orderby_non_id` — `orderBy: BLOCK_NUMBER_ASC` returns ascending block number order on both services
+- `test_orderby_related_scalar` — `orderBy: TEST_AUTHOR_BY_CREATOR_ID__NAME_ASC/DESC` orders books by related author name via correlated subquery
 - `test_distinct` — `distinct: [CHAIN]` collapses 20 same-chain rows to 1; both services return chain="KUSAMA-4009"
 - `test_enum_field` — `orders { nodes { status } }` returns valid enum values (PLACED/FILLED/REDEEMED/REFUNDED)
 

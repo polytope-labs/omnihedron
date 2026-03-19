@@ -362,6 +362,110 @@ async fn test_distinct() {
 	println!("distinct: Rust and TS each returned 1 row with chain=KUSAMA-4009 ✓");
 }
 
+/// Test ordering by a forward-relation scalar field (pg-order-by-related).
+///
+/// Orders `testBooks` by the related `testAuthor`'s `name` field via the
+/// `creator_id` FK.  The enum value follows the double-underscore pattern:
+/// `TEST_AUTHOR_BY_CREATOR_ID__NAME_ASC`.
+#[tokio::test]
+async fn test_orderby_related_scalar() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	// Order books by their author's name ascending
+	let query = r#"
+        {
+            testBooks(orderBy: TEST_AUTHOR_BY_CREATOR_ID__NAME_ASC) {
+                nodes { id title creatorId }
+            }
+        }
+    "#;
+
+	let ts_resp = ts_client.query(query).await;
+	let rust_resp = rust_client.query(query).await;
+
+	println!("TS   orderBy related: {}", serde_json::to_string_pretty(&ts_resp).unwrap());
+	println!("Rust orderBy related: {}", serde_json::to_string_pretty(&rust_resp).unwrap());
+
+	// Verify Rust returns no errors
+	assert!(
+		rust_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust orderBy related returned errors: {}",
+		rust_resp
+	);
+
+	// Verify TS returns no errors
+	assert!(
+		ts_resp
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"TS orderBy related returned errors: {}",
+		ts_resp
+	);
+
+	// Verify the ordering: Alice's books should come before Bob's
+	if let Some(nodes) = rust_resp.pointer("/data/testBooks/nodes").and_then(|v| v.as_array()) {
+		let creator_ids: Vec<&str> = nodes.iter().filter_map(|n| n["creatorId"].as_str()).collect();
+		// All Alice books should appear before any Bob books
+		let first_bob = creator_ids.iter().position(|id| *id == "author-bob");
+		let last_alice = creator_ids.iter().rposition(|id| *id == "author-alice");
+		if let (Some(bob_pos), Some(alice_pos)) = (first_bob, last_alice) {
+			assert!(
+				alice_pos < bob_pos,
+				"Alice books should come before Bob books when ordering by name ASC, got: {:?}",
+				creator_ids
+			);
+		}
+	}
+
+	// Descending order — Bob before Alice
+	let query_desc = r#"
+        {
+            testBooks(orderBy: TEST_AUTHOR_BY_CREATOR_ID__NAME_DESC) {
+                nodes { id title creatorId }
+            }
+        }
+    "#;
+
+	let rust_desc = rust_client.query(query_desc).await;
+
+	assert!(
+		rust_desc
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"Rust DESC orderBy related returned errors: {}",
+		rust_desc
+	);
+
+	if let Some(nodes) = rust_desc.pointer("/data/testBooks/nodes").and_then(|v| v.as_array()) {
+		let creator_ids: Vec<&str> = nodes.iter().filter_map(|n| n["creatorId"].as_str()).collect();
+		let first_alice = creator_ids.iter().position(|id| *id == "author-alice");
+		let last_bob = creator_ids.iter().rposition(|id| *id == "author-bob");
+		if let (Some(alice_pos), Some(bob_pos)) = (first_alice, last_bob) {
+			assert!(
+				bob_pos < alice_pos,
+				"Bob books should come before Alice books when ordering by name DESC, got: {:?}",
+				creator_ids
+			);
+		}
+	}
+
+	println!("orderBy related scalar: forward relation ordering works ✓");
+}
+
 #[tokio::test]
 async fn test_distinct_with_filter() {
 	if !services_available() {

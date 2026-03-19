@@ -29,7 +29,7 @@
 use async_graphql::{self, dynamic::ResolverContext};
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
-use tracing::debug;
+use tracing::trace;
 
 use crate::resolvers::connection::{json_to_pg_params, row_to_json};
 
@@ -138,7 +138,7 @@ pub async fn resolve_aggregates(
 	let select_clause = select_parts.join(", ");
 	let sql = format!(r#"SELECT {select_clause} FROM "{schema}"."{table}" AS t {where_clause}"#);
 
-	debug!(sql = %sql, "Executing aggregates query");
+	trace!(sql = %sql, "Executing aggregates query");
 
 	let client = pool.get().await?;
 	let pg_params = json_to_pg_params(&params);
@@ -393,7 +393,7 @@ pub async fn resolve_grouped_aggregates(
 		r#"SELECT {select_clause} FROM "{schema}"."{table}" AS t {where_clause} {group_order_clause}"#
 	);
 
-	debug!(sql = %sql, "Executing groupedAggregates query");
+	trace!(sql = %sql, "Executing groupedAggregates query");
 
 	let client = pool.get().await?;
 	let pg_params = json_to_pg_params(&params);

@@ -246,10 +246,10 @@ async fn test_relation_none_filter() {
 		.pointer("/data/testAuthors/totalCount")
 		.and_then(|v| v.as_i64())
 		.unwrap_or(-1);
-	assert_eq!(total, 0, "Alice has 'Book Two' → none should return 0");
+	assert_eq!(total, 1, "Bob has no 'Book Two' → none returns Bob");
 
 	compare_responses("none filter", &ts, &rust);
-	println!("none filter: 0 authors ✓");
+	println!("none filter: 1 author (Bob) ✓");
 }
 
 #[tokio::test]
@@ -274,8 +274,8 @@ async fn test_relation_every_filter() {
 		.pointer("/data/testAuthors/totalCount")
 		.and_then(|v| v.as_i64())
 		.unwrap_or(0);
-	assert_eq!(total, 1, "Alice's books all start with 'Book'");
+	assert_eq!(total, 2, "Both authors' books all start with 'Book'");
 
 	compare_responses("every filter", &ts, &rust);
-	println!("every filter: 1 author ✓");
+	println!("every filter: 2 authors ✓");
 }

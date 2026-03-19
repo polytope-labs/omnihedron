@@ -4646,18 +4646,23 @@ ALTER TABLE app.test_books ADD CONSTRAINT test_books_pkey PRIMARY KEY (_id);
 ALTER TABLE app.test_books ADD CONSTRAINT test_books_creator_id_fkey
     FOREIGN KEY (creator_id) REFERENCES app.test_authors(id);
 
--- One author visible at all block heights.
+-- Two authors visible at all block heights.
 INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
     ('11111111-1111-1111-1111-111111111111'::uuid,
-     'author-alice', 'Alice', '[0,)'::int8range);
+     'author-alice', 'Alice', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111112'::uuid,
+     'author-bob', 'Bob', '[0,)'::int8range);
 
 -- book-1 v1: visible at blocks [100, 500).
 -- book-1 v2: visible at blocks [500, ∞).
 -- book-2: always visible [0, ∞).
+-- book-3: by Bob, always visible [0, ∞).
 INSERT INTO app.test_books (_id, id, title, creator_id, _block_range) VALUES
     ('22222222-2222-2222-2222-222222222201'::uuid,
      'book-1', 'Book One v1', 'author-alice', '[100,500)'::int8range),
     ('22222222-2222-2222-2222-222222222202'::uuid,
      'book-1', 'Book One v2', 'author-alice', '[500,)'::int8range),
     ('22222222-2222-2222-2222-222222222203'::uuid,
-     'book-2', 'Book Two', 'author-alice', '[0,)'::int8range);
+     'book-2', 'Book Two', 'author-alice', '[0,)'::int8range),
+    ('22222222-2222-2222-2222-222222222204'::uuid,
+     'book-3', 'Book Three', 'author-bob', '[0,)'::int8range);
