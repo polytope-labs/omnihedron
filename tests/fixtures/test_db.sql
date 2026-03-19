@@ -4697,3 +4697,20 @@ INSERT INTO app.test_books (_id, id, title, creator_id, _block_range) VALUES
      'book-2', 'Book Two', 'author-alice', '[0,)'::int8range),
     ('22222222-2222-2222-2222-222222222204'::uuid,
      'book-3', 'Book Three', 'author-bob', '[0,)'::int8range);
+
+-- ---------------------------------------------------------------------------
+-- Fulltext search: @fullText directive creates a tsvector column + search function.
+-- This replicates the pattern SubQuery generates for @fullText(fields: ["title"]).
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE app.test_books ADD COLUMN _tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('pg_catalog.english', coalesce(title, ''))) STORED;
+CREATE INDEX test_books_fulltext_idx ON app.test_books USING gist (_tsv);
+
+CREATE OR REPLACE FUNCTION app.search_test_books(search text)
+    RETURNS SETOF app.test_books AS $$
+    SELECT * FROM app.test_books AS "table"
+    WHERE "table"."_tsv" @@ to_tsquery(search)
+$$ LANGUAGE sql STABLE;
+
+COMMENT ON FUNCTION app.search_test_books(text) IS '@name search_test_books';

@@ -35,7 +35,7 @@ use tracing::{error, info, warn};
 use crate::{
 	config::Config,
 	db::pool::build_tls_connector,
-	introspection::{introspect_enums, introspect_schema},
+	introspection::{introspect_enums, introspect_schema, introspect_search_functions},
 	schema::build_schema,
 };
 
@@ -132,9 +132,10 @@ async fn try_build_schema(
 ) -> anyhow::Result<async_graphql::dynamic::Schema> {
 	let tables = introspect_schema(pool, &cfg.name).await?;
 	let enums = introspect_enums(pool, &cfg.name).await?;
+	let search_fns = introspect_search_functions(pool, &cfg.name).await?;
 	// Detect historical mode on every rebuild (it may have changed).
 	let hist_arg = detect_historical_mode(pool, &cfg.name).await;
-	build_schema(&tables, &enums, pool.clone(), cfg.clone(), &hist_arg)
+	build_schema(&tables, &enums, pool.clone(), cfg.clone(), &hist_arg, &search_fns)
 }
 
 /// Query `_metadata` for `historicalStateEnabled`.

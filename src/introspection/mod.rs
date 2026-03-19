@@ -30,5 +30,5 @@ pub mod types;
 
 pub use model::TableInfo;
 #[allow(unused_imports)]
-pub use model::{ColumnInfo, EnumInfo, ForeignKey};
-pub use queries::{introspect_enums, introspect_schema};
+pub use model::{ColumnInfo, EnumInfo, ForeignKey, SearchFunction};
+pub use queries::{introspect_enums, introspect_schema, introspect_search_functions};

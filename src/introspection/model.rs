@@ -154,6 +154,20 @@ impl SmartTags {
 	}
 }
 
+/// A PostgreSQL function created by SubQuery's `@fullText` directive.
+///
+/// Pattern: `search_{hash}(search text) RETURNS SETOF table`
+/// with a comment `@name search_{table}` to set the GraphQL field name.
+#[derive(Debug, Clone)]
+pub struct SearchFunction {
+	/// The raw PostgreSQL function name (often a hash like `search_abc123`).
+	pub pg_name: String,
+	/// The GraphQL field name extracted from the `@name search_{table}` comment.
+	pub graphql_name: String,
+	/// The table that this function returns rows from (`RETURNS SETOF table`).
+	pub returns_table: String,
+}
+
 /// Names of internal SubQuery columns that must be hidden from the GraphQL schema.
 const INTERNAL_COLUMNS: &[&str] = &["_block_range", "_id"];
 

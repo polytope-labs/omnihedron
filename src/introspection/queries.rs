@@ -78,6 +78,57 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 	Ok(tables)
 }
 
+/// Discover fulltext search functions created by SubQuery's `@fullText` directive.
+///
+/// These are PostgreSQL functions matching the pattern:
+/// `search_{hash}(search text) RETURNS SETOF table`
+/// with a `@name search_{table}` comment.
+pub async fn introspect_search_functions(
+	pool: &Pool,
+	schema: &str,
+) -> Result<Vec<super::model::SearchFunction>> {
+	let client = pool.get().await?;
+
+	let rows = client
+		.query(
+			r#"
+            SELECT
+                p.proname AS func_name,
+                obj_description(p.oid, 'pg_proc') AS comment,
+                c.relname AS return_table
+            FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            JOIN pg_type rt ON p.prorettype = rt.oid
+            LEFT JOIN pg_class c ON rt.typrelid = c.oid
+            WHERE n.nspname = $1
+              AND p.proretset = true
+              AND c.relname IS NOT NULL
+              AND obj_description(p.oid, 'pg_proc') LIKE '@name search_%'
+            "#,
+			&[&schema],
+		)
+		.await?;
+
+	let functions = rows
+		.iter()
+		.filter_map(|r| {
+			let pg_name: String = r.get("func_name");
+			let comment: Option<String> = r.get("comment");
+			let returns_table: String = r.get("return_table");
+
+			let graphql_name = comment.as_deref().and_then(|c| {
+				c.lines().find_map(|line| {
+					line.trim().strip_prefix("@name ").map(|n| n.trim().to_string())
+				})
+			})?;
+
+			Some(super::model::SearchFunction { pg_name, graphql_name, returns_table })
+		})
+		.collect();
+
+	Ok(functions)
+}
+
 /// Introspect all enum types defined in `schema`.
 ///
 /// The display name is extracted from the `@enumName <Name>` tag stored in
