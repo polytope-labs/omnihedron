@@ -823,11 +823,12 @@ pub fn pg_col_to_json(
 			.flatten()
 			.map_or(Value::Null, |v| json!(v.to_string())),
 		Type::NUMERIC => {
-			// Read as string to preserve precision
-			row.try_get::<_, Option<String>>(idx)
+			// tokio-postgres uses binary protocol — NUMERIC can't be read as String.
+			// Use rust_decimal::Decimal which implements FromSql for NUMERIC.
+			row.try_get::<_, Option<rust_decimal::Decimal>>(idx)
 				.ok()
 				.flatten()
-				.map_or(Value::Null, |v| json!(v))
+				.map_or(Value::Null, |v| json!(v.to_string()))
 		},
 		Type::BYTEA => row
 			.try_get::<_, Option<Vec<u8>>>(idx)

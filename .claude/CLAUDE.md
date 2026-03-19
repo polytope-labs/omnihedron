@@ -381,6 +381,12 @@ All workflows: `cancel-in-progress: true`.
 
 ---
 
+## Git workflow
+
+**Never commit directly to `main`.** Always create a new branch, push it, and open a pull request. Wait for CI to pass before merging. Sign all commits with GPG.
+
+---
+
 ## Development workflow
 
 ```bash
