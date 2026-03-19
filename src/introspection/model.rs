@@ -112,6 +112,46 @@ pub struct ForeignKey {
 	/// The referenced column (usually `id`).  Preserved for future join-condition use.
 	#[allow(dead_code)]
 	pub foreign_column: String,
+	/// PostGraphile smart tags parsed from the FK constraint's `COMMENT ON CONSTRAINT`.
+	/// SubQuery stores `@foreignFieldName` (hasMany) and `@singleForeignFieldName`
+	/// (hasOne) tags to override backward relation field names (from `@derivedFrom`).
+	pub smart_tags: SmartTags,
+}
+
+/// PostGraphile smart tags parsed from a constraint comment.
+#[derive(Debug, Clone, Default)]
+pub struct SmartTags {
+	/// `@foreignFieldName <name>` — overrides the backward relation field name
+	/// for hasMany (one-to-many) relations.
+	pub foreign_field_name: Option<String>,
+	/// `@singleForeignFieldName <name>` — overrides the backward relation field name
+	/// for hasOne (one-to-one) relations.
+	pub single_foreign_field_name: Option<String>,
+}
+
+impl SmartTags {
+	/// Parse smart tags from a PostgreSQL constraint comment string.
+	///
+	/// Format: `@tagName value` separated by newlines.
+	pub fn from_comment(comment: &str) -> Self {
+		let mut tags = SmartTags::default();
+		for line in comment.lines() {
+			let line = line.trim();
+			let parts: Vec<&str> = line.splitn(2, ' ').collect();
+			if parts.len() == 2 {
+				match parts[0] {
+					"@foreignFieldName" => {
+						tags.foreign_field_name = Some(parts[1].trim().to_string());
+					},
+					"@singleForeignFieldName" => {
+						tags.single_foreign_field_name = Some(parts[1].trim().to_string());
+					},
+					_ => {},
+				}
+			}
+		}
+		tags
+	}
 }
 
 /// Names of internal SubQuery columns that must be hidden from the GraphQL schema.

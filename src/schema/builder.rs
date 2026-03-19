@@ -521,7 +521,7 @@ fn register_table_types(
 			if fk.foreign_table == table.name {
 				let child_type_name = table_to_type_name(&other_table.name);
 				let child_plural_type_name = table_to_plural_type_name(&other_table.name);
-				let field_name = backward_relation_field(&other_table.name, &fk.column);
+				let default_field_name = backward_relation_field(&other_table.name, &fk.column);
 				let child_table = other_table.name.clone();
 				let fk_col = fk.column.clone();
 				let pool_clone = pool.clone();
@@ -532,6 +532,13 @@ fn register_table_types(
 				let is_unique = other_table.is_column_unique(&fk.column);
 
 				if is_unique {
+					// Use @singleForeignFieldName smart tag if available, else default
+					let field_name = fk
+						.smart_tags
+						.single_foreign_field_name
+						.clone()
+						.unwrap_or(default_field_name);
+
 					// Single record backward relation (one-to-one)
 					entity_obj = entity_obj.field(Field::new(
 						field_name,
@@ -554,6 +561,10 @@ fn register_table_types(
 						},
 					));
 				} else {
+					// Use @foreignFieldName smart tag if available, else default
+					let field_name =
+						fk.smart_tags.foreign_field_name.clone().unwrap_or(default_field_name);
+
 					// Many backward relation (one-to-many) → connection
 					let child_conn_type = format!("{child_plural_type_name}Connection");
 					let child_filter_type = format!("{child_type_name}Filter");
@@ -798,7 +809,9 @@ fn register_table_types(
 				let child_type = table_to_type_name(&other_table.name);
 				let child_filter = format!("{child_type}Filter");
 				let to_many_filter_name = format!("{type_name}ToMany{child_type}Filter");
-				let rel_field_name = backward_relation_field(&other_table.name, &fk.column);
+				let default_rel_name = backward_relation_field(&other_table.name, &fk.column);
+				let rel_field_name =
+					fk.smart_tags.foreign_field_name.clone().unwrap_or(default_rel_name);
 
 				// Register the ToMany filter input type (some/none/every)
 				let to_many_obj = InputObject::new(&to_many_filter_name)
@@ -923,7 +936,8 @@ fn build_filter_context(
 	for other in all_tables {
 		for fk in &other.foreign_keys {
 			if fk.foreign_table == table.name {
-				let rel_name = backward_relation_field(&other.name, &fk.column);
+				let default_name = backward_relation_field(&other.name, &fk.column);
+				let rel_name = fk.smart_tags.foreign_field_name.clone().unwrap_or(default_name);
 				ctx.backward_relations.insert(
 					rel_name,
 					BackwardRelInfo {

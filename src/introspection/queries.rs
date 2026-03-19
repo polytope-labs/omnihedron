@@ -206,6 +206,7 @@ async fn fetch_foreign_keys(
 	schema: &str,
 	table: &str,
 ) -> Result<Vec<ForeignKey>> {
+	use super::model::SmartTags;
 	let rows = client
 		.query(
 			r#"
@@ -213,7 +214,8 @@ async fn fetch_foreign_keys(
               tc.constraint_name,
               kcu.column_name,
               ccu.table_name  AS foreign_table,
-              ccu.column_name AS foreign_column
+              ccu.column_name AS foreign_column,
+              pg_catalog.obj_description(pgc.oid, 'pg_constraint') AS comment
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
               ON tc.constraint_name = kcu.constraint_name
@@ -221,6 +223,11 @@ async fn fetch_foreign_keys(
             JOIN information_schema.constraint_column_usage ccu
               ON ccu.constraint_name = tc.constraint_name
               AND ccu.table_schema = tc.table_schema
+            LEFT JOIN pg_catalog.pg_constraint pgc
+              ON pgc.conname = tc.constraint_name
+              AND pgc.connamespace = (
+                SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = tc.table_schema
+              )
             WHERE tc.constraint_type = 'FOREIGN KEY'
               AND tc.table_schema = $1
               AND tc.table_name = $2
@@ -231,11 +238,16 @@ async fn fetch_foreign_keys(
 
 	Ok(rows
 		.iter()
-		.map(|r| ForeignKey {
-			constraint_name: r.get("constraint_name"),
-			column: r.get("column_name"),
-			foreign_table: r.get("foreign_table"),
-			foreign_column: r.get("foreign_column"),
+		.map(|r| {
+			let comment: Option<String> = r.get("comment");
+			let smart_tags = comment.as_deref().map(SmartTags::from_comment).unwrap_or_default();
+			ForeignKey {
+				constraint_name: r.get("constraint_name"),
+				column: r.get("column_name"),
+				foreign_table: r.get("foreign_table"),
+				foreign_column: r.get("foreign_column"),
+				smart_tags,
+			}
 		})
 		.collect())
 }
