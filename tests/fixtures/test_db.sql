@@ -4645,6 +4645,31 @@ CREATE TABLE app.test_books (
 ALTER TABLE app.test_books ADD CONSTRAINT test_books_pkey PRIMARY KEY (_id);
 ALTER TABLE app.test_books ADD CONSTRAINT test_books_creator_id_fkey
     FOREIGN KEY (creator_id) REFERENCES app.test_authors(id);
+-- Smart tag: @derivedFrom(field: "creator") → overrides backward relation name
+-- from default "testBooksByCreatorId" to "books" on TestAuthor.
+COMMENT ON CONSTRAINT test_books_creator_id_fkey ON app.test_books IS '@foreignFieldName books';
+
+-- ---------------------------------------------------------------------------
+-- Test tables for smart tag: @singleForeignFieldName (one-to-one @derivedFrom)
+-- test_author_profiles has a unique FK to test_authors, with a smart tag
+-- overriding the backward relation field name to "profile".
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE app.test_author_profiles (
+    id text NOT NULL,
+    bio text NOT NULL,
+    author_id text NOT NULL,
+    _id uuid NOT NULL,
+    _block_range int8range NOT NULL
+);
+
+ALTER TABLE app.test_author_profiles ADD CONSTRAINT test_author_profiles_pkey PRIMARY KEY (_id);
+ALTER TABLE app.test_author_profiles ADD CONSTRAINT test_author_profiles_author_id_fkey
+    FOREIGN KEY (author_id) REFERENCES app.test_authors(id);
+-- Unique constraint makes this a one-to-one relation.
+ALTER TABLE app.test_author_profiles ADD CONSTRAINT test_author_profiles_author_id_unique UNIQUE (author_id);
+-- Smart tag: overrides backward relation from "testAuthorProfileByAuthorId" to "profile".
+COMMENT ON CONSTRAINT test_author_profiles_author_id_fkey ON app.test_author_profiles IS '@singleForeignFieldName profile';
 
 -- Two authors visible at all block heights.
 INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
@@ -4652,6 +4677,12 @@ INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
      'author-alice', 'Alice', '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111112'::uuid,
      'author-bob', 'Bob', '[0,)'::int8range);
+
+INSERT INTO app.test_author_profiles (_id, id, bio, author_id, _block_range) VALUES
+    ('33333333-3333-3333-3333-333333333301'::uuid,
+     'profile-alice', 'Alice writes mystery novels.', 'author-alice', '[0,)'::int8range),
+    ('33333333-3333-3333-3333-333333333302'::uuid,
+     'profile-bob', 'Bob writes science fiction.', 'author-bob', '[0,)'::int8range);
 
 -- book-1 v1: visible at blocks [100, 500).
 -- book-1 v2: visible at blocks [500, ∞).
