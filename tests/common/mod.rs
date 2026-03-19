@@ -151,11 +151,10 @@ pub fn sort_nodes(val: &mut Value) {
 				sort_nodes(item);
 			}
 		},
-		Value::Object(map) => {
+		Value::Object(map) =>
 			for v in map.values_mut() {
 				sort_nodes(v);
-			}
-		},
+			},
 		_ => {},
 	}
 }
@@ -203,11 +202,10 @@ pub fn strip_field(val: &mut Value, field: &str) {
 				strip_field(v, field);
 			}
 		},
-		Value::Array(arr) => {
+		Value::Array(arr) =>
 			for item in arr.iter_mut() {
 				strip_field(item, field);
-			}
-		},
+			},
 		_ => {},
 	}
 }

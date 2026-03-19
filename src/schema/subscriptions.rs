@@ -202,11 +202,10 @@ async fn create_subscription_stream(
 		loop {
 			let msg = futures_util::future::poll_fn(|cx| connection.poll_message(cx)).await;
 			match msg {
-				Some(Ok(AsyncMessage::Notification(n))) => {
+				Some(Ok(AsyncMessage::Notification(n))) =>
 					if tx.send(n).await.is_err() {
 						break;
-					}
-				},
+					},
 				Some(Ok(_)) => {},
 				Some(Err(e)) => {
 					error!(error = %e, "Subscription PG connection error");

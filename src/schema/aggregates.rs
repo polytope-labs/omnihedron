@@ -184,8 +184,8 @@ pub fn register_aggregate_types(
 /// Returns `true` if the PostgreSQL column type represents a timestamp — eligible
 /// for time-truncation `groupBy` variants (`_TRUNCATED_TO_HOUR`, `_TRUNCATED_TO_DAY`).
 fn is_timestamp_col(pg_type: &str, udt_name: &str) -> bool {
-	matches!(pg_type, "timestamp without time zone" | "timestamp with time zone")
-		|| matches!(udt_name, "timestamp" | "timestamptz")
+	matches!(pg_type, "timestamp without time zone" | "timestamp with time zone") ||
+		matches!(udt_name, "timestamp" | "timestamptz")
 }
 
 /// Register the `{TypeName}GroupBy` enum and `{TypeName}AggregateGroup` object type
