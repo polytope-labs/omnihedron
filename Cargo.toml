@@ -1,6 +1,6 @@
 [package]
 name = "omnihedron"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 
 [[bin]]
@@ -27,7 +27,10 @@ futures = "0.3"
 futures-util = "0.3"
 
 # PostgreSQL
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4", "with-bit-vec-0_6", "with-eui48-1", "with-geo-types-0_7"] }
+bit-vec = "0.6"
+eui48 = "1"
+geo-types = "0.7"
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 deadpool-postgres = "0.14"
 native-tls = "0.2"

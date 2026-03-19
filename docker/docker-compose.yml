@@ -29,6 +29,7 @@ services:
       PGPASSWORD: postgres
     volumes:
       - ../tests/fixtures/test_db.sql:/tmp/test_db.sql:ro
+      - ../tests/fixtures/type_coverage.sql:/tmp/type_coverage.sql:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -42,6 +43,7 @@ services:
         else
           echo "==> Loading fixture data..."
           psql -h postgres -U postgres -d indexer -f /tmp/test_db.sql
+          psql -h postgres -U postgres -d indexer -f /tmp/type_coverage.sql
           echo "==> Fixture loaded."
         fi
     restart: "no"

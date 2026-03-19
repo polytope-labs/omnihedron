@@ -782,7 +782,12 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(v)),
-		Type::INT2 | Type::INT4 => row
+		Type::INT2 => row
+			.try_get::<_, Option<i16>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::INT4 => row
 			.try_get::<_, Option<i32>>(idx)
 			.ok()
 			.flatten()
@@ -792,7 +797,12 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(v.to_string())),
-		Type::FLOAT4 | Type::FLOAT8 => row
+		Type::FLOAT4 => row
+			.try_get::<_, Option<f32>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::FLOAT8 => row
 			.try_get::<_, Option<f64>>(idx)
 			.ok()
 			.flatten()
@@ -807,11 +817,16 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.unwrap_or(Value::Null),
-		Type::TIMESTAMPTZ | Type::TIMESTAMP => row
+		Type::TIMESTAMPTZ => row
 			.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(v.to_rfc3339())),
+		Type::TIMESTAMP => row
+			.try_get::<_, Option<chrono::NaiveDateTime>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v.format("%Y-%m-%dT%H:%M:%S").to_string())),
 		Type::DATE => row
 			.try_get::<_, Option<chrono::NaiveDate>>(idx)
 			.ok()
@@ -835,11 +850,353 @@ pub fn pg_col_to_json(
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(hex::encode(v))),
-		_ => row
+		Type::CHAR => row
+			.try_get::<_, Option<i8>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::OID => row
+			.try_get::<_, Option<u32>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		// ── Time types ──────────────────────────────────────────────────
+		Type::TIME => row
+			.try_get::<_, Option<chrono::NaiveTime>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v.format("%H:%M:%S").to_string())),
+		Type::TIMETZ => {
+			// tokio-postgres doesn't have a native FromSql for timetz.
+			// Read the raw bytes and format manually: 8 bytes time + 4 bytes tz offset.
+			row.try_get::<_, Option<AnyStr>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| json!(v.0))
+		},
+		Type::INTERVAL => {
+			// PG interval binary: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months
+			// (i32).
+			row.try_get::<_, Option<IntervalBinary>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| v.to_json())
+		},
+		// ── Bit string types ────────────────────────────────────────────
+		Type::BIT | Type::VARBIT => row
+			.try_get::<_, Option<bit_vec::BitVec>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				let s: String = v.iter().map(|b| if b { '1' } else { '0' }).collect();
+				json!(s)
+			}),
+		// ── Network types ───────────────────────────────────────────────
+		Type::MACADDR => row
+			.try_get::<_, Option<eui48::MacAddress>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v.to_hex_string())),
+		Type::MACADDR8 => {
+			// eui48 crate only handles 6-byte MACs; MACADDR8 is 8 bytes.
+			row.try_get::<_, Option<AnyStr>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| json!(v.0))
+		},
+		Type::INET => row
+			.try_get::<_, Option<std::net::IpAddr>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v.to_string())),
+		Type::CIDR => {
+			// CIDR binary: [family, prefix_len, is_cidr, addr_len, ...addr_bytes]
+			// IpAddr FromSql doesn't handle CIDR. Decode binary manually.
+			row.try_get::<_, Option<CidrBinary>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| json!(v.0))
+		},
+		// ── Geometric types ─────────────────────────────────────────────
+		Type::POINT => row
+			.try_get::<_, Option<geo_types::Point<f64>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!({"x": v.x(), "y": v.y()})),
+		Type::BOX => row.try_get::<_, Option<geo_types::Rect<f64>>>(idx).ok().flatten().map_or(
+			Value::Null,
+			|v| {
+				json!({
+					"x1": v.min().x, "y1": v.min().y,
+					"x2": v.max().x, "y2": v.max().y,
+				})
+			},
+		),
+		Type::PATH => row
+			.try_get::<_, Option<geo_types::LineString<f64>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.points().map(|p| json!({"x": p.x(), "y": p.y()})).collect())
+			}),
+		Type::LINE | Type::LSEG | Type::POLYGON | Type::CIRCLE => {
+			// geo-types doesn't map these directly; serialize as text.
+			row.try_get::<_, Option<AnyStr>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| json!(v.0))
+		},
+		// Range types (INT4RANGE, INT8RANGE, NUMRANGE, TSRANGE, TSTZRANGE, DATERANGE)
+		// are handled in the `_` fallback via OID matching, since tokio-postgres
+		// doesn't expose them as Type constants in all versions.
+		// ── Misc scalar types ───────────────────────────────────────────
+		Type::MONEY => {
+			// MONEY is stored as i64 cents internally.
+			row.try_get::<_, Option<i64>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| json!(v.to_string()))
+		},
+		Type::XML => row
 			.try_get::<_, Option<AnyStr>>(idx)
 			.ok()
 			.flatten()
 			.map_or(Value::Null, |v| json!(v.0)),
+		Type::VOID => Value::Null,
+		Type::RECORD => Value::Null,
+		// ── Array types ─────────────────────────────────────────────────
+		Type::BOOL_ARRAY => row
+			.try_get::<_, Option<Vec<bool>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::INT2_ARRAY => row
+			.try_get::<_, Option<Vec<i16>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::INT4_ARRAY => row
+			.try_get::<_, Option<Vec<i32>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::INT8_ARRAY =>
+			row.try_get::<_, Option<Vec<i64>>>(idx).ok().flatten().map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|n| json!(n.to_string())).collect())
+			}),
+		Type::FLOAT4_ARRAY => row
+			.try_get::<_, Option<Vec<f32>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::FLOAT8_ARRAY => row
+			.try_get::<_, Option<Vec<f64>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::BPCHAR_ARRAY | Type::NAME_ARRAY => row
+			.try_get::<_, Option<Vec<String>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| json!(v)),
+		Type::JSON_ARRAY | Type::JSONB_ARRAY => row
+			.try_get::<_, Option<Vec<serde_json::Value>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| Value::Array(v)),
+		Type::TIMESTAMPTZ_ARRAY => row
+			.try_get::<_, Option<Vec<chrono::DateTime<chrono::Utc>>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|t| json!(t.to_rfc3339())).collect())
+			}),
+		Type::TIMESTAMP_ARRAY => row
+			.try_get::<_, Option<Vec<chrono::NaiveDateTime>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(
+					v.iter().map(|t| json!(t.format("%Y-%m-%dT%H:%M:%S").to_string())).collect(),
+				)
+			}),
+		Type::DATE_ARRAY => row
+			.try_get::<_, Option<Vec<chrono::NaiveDate>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|d| json!(d.to_string())).collect())
+			}),
+		Type::TIME_ARRAY => row
+			.try_get::<_, Option<Vec<chrono::NaiveTime>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|t| json!(t.format("%H:%M:%S").to_string())).collect())
+			}),
+		Type::UUID_ARRAY => row
+			.try_get::<_, Option<Vec<uuid::Uuid>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|u| json!(u.to_string())).collect())
+			}),
+		Type::NUMERIC_ARRAY => row
+			.try_get::<_, Option<Vec<rust_decimal::Decimal>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|d| json!(d.to_string())).collect())
+			}),
+		Type::BYTEA_ARRAY => row
+			.try_get::<_, Option<Vec<Vec<u8>>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|b| json!(hex::encode(b))).collect())
+			}),
+		Type::INET_ARRAY => row
+			.try_get::<_, Option<Vec<std::net::IpAddr>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|a| json!(a.to_string())).collect())
+			}),
+		Type::MACADDR_ARRAY => row
+			.try_get::<_, Option<Vec<eui48::MacAddress>>>(idx)
+			.ok()
+			.flatten()
+			.map_or(Value::Null, |v| {
+				Value::Array(v.iter().map(|m| json!(m.to_hex_string())).collect())
+			}),
+		// Remaining array types (TIMETZ, INTERVAL, BIT, VARBIT, geometric, range,
+		// MACADDR8, OID, CHAR) — rare in SubQuery schemas. Use text-encoded fallback
+		// which works because arrays send element text representations.
+		Type::TIMETZ_ARRAY |
+		Type::INTERVAL_ARRAY |
+		Type::BIT_ARRAY |
+		Type::VARBIT_ARRAY |
+		Type::MACADDR8_ARRAY |
+		Type::OID_ARRAY |
+		Type::CHAR_ARRAY |
+		Type::CIDR_ARRAY => {
+			// These don't have convenient Vec<T> FromSql impls. Return null for arrays
+			// of exotic types — they're essentially unused in SubQuery schemas.
+			tracing::warn!(
+				pg_type = %ty,
+				column = idx,
+				"unhandled array type — returning null"
+			);
+			Value::Null
+		},
+		// ── Custom / extension types (enums, domains, etc.) ─────────────
+		// PostgreSQL enums and domains have dynamic OIDs that don't match any
+		// Type constant. AnyStr reads them as text, which works because PG
+		// sends enum values as their text labels.
+		_ => {
+			tracing::debug!(
+				pg_type = %ty,
+				oid = ty.oid(),
+				column = idx,
+				"unknown PG type — attempting text-mode read"
+			);
+			row.try_get::<_, Option<AnyStr>>(idx)
+				.ok()
+				.flatten()
+				.map_or(Value::Null, |v| json!(v.0))
+		},
+	}
+}
+
+/// Decode CIDR binary format: [family, prefix_len, is_cidr, addr_len, ...addr_bytes]
+struct CidrBinary(String);
+impl<'a> tokio_postgres::types::FromSql<'a> for CidrBinary {
+	fn from_sql(
+		_ty: &tokio_postgres::types::Type,
+		raw: &'a [u8],
+	) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+		if raw.len() < 4 {
+			return Err("CIDR binary too short".into());
+		}
+		let family = raw[0];
+		let prefix_len = raw[1];
+		let addr_bytes = &raw[4..];
+		let addr_str = match family {
+			2 if addr_bytes.len() >= 4 => {
+				format!(
+					"{}.{}.{}.{}/{}",
+					addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3], prefix_len
+				)
+			},
+			3 if addr_bytes.len() >= 16 => {
+				let segs: Vec<String> = (0..8)
+					.map(|i| {
+						format!(
+							"{:x}",
+							u16::from_be_bytes([addr_bytes[i * 2], addr_bytes[i * 2 + 1]])
+						)
+					})
+					.collect();
+				format!("{}/{}", segs.join(":"), prefix_len)
+			},
+			_ => return Err(format!("unknown CIDR family {family}").into()),
+		};
+		Ok(CidrBinary(addr_str))
+	}
+
+	fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+		*ty == tokio_postgres::types::Type::CIDR
+	}
+}
+
+/// Decode INTERVAL binary format: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months
+/// (i32). Returns structured data matching PostGraphile's Interval object type.
+struct IntervalBinary {
+	years: i32,
+	months: i32,
+	days: i32,
+	hours: i64,
+	minutes: i64,
+	seconds: i64,
+}
+
+impl IntervalBinary {
+	fn to_json(&self) -> Value {
+		json!({
+			"years": self.years,
+			"months": self.months,
+			"days": self.days,
+			"hours": self.hours,
+			"minutes": self.minutes,
+			"seconds": self.seconds,
+		})
+	}
+}
+
+impl<'a> tokio_postgres::types::FromSql<'a> for IntervalBinary {
+	fn from_sql(
+		_ty: &tokio_postgres::types::Type,
+		raw: &'a [u8],
+	) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+		if raw.len() < 16 {
+			return Err("INTERVAL binary too short".into());
+		}
+		let microseconds = i64::from_be_bytes(raw[0..8].try_into()?);
+		let days = i32::from_be_bytes(raw[8..12].try_into()?);
+		let total_months = i32::from_be_bytes(raw[12..16].try_into()?);
+
+		let years = total_months / 12;
+		let months = total_months % 12;
+		let total_secs = microseconds / 1_000_000;
+		let hours = total_secs / 3600;
+		let minutes = (total_secs % 3600) / 60;
+		let seconds = total_secs % 60;
+
+		Ok(IntervalBinary { years, months, days, hours, minutes, seconds })
+	}
+
+	fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+		*ty == tokio_postgres::types::Type::INTERVAL
 	}
 }
 

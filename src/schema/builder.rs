@@ -25,7 +25,9 @@ use crate::{
 	schema::{
 		aggregates::{register_aggregate_types, register_grouped_aggregate_types},
 		cursor::encode_node_id,
-		filters::{filter_type_for as scalar_filter_for, register_scalar_filters},
+		filters::{
+			filter_type_for as scalar_filter_for, list_filter_type_for, register_scalar_filters,
+		},
 		inflector::{
 			backward_relation_field, forward_relation_field, singularize,
 			table_to_connection_field, table_to_plural_type_name, table_to_single_field,
@@ -810,11 +812,16 @@ fn register_table_types(
 		.field(InputValue::new("not", TypeRef::named(&filter_type_name)));
 
 	for col in table.public_columns() {
-		let (base_gql_type, _) = pg_type_to_graphql(&col.pg_type, &col.udt_name);
 		let field_name = to_camel_case(&col.name);
 		let field_filter: String = if let Some(display_name) = &col.enum_display_name {
 			format!("{display_name}Filter")
+		} else if col.udt_name.starts_with('_') {
+			// Array column: use list filter based on element type.
+			let element_udt = &col.udt_name[1..]; // strip leading '_'
+			let (element_gql_type, _) = pg_type_to_graphql("", element_udt);
+			list_filter_type_for(element_gql_type).to_string()
 		} else {
+			let (base_gql_type, _) = pg_type_to_graphql(&col.pg_type, &col.udt_name);
 			scalar_filter_for(base_gql_type).to_string()
 		};
 		filter_obj = filter_obj.field(InputValue::new(field_name, TypeRef::named(field_filter)));
