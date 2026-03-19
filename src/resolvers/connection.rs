@@ -880,7 +880,7 @@ pub fn pg_col_to_json(
 			row.try_get::<_, Option<IntervalBinary>>(idx)
 				.ok()
 				.flatten()
-				.map_or(Value::Null, |v| json!(v.0))
+				.map_or(Value::Null, |v| v.to_json())
 		},
 		// ── Bit string types ────────────────────────────────────────────
 		Type::BIT | Type::VARBIT => row
@@ -1150,8 +1150,29 @@ impl<'a> tokio_postgres::types::FromSql<'a> for CidrBinary {
 }
 
 /// Decode INTERVAL binary format: 8 bytes microseconds (i64), 4 bytes days (i32), 4 bytes months
-/// (i32). Produces a PostgreSQL-style interval string like "1 year 2 mons 3 days 04:05:06".
-struct IntervalBinary(String);
+/// (i32). Returns structured data matching PostGraphile's Interval object type.
+struct IntervalBinary {
+	years: i32,
+	months: i32,
+	days: i32,
+	hours: i64,
+	minutes: i64,
+	seconds: i64,
+}
+
+impl IntervalBinary {
+	fn to_json(&self) -> Value {
+		json!({
+			"years": self.years,
+			"months": self.months,
+			"days": self.days,
+			"hours": self.hours,
+			"minutes": self.minutes,
+			"seconds": self.seconds,
+		})
+	}
+}
+
 impl<'a> tokio_postgres::types::FromSql<'a> for IntervalBinary {
 	fn from_sql(
 		_ty: &tokio_postgres::types::Type,
@@ -1162,31 +1183,16 @@ impl<'a> tokio_postgres::types::FromSql<'a> for IntervalBinary {
 		}
 		let microseconds = i64::from_be_bytes(raw[0..8].try_into()?);
 		let days = i32::from_be_bytes(raw[8..12].try_into()?);
-		let months = i32::from_be_bytes(raw[12..16].try_into()?);
+		let total_months = i32::from_be_bytes(raw[12..16].try_into()?);
 
-		let mut parts = Vec::new();
-		let years = months / 12;
-		let remaining_months = months % 12;
-		if years != 0 {
-			parts.push(format!("{years} year{}", if years.abs() != 1 { "s" } else { "" }));
-		}
-		if remaining_months != 0 {
-			parts.push(format!(
-				"{remaining_months} mon{}",
-				if remaining_months.abs() != 1 { "s" } else { "" }
-			));
-		}
-		if days != 0 {
-			parts.push(format!("{days} day{}", if days.abs() != 1 { "s" } else { "" }));
-		}
-		if microseconds != 0 || parts.is_empty() {
-			let total_secs = microseconds / 1_000_000;
-			let hours = total_secs / 3600;
-			let mins = (total_secs % 3600) / 60;
-			let secs = total_secs % 60;
-			parts.push(format!("{hours:02}:{mins:02}:{secs:02}"));
-		}
-		Ok(IntervalBinary(parts.join(" ")))
+		let years = total_months / 12;
+		let months = total_months % 12;
+		let total_secs = microseconds / 1_000_000;
+		let hours = total_secs / 3600;
+		let minutes = (total_secs % 3600) / 60;
+		let seconds = total_secs % 60;
+
+		Ok(IntervalBinary { years, months, days, hours, minutes, seconds })
 	}
 
 	fn accepts(ty: &tokio_postgres::types::Type) -> bool {

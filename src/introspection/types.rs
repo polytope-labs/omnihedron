@@ -45,12 +45,14 @@ pub fn pg_type_to_graphql(pg_type: &str, udt_name: &str) -> (&'static str, bool)
 		"bytea" => ("String", false), // hex-encoded
 		"date" => ("Date", false),
 		"timestamp without time zone" | "timestamp with time zone" => ("Datetime", false),
-		"time without time zone" | "time with time zone" => ("String", false),
-		"interval" => ("String", false),
-		"uuid" => ("String", false),
+		"time without time zone" | "time with time zone" => ("Time", false),
+		"interval" => ("Interval", false),
+		"uuid" => ("UUID", false),
 		"json" | "jsonb" => ("JSON", false),
-		"inet" | "cidr" | "macaddr" => ("String", false),
-		"bit" | "bit varying" => ("String", false),
+		"inet" | "cidr" => ("InternetAddress", false),
+		"macaddr" => ("String", false),
+		"bit" | "bit varying" => ("BitString", false),
+		"point" => ("Point", false),
 		"money" => ("String", true),
 		"xml" => ("String", false),
 		"USER-DEFINED" => {
@@ -68,9 +70,14 @@ pub fn pg_type_to_graphql(pg_type: &str, udt_name: &str) -> (&'static str, bool)
 				"numeric" | "decimal" => ("BigFloat", true),
 				"bool" => ("Boolean", false),
 				"json" | "jsonb" => ("JSON", false),
-				"uuid" => ("String", false),
+				"uuid" => ("UUID", false),
 				"timestamp" | "timestamptz" => ("Datetime", false),
 				"date" => ("Date", false),
+				"time" | "timetz" => ("Time", false),
+				"interval" => ("Interval", false),
+				"inet" | "cidr" => ("InternetAddress", false),
+				"bit" | "varbit" => ("BitString", false),
+				"point" => ("Point", false),
 				_ => ("String", false),
 			}
 		},
@@ -90,5 +97,15 @@ pub fn is_numeric_pg_type(pg_type: &str, udt_name: &str) -> bool {
 /// appear in `lessThan` / `greaterThan` filter operators).
 #[allow(dead_code)]
 pub fn is_comparable_type(graphql_type: &str) -> bool {
-	matches!(graphql_type, "Int" | "BigInt" | "Float" | "BigFloat" | "String" | "Date" | "Datetime")
+	matches!(
+		graphql_type,
+		"Int" |
+			"BigInt" | "Float" |
+			"BigFloat" |
+			"String" | "Date" |
+			"Datetime" |
+			"UUID" | "Time" |
+			"BitString" |
+			"InternetAddress"
+	)
 }

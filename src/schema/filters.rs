@@ -37,6 +37,33 @@ pub fn register_scalar_filters(builder: SchemaBuilder) -> SchemaBuilder {
 		.register(date_filter())
 		.register(datetime_filter())
 		.register(json_filter())
+		// PostGraphile-compatible dedicated scalars and filters
+		.register(Scalar::new("UUID"))
+		.register(Scalar::new("Time"))
+		.register(Scalar::new("BitString"))
+		.register(Scalar::new("InternetAddress"))
+		.register(interval_type())
+		.register(interval_input())
+		.register(point_type())
+		.register(point_input())
+		.register(uuid_filter())
+		.register(time_filter())
+		.register(bitstring_filter())
+		.register(internet_address_filter())
+		.register(interval_filter())
+		// List filter types for array columns
+		.register(string_list_filter())
+		.register(int_list_filter())
+		.register(bigint_list_filter())
+		.register(float_list_filter())
+		.register(bigfloat_list_filter())
+		.register(boolean_list_filter())
+		.register(date_list_filter())
+		.register(datetime_list_filter())
+		.register(json_list_filter())
+		.register(uuid_list_filter())
+		.register(time_list_filter())
+		.register(internet_address_list_filter())
 }
 
 fn string_filter() -> InputObject {
@@ -188,6 +215,153 @@ fn json_filter() -> InputObject {
 		.field(InputValue::new("notDistinctFrom", TypeRef::named("JSON")))
 }
 
+// ── PostGraphile-compatible object types ────────────────────────────────────
+
+fn object_field_resolver(
+	field_name: &'static str,
+) -> impl Fn(ResolverContext) -> FieldFuture + Send + Sync {
+	move |ctx| {
+		let val = ctx.parent_value.as_value().and_then(|v| match v {
+			async_graphql::Value::Object(map) => map.get(field_name).cloned(),
+			_ => None,
+		});
+		FieldFuture::new(async move { Ok(val.map(FieldValue::value)) })
+	}
+}
+
+fn interval_type() -> Object {
+	Object::new("Interval")
+		.field(Field::new(
+			"seconds",
+			TypeRef::named(TypeRef::INT),
+			object_field_resolver("seconds"),
+		))
+		.field(Field::new(
+			"minutes",
+			TypeRef::named(TypeRef::INT),
+			object_field_resolver("minutes"),
+		))
+		.field(Field::new("hours", TypeRef::named(TypeRef::INT), object_field_resolver("hours")))
+		.field(Field::new("days", TypeRef::named(TypeRef::INT), object_field_resolver("days")))
+		.field(Field::new("months", TypeRef::named(TypeRef::INT), object_field_resolver("months")))
+		.field(Field::new("years", TypeRef::named(TypeRef::INT), object_field_resolver("years")))
+}
+
+fn interval_input() -> InputObject {
+	InputObject::new("IntervalInput")
+		.field(InputValue::new("seconds", TypeRef::named(TypeRef::INT)))
+		.field(InputValue::new("minutes", TypeRef::named(TypeRef::INT)))
+		.field(InputValue::new("hours", TypeRef::named(TypeRef::INT)))
+		.field(InputValue::new("days", TypeRef::named(TypeRef::INT)))
+		.field(InputValue::new("months", TypeRef::named(TypeRef::INT)))
+		.field(InputValue::new("years", TypeRef::named(TypeRef::INT)))
+}
+
+fn point_type() -> Object {
+	Object::new("Point")
+		.field(Field::new("x", TypeRef::named(TypeRef::FLOAT), object_field_resolver("x")))
+		.field(Field::new("y", TypeRef::named(TypeRef::FLOAT), object_field_resolver("y")))
+}
+
+fn point_input() -> InputObject {
+	InputObject::new("PointInput")
+		.field(InputValue::new("x", TypeRef::named_nn(TypeRef::FLOAT)))
+		.field(InputValue::new("y", TypeRef::named_nn(TypeRef::FLOAT)))
+}
+
+// ── Dedicated scalar filter types ───────────────────────────────────────────
+
+fn comparable_filter(name: &str, scalar: &str) -> InputObject {
+	InputObject::new(name)
+		.field(InputValue::new("equalTo", TypeRef::named(scalar)))
+		.field(InputValue::new("notEqualTo", TypeRef::named(scalar)))
+		.field(InputValue::new("isNull", TypeRef::named(TypeRef::BOOLEAN)))
+		.field(InputValue::new("in", TypeRef::named_nn_list(scalar)))
+		.field(InputValue::new("notIn", TypeRef::named_nn_list(scalar)))
+		.field(InputValue::new("lessThan", TypeRef::named(scalar)))
+		.field(InputValue::new("lessThanOrEqualTo", TypeRef::named(scalar)))
+		.field(InputValue::new("greaterThan", TypeRef::named(scalar)))
+		.field(InputValue::new("greaterThanOrEqualTo", TypeRef::named(scalar)))
+		.field(InputValue::new("distinctFrom", TypeRef::named(scalar)))
+		.field(InputValue::new("notDistinctFrom", TypeRef::named(scalar)))
+}
+
+fn equality_filter(name: &str, scalar: &str) -> InputObject {
+	InputObject::new(name)
+		.field(InputValue::new("equalTo", TypeRef::named(scalar)))
+		.field(InputValue::new("notEqualTo", TypeRef::named(scalar)))
+		.field(InputValue::new("isNull", TypeRef::named(TypeRef::BOOLEAN)))
+		.field(InputValue::new("distinctFrom", TypeRef::named(scalar)))
+		.field(InputValue::new("notDistinctFrom", TypeRef::named(scalar)))
+}
+
+fn uuid_filter() -> InputObject {
+	comparable_filter("UUIDFilter", "UUID")
+}
+
+fn time_filter() -> InputObject {
+	comparable_filter("TimeFilter", "Time")
+}
+
+fn bitstring_filter() -> InputObject {
+	comparable_filter("BitStringFilter", "BitString")
+}
+
+fn internet_address_filter() -> InputObject {
+	comparable_filter("InternetAddressFilter", "InternetAddress")
+}
+
+fn interval_filter() -> InputObject {
+	equality_filter("IntervalFilter", "IntervalInput")
+}
+
+// ── List filter types (for array columns) ───────────────────────────────────
+
+fn list_filter(name: &str, scalar: &str) -> InputObject {
+	InputObject::new(name)
+		.field(InputValue::new("every", TypeRef::named(scalar)))
+		.field(InputValue::new("some", TypeRef::named(scalar)))
+		.field(InputValue::new("none", TypeRef::named(scalar)))
+		.field(InputValue::new("isEmpty", TypeRef::named(TypeRef::BOOLEAN)))
+}
+
+fn string_list_filter() -> InputObject {
+	list_filter("StringListFilter", "StringFilter")
+}
+fn int_list_filter() -> InputObject {
+	list_filter("IntListFilter", "IntFilter")
+}
+fn bigint_list_filter() -> InputObject {
+	list_filter("BigIntListFilter", "BigIntFilter")
+}
+fn float_list_filter() -> InputObject {
+	list_filter("FloatListFilter", "FloatFilter")
+}
+fn bigfloat_list_filter() -> InputObject {
+	list_filter("BigFloatListFilter", "BigFloatFilter")
+}
+fn boolean_list_filter() -> InputObject {
+	list_filter("BooleanListFilter", "BooleanFilter")
+}
+fn date_list_filter() -> InputObject {
+	list_filter("DateListFilter", "DateFilter")
+}
+fn datetime_list_filter() -> InputObject {
+	list_filter("DatetimeListFilter", "DatetimeFilter")
+}
+fn json_list_filter() -> InputObject {
+	list_filter("JSONListFilter", "JSONFilter")
+}
+fn uuid_list_filter() -> InputObject {
+	list_filter("UUIDListFilter", "UUIDFilter")
+}
+fn time_list_filter() -> InputObject {
+	list_filter("TimeListFilter", "TimeFilter")
+}
+fn internet_address_list_filter() -> InputObject {
+	list_filter("InternetAddressListFilter", "InternetAddressFilter")
+}
+
 /// Return the name of the scalar filter type for a given GraphQL type name.
 pub fn filter_type_for(graphql_type: &str) -> &'static str {
 	match graphql_type {
@@ -200,6 +374,11 @@ pub fn filter_type_for(graphql_type: &str) -> &'static str {
 		"Date" => "DateFilter",
 		"Datetime" => "DatetimeFilter",
 		"JSON" => "JSONFilter",
+		"UUID" => "UUIDFilter",
+		"Time" => "TimeFilter",
+		"BitString" => "BitStringFilter",
+		"InternetAddress" => "InternetAddressFilter",
+		"Interval" => "IntervalFilter",
 		_ => "StringFilter", // fallback
 	}
 }

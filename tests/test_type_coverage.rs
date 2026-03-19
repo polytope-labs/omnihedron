@@ -39,14 +39,14 @@ async fn get_type_coverage_node(client: &TestClient, id: &str) -> Value {
                     colTimestamptz
                     colDate
                     colTime
-                    colInterval
+                    colInterval {{ seconds minutes hours days months years }}
                     colUuid
                     colBit
                     colVarbit
                     colInet
                     colCidr
                     colMacaddr
-                    colPoint
+                    colPoint {{ x y }}
                     colBox
                     colEnum
                     colOid
@@ -311,8 +311,10 @@ async fn test_interval_serialization() {
 	}
 	let client = TestClient::new(&rust_url());
 	let node = get_type_coverage_node(&client, "type-test-1").await;
-	let val = node["colInterval"].as_str().expect("colInterval should be a string");
-	assert!(!val.is_empty(), "colInterval should not be empty, got '{val}'");
+	let val = &node["colInterval"];
+	assert!(!val.is_null(), "colInterval should not be null");
+	// Interval is now an object type with {seconds, minutes, hours, days, months, years}
+	assert!(val.is_object(), "colInterval should be an object, got: {val:?}");
 }
 
 #[tokio::test]
@@ -719,9 +721,21 @@ async fn test_all_nulls() {
 		"colMacaddrArr",
 	];
 
+	// Object types (Interval, Point) return {all-null-fields} when the DB column is NULL,
+	// because async-graphql resolves subfields even when the parent is null.
+	let is_null_or_all_null_object = |v: &serde_json::Value| -> bool {
+		if v.is_null() {
+			return true;
+		}
+		if let Some(obj) = v.as_object() {
+			return obj.values().all(|v| v.is_null());
+		}
+		false
+	};
+
 	for field in &fields {
 		assert!(
-			node[field].is_null(),
+			is_null_or_all_null_object(&node[field]),
 			"{field} should be null for the null row, got: {:?}",
 			node[field]
 		);
