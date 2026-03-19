@@ -63,20 +63,17 @@ async fn main() -> anyhow::Result<()> {
 	info!(schema = %schema_name, "Resolved PostgreSQL schema");
 
 	// ── Introspection ─────────────────────────────────────────────────────────
-	info!("Introspecting database schema...");
 	let tables = introspect_schema(&pool, &schema_name).await?;
 	let enums = introspect_enums(&pool, &schema_name).await?;
-	info!(tables = tables.len(), enums = enums.len(), "Introspection complete");
 
 	// ── Detect historical mode ────────────────────────────────────────────────
 	let historical_arg = detect_historical_mode(&pool, &schema_name).await;
 	info!(historical_arg = %historical_arg, "Historical argument name");
 
 	// ── Build GraphQL schema ──────────────────────────────────────────────────
-	info!("Building GraphQL schema...");
 	let gql_schema = build_schema(&tables, &enums, pool.clone(), cfg.clone(), &historical_arg)?;
 	let shared_schema: SharedSchema = Arc::new(RwLock::new(gql_schema));
-	info!("GraphQL schema built successfully");
+	info!(tables = tables.len(), enums = enums.len(), "GraphQL schema built");
 
 	// ── Hot reload ────────────────────────────────────────────────────────────
 	start_schema_listener(pool.clone(), shared_schema.clone(), cfg.clone()).await;

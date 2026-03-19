@@ -15,10 +15,6 @@
 
 use std::sync::Arc;
 
-use async_graphql::{Name, Value as GqlValue, dynamic::*};
-use deadpool_postgres::Pool;
-use tracing::info;
-
 use crate::{
 	config::Config,
 	introspection::{
@@ -39,6 +35,8 @@ use crate::{
 		subscriptions::register_subscriptions,
 	},
 };
+use async_graphql::{Name, Value as GqlValue, dynamic::*};
+use deadpool_postgres::Pool;
 
 /// Build the complete dynamic GraphQL schema from an introspected set of tables.
 ///
@@ -52,8 +50,6 @@ pub fn build_schema(
 	cfg: Arc<Config>,
 	historical_arg_name: &str,
 ) -> anyhow::Result<Schema> {
-	info!(table_count = tables.len(), "Building GraphQL schema");
-
 	// ── Register scalars ─────────────────────────────────────────────────────
 	let subscription_root = if cfg.subscription { Some("Subscription") } else { None };
 	let mut builder = Schema::build("Query", None, subscription_root)

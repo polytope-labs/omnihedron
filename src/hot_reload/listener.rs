@@ -47,7 +47,6 @@ pub async fn start_schema_listener(pool: Arc<Pool>, schema: Arc<RwLock<Schema>>,
 	}
 
 	let channel = hash_name(&cfg.name, "schema_channel", "_metadata");
-	info!(channel = %channel, "Starting schema change listener");
 
 	tokio::spawn(async move {
 		loop {
@@ -119,7 +118,6 @@ async fn listen_for_changes(
 	loop {
 		match rx.recv().await {
 			Some(notif) if notif.payload() == "schema_updated" => {
-				info!("Schema change detected, rebuilding...");
 				rebuild_schema(pool.clone(), schema.clone(), cfg.clone()).await;
 			},
 			Some(_) => {}, // Different payload, ignore

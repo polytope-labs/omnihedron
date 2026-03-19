@@ -30,7 +30,7 @@ use deadpool_postgres::Pool;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio_postgres::AsyncMessage;
-use tracing::{error, info};
+use tracing::error;
 
 use crate::{
 	config::Config,
@@ -139,7 +139,6 @@ pub fn register_subscriptions(
 						.unwrap_or_default();
 
 					let channel = hash_name(&schema, "notify_channel", &table);
-					info!(channel = %channel, table = %table, "Starting subscription");
 
 					let raw_stream = create_subscription_stream(
 						pool,

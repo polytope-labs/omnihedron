@@ -1,11 +1,13 @@
 name: Integration Tests
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
 concurrency:
-  group: integration-tests-${{ github.head_ref }}
+  group: integration-tests-${{ github.head_ref || github.sha }}
   cancel-in-progress: true
 
 env:
