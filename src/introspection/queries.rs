@@ -72,6 +72,14 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 
 	debug!(schema, table_count = table_names.len(), "Introspecting tables");
 
+	// Log tables with smart tag comments for debugging.
+	for (table, comment) in &table_comments {
+		tracing::info!(table = %table, comment = %comment, "Table comment with smart tags");
+	}
+	if table_comments.is_empty() {
+		tracing::info!("No table comments found with smart tags");
+	}
+
 	let mut tables = Vec::with_capacity(table_names.len());
 
 	for table_name in &table_names {
@@ -85,6 +93,15 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 		// (not constraint comments). Parse them and apply to matching FKs.
 		if let Some(comment) = table_comments.get(table_name) {
 			let table_tags = super::model::SmartTags::from_table_comment(comment);
+			for (fk_col, tags) in &table_tags {
+				debug!(
+					table = %table_name,
+					fk_col = %fk_col,
+					foreign_field_name = ?tags.foreign_field_name,
+					single_foreign_field_name = ?tags.single_foreign_field_name,
+					"Parsed smart tag from table comment"
+				);
+			}
 			for (fk_col, tags) in table_tags {
 				if let Some(fk) = foreign_keys.iter_mut().find(|fk| fk.column == fk_col) {
 					if fk.smart_tags.foreign_field_name.is_none() {
@@ -93,7 +110,29 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 					if fk.smart_tags.single_foreign_field_name.is_none() {
 						fk.smart_tags.single_foreign_field_name = tags.single_foreign_field_name;
 					}
+				} else {
+					debug!(
+						table = %table_name,
+						fk_col = %fk_col,
+						"Smart tag FK column not found in table's foreign keys"
+					);
 				}
+			}
+		}
+
+		// Also log constraint-level smart tags
+		for fk in &foreign_keys {
+			if fk.smart_tags.foreign_field_name.is_some() ||
+				fk.smart_tags.single_foreign_field_name.is_some()
+			{
+				debug!(
+					table = %table_name,
+					constraint = %fk.constraint_name,
+					fk_col = %fk.column,
+					foreign_field_name = ?fk.smart_tags.foreign_field_name,
+					single_foreign_field_name = ?fk.smart_tags.single_foreign_field_name,
+					"FK with smart tags"
+				);
 			}
 		}
 
