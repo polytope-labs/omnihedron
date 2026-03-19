@@ -132,12 +132,15 @@ pub struct SmartTags {
 impl SmartTags {
 	/// Parse smart tags from a PostgreSQL constraint comment string.
 	///
-	/// Format: `@tagName value` separated by newlines.
+	/// Format: `@tagName value` separated by newlines or `|` (pipe).
+	/// SubQuery uses `|` as separator within a single tag set for historical tables
+	/// (stored as table comments), and newlines for constraint comments.
 	pub fn from_comment(comment: &str) -> Self {
 		let mut tags = SmartTags::default();
-		for line in comment.lines() {
-			let line = line.trim();
-			let parts: Vec<&str> = line.splitn(2, ' ').collect();
+		// Split on both newlines and pipes to handle both formats.
+		for segment in comment.split(|c| c == '\n' || c == '|') {
+			let segment = segment.trim();
+			let parts: Vec<&str> = segment.splitn(2, ' ').collect();
 			if parts.len() == 2 {
 				match parts[0] {
 					"@foreignFieldName" => {
@@ -152,6 +155,76 @@ impl SmartTags {
 		}
 		tags
 	}
+
+	/// Parse all smart tag groups from a table comment (historical mode).
+	///
+	/// In historical mode, SubQuery stores all FK smart tags as a single table
+	/// comment with newline-separated groups. Each group contains `|`-separated
+	/// tags for one FK, including a `@foreignKey (col) REFERENCES "table" (id)`
+	/// that identifies which FK the tags belong to.
+	///
+	/// Returns `Vec<(fk_column, SmartTags)>` where `fk_column` is extracted from
+	/// the `@foreignKey` tag.
+	pub fn from_table_comment(comment: &str) -> Vec<(String, SmartTags)> {
+		let mut results = Vec::new();
+		// Each line represents one FK's tag set.
+		for line in comment.lines() {
+			let line = line.trim();
+			if line.is_empty() {
+				continue;
+			}
+			let mut tags = SmartTags::default();
+			let mut fk_column: Option<String> = None;
+
+			for segment in line.split('|') {
+				let segment = segment.trim();
+				let parts: Vec<&str> = segment.splitn(2, ' ').collect();
+				if parts.len() < 2 {
+					continue;
+				}
+				match parts[0] {
+					"@foreignFieldName" => {
+						tags.foreign_field_name = Some(parts[1].trim().to_string());
+					},
+					"@singleForeignFieldName" => {
+						tags.single_foreign_field_name = Some(parts[1].trim().to_string());
+					},
+					"@foreignKey" => {
+						// Format: "(col_name) REFERENCES ..."
+						// Extract column name from parentheses.
+						if let Some(start) = parts[1].find('(') {
+							if let Some(end) = parts[1][start..].find(')') {
+								fk_column =
+									Some(parts[1][start + 1..start + end].trim().to_string());
+							}
+						}
+					},
+					_ => {},
+				}
+			}
+
+			if let Some(col) = fk_column {
+				if tags.foreign_field_name.is_some() || tags.single_foreign_field_name.is_some() {
+					results.push((col, tags));
+				}
+			}
+		}
+		results
+	}
+}
+
+/// A PostgreSQL function created by SubQuery's `@fullText` directive.
+///
+/// Pattern: `search_{hash}(search text) RETURNS SETOF table`
+/// with a comment `@name search_{table}` to set the GraphQL field name.
+#[derive(Debug, Clone)]
+pub struct SearchFunction {
+	/// The raw PostgreSQL function name (often a hash like `search_abc123`).
+	pub pg_name: String,
+	/// The GraphQL field name extracted from the `@name search_{table}` comment.
+	pub graphql_name: String,
+	/// The table that this function returns rows from (`RETURNS SETOF table`).
+	pub returns_table: String,
 }
 
 /// Names of internal SubQuery columns that must be hidden from the GraphQL schema.

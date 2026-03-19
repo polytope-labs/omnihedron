@@ -49,6 +49,7 @@ pub fn build_schema(
 	pool: Arc<Pool>,
 	cfg: Arc<Config>,
 	historical_arg_name: &str,
+	search_functions: &[crate::introspection::SearchFunction],
 ) -> anyhow::Result<Schema> {
 	// ── Register scalars ─────────────────────────────────────────────────────
 	let subscription_root = if cfg.subscription { Some("Subscription") } else { None };
@@ -299,6 +300,37 @@ pub fn build_schema(
 			})
 			.argument(InputValue::new("after", TypeRef::named("Cursor")))
 			.argument(InputValue::new("before", TypeRef::named("Cursor"))),
+		);
+	}
+
+	// ── Fulltext search queries ───────────────────────────────────────────────
+	for search_fn in search_functions {
+		// Find the table this search function returns.
+		let table_info = tables.iter().find(|t| t.name == search_fn.returns_table);
+		if table_info.is_none() {
+			continue;
+		}
+
+		let plural_type_name = table_to_plural_type_name(&search_fn.returns_table);
+		let connection_type = format!("{plural_type_name}Connection");
+		let pg_func = search_fn.pg_name.clone();
+		let pool_s = pool.clone();
+		let cfg_s = cfg.clone();
+
+		query = query.field(
+			Field::new(&search_fn.graphql_name, TypeRef::named_nn(&connection_type), move |ctx| {
+				let pool = pool_s.clone();
+				let cfg = cfg_s.clone();
+				let pg_func = pg_func.clone();
+				FieldFuture::new(async move {
+					let maybe =
+						resolvers::search::resolve_search(&ctx, &pool, &pg_func, &cfg).await?;
+					Ok(maybe.map(FieldValue::owned_any))
+				})
+			})
+			.argument(InputValue::new("search", TypeRef::named_nn(TypeRef::STRING)))
+			.argument(InputValue::new("first", TypeRef::named(TypeRef::INT)))
+			.argument(InputValue::new("offset", TypeRef::named(TypeRef::INT))),
 		);
 	}
 

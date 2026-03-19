@@ -33,7 +33,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use config::{Config, DbConfig};
 use db::{create_pool, discover_schema};
 use hot_reload::start_schema_listener;
-use introspection::{introspect_enums, introspect_schema};
+use introspection::{introspect_enums, introspect_schema, introspect_search_functions};
 use schema::build_schema;
 use server::{AppState, SharedSchema, build_router};
 
@@ -65,15 +65,22 @@ async fn main() -> anyhow::Result<()> {
 	// ── Introspection ─────────────────────────────────────────────────────────
 	let tables = introspect_schema(&pool, &schema_name).await?;
 	let enums = introspect_enums(&pool, &schema_name).await?;
+	let search_fns = introspect_search_functions(&pool, &schema_name).await?;
 
 	// ── Detect historical mode ────────────────────────────────────────────────
 	let historical_arg = detect_historical_mode(&pool, &schema_name).await;
 	info!(historical_arg = %historical_arg, "Historical argument name");
 
 	// ── Build GraphQL schema ──────────────────────────────────────────────────
-	let gql_schema = build_schema(&tables, &enums, pool.clone(), cfg.clone(), &historical_arg)?;
+	let gql_schema =
+		build_schema(&tables, &enums, pool.clone(), cfg.clone(), &historical_arg, &search_fns)?;
 	let shared_schema: SharedSchema = Arc::new(RwLock::new(gql_schema));
-	info!(tables = tables.len(), enums = enums.len(), "GraphQL schema built");
+	info!(
+		tables = tables.len(),
+		enums = enums.len(),
+		search_functions = search_fns.len(),
+		"GraphQL schema built"
+	);
 
 	// ── Hot reload ────────────────────────────────────────────────────────────
 	start_schema_listener(pool.clone(), shared_schema.clone(), cfg.clone()).await;
