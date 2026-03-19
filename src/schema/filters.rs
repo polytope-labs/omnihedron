@@ -382,3 +382,23 @@ pub fn filter_type_for(graphql_type: &str) -> &'static str {
 		_ => "StringFilter", // fallback
 	}
 }
+
+/// Return the name of the list filter type for an array column whose elements
+/// map to the given GraphQL type name.
+pub fn list_filter_type_for(element_gql_type: &str) -> &'static str {
+	match element_gql_type {
+		"String" => "StringListFilter",
+		"Int" => "IntListFilter",
+		"BigInt" => "BigIntListFilter",
+		"Float" => "FloatListFilter",
+		"BigFloat" => "BigFloatListFilter",
+		"Boolean" => "BooleanListFilter",
+		"Date" => "DateListFilter",
+		"Datetime" => "DatetimeListFilter",
+		"JSON" => "JSONListFilter",
+		"UUID" => "UUIDListFilter",
+		"Time" => "TimeListFilter",
+		"InternetAddress" => "InternetAddressListFilter",
+		_ => "JSONListFilter", // fallback for unmapped array types
+	}
+}
