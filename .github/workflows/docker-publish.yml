@@ -84,6 +84,6 @@ jobs:
         with:
           generate_release_notes: true
           tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          name: Omnihedron ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.POLYTOPE_GITHUB_TOKEN }}
