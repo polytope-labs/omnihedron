@@ -4671,12 +4671,28 @@ ALTER TABLE app.test_author_profiles ADD CONSTRAINT test_author_profiles_author_
 -- Smart tag: overrides backward relation from "testAuthorProfileByAuthorId" to "profile".
 COMMENT ON CONSTRAINT test_author_profiles_author_id_fkey ON app.test_author_profiles IS '@singleForeignFieldName profile';
 
--- Two authors visible at all block heights.
+-- Ten authors visible at all block heights.
 INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
     ('11111111-1111-1111-1111-111111111111'::uuid,
      'author-alice', 'Alice', '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111112'::uuid,
-     'author-bob', 'Bob', '[0,)'::int8range);
+     'author-bob', 'Bob', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111113'::uuid,
+     'author-charlie', 'Charlie', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111114'::uuid,
+     'author-diana', 'Diana', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111115'::uuid,
+     'author-eve', 'Eve', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111116'::uuid,
+     'author-frank', 'Frank', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111117'::uuid,
+     'author-grace', 'Grace', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111118'::uuid,
+     'author-henry', 'Henry', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111119'::uuid,
+     'author-iris', 'Iris', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-11111111111a'::uuid,
+     'author-jack', 'Jack', '[0,)'::int8range);
 
 INSERT INTO app.test_author_profiles (_id, id, bio, author_id, _block_range) VALUES
     ('33333333-3333-3333-3333-333333333301'::uuid,
