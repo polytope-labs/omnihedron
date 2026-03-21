@@ -29,8 +29,6 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
 
       - name: Start PostgreSQL and TypeScript service
         run: docker compose -f docker/docker-compose.ci.yml up -d --wait subql-query-ts

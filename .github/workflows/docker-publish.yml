@@ -30,9 +30,6 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          # Cache key includes OS and Cargo.lock so a lockfile change busts it
-          key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
 
       - name: Read version from Cargo.toml
         id: cargo_version
