@@ -1,3 +1,10 @@
-*
-!target/release/omnihedron
+target
+.git
+.github
+docs
+tests
+scripts
+docker
 *.env*
+.next
+node_modules
