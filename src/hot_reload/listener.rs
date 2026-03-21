@@ -37,10 +37,16 @@ use crate::{
 	db::pool::build_tls_connector,
 	introspection::{introspect_enums, introspect_schema, introspect_search_functions},
 	schema::build_schema,
+	server::SchemaState,
 };
 
 /// Start the schema change listener in a background task.
-pub async fn start_schema_listener(pool: Arc<Pool>, schema: Arc<RwLock<Schema>>, cfg: Arc<Config>) {
+pub async fn start_schema_listener(
+	pool: Arc<Pool>,
+	schema: Arc<RwLock<Schema>>,
+	cfg: Arc<Config>,
+	schema_state: Arc<SchemaState>,
+) {
 	if cfg.disable_hot_schema {
 		info!("Hot schema reload is disabled");
 		return;
@@ -50,7 +56,15 @@ pub async fn start_schema_listener(pool: Arc<Pool>, schema: Arc<RwLock<Schema>>,
 
 	tokio::spawn(async move {
 		loop {
-			match listen_for_changes(pool.clone(), schema.clone(), cfg.clone(), &channel).await {
+			match listen_for_changes(
+				pool.clone(),
+				schema.clone(),
+				cfg.clone(),
+				&channel,
+				schema_state.clone(),
+			)
+			.await
+			{
 				Ok(_) => {},
 				Err(e) => {
 					error!(error = %e, "Schema listener error, restarting in 5s");
@@ -66,6 +80,7 @@ async fn listen_for_changes(
 	schema: Arc<RwLock<Schema>>,
 	cfg: Arc<Config>,
 	channel: &str,
+	schema_state: Arc<SchemaState>,
 ) -> anyhow::Result<()> {
 	let db = crate::config::DbConfig::from_env()?;
 	let tls = build_tls_connector(&cfg)?;
@@ -118,7 +133,8 @@ async fn listen_for_changes(
 	loop {
 		match rx.recv().await {
 			Some(notif) if notif.payload() == "schema_updated" => {
-				rebuild_schema(pool.clone(), schema.clone(), cfg.clone()).await;
+				rebuild_schema(pool.clone(), schema.clone(), cfg.clone(), schema_state.clone())
+					.await;
 			},
 			Some(_) => {}, // Different payload, ignore
 			None => return Err(anyhow::anyhow!("Notification channel closed")),
@@ -157,13 +173,26 @@ async fn detect_historical_mode(pool: &Pool, schema: &str) -> String {
 	"blockHeight".to_string()
 }
 
-async fn rebuild_schema(pool: Arc<Pool>, schema_lock: Arc<RwLock<Schema>>, cfg: Arc<Config>) {
+async fn rebuild_schema(
+	pool: Arc<Pool>,
+	schema_lock: Arc<RwLock<Schema>>,
+	cfg: Arc<Config>,
+	schema_state: Arc<SchemaState>,
+) {
+	let start = std::time::Instant::now();
 	const MAX_RETRIES: u32 = 5;
 	for attempt in 1..=MAX_RETRIES {
 		match try_build_schema(&pool, &cfg).await {
 			Ok(new_schema) => {
 				*schema_lock.write().await = new_schema;
-				info!("Schema successfully rebuilt");
+				let duration = start.elapsed().as_secs_f64();
+
+				// Update schema state for health checks
+				let table_count =
+					introspect_schema(&pool, &cfg.name).await.map(|t| t.len()).unwrap_or(0);
+				schema_state.update(table_count).await;
+
+				info!(duration_ms = (duration * 1000.0) as u64, "Schema successfully rebuilt");
 				return;
 			},
 			Err(e) => {

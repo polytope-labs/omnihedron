@@ -22,7 +22,6 @@
 //! response (nodes, edges, pageInfo, totalCount).
 
 use async_graphql::dynamic::ResolverContext;
-use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 use tracing::trace;
@@ -37,7 +36,6 @@ use crate::{
 /// Returns a connection response with nodes, edges, pageInfo, and totalCount.
 pub async fn resolve_search(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	pg_function_name: &str,
 	cfg: &Config,
 ) -> async_graphql::Result<Option<Value>> {
@@ -86,11 +84,13 @@ pub async fn resolve_search(
 
 	trace!(sql = %sql, search = %search_query, "Executing fulltext search query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let params: Vec<&(dyn ToSql + Sync)> = vec![&search_query];
 
-	let rows = client.query(&sql, &params).await?;
-	let count_row = client.query_one(&count_sql, &params).await?;
+	let rows = req_client.query(&sql, &params).await?;
+	let count_row = req_client.query_one(&count_sql, &params).await?;
 	let total: i64 = count_row.get("total");
 
 	let mut nodes = vec![];

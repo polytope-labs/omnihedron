@@ -1,0 +1,96 @@
+---
+title: Historical Queries
+description: How omnihedron handles versioned table data with blockHeight and timestamp arguments
+---
+
+SubQuery indexers can store **every version** of a row, not just the latest. Each version is tagged with a `_block_range` column — a PostgreSQL int8range that says "this version was valid from block X to block Y."
+
+## How it works
+
+When omnihedron introspects a table and finds a `_block_range` column, it marks that table as historical. Historical tables get an extra argument on their connection query.
+
+### Detection
+
+At startup, omnihedron reads the `historicalStateEnabled` key from the `_metadata` table:
+
+```sql
+SELECT value FROM "{schema}"."_metadata"
+WHERE key = 'historicalStateEnabled' LIMIT 1
+```
+
+- If the value is `"timestamp"` → the argument is named `timestamp`
+- Otherwise → the argument is named `blockHeight`
+
+### Querying
+
+```graphql
+# Block height mode
+{
+  transfers(blockHeight: "1729590000000") {
+    nodes { id amount }
+  }
+}
+
+# Timestamp mode (same syntax, different argument name)
+{
+  transfers(timestamp: "1729590000000") {
+    nodes { id amount }
+  }
+}
+```
+
+Both generate identical SQL:
+
+```sql
+SELECT t."id", t."amount"
+FROM "app"."transfers" AS t
+WHERE t._block_range @> 1729590000000::bigint
+ORDER BY t."id" ASC, t."_id" ASC
+```
+
+The `_id ASC` tiebreaker ensures deterministic ordering when multiple versions of different rows exist.
+
+### Default behaviour
+
+When no `blockHeight`/`timestamp` argument is provided, omnihedron filters for the **latest version**:
+
+```sql
+WHERE t._block_range @> 9223372036854775807::bigint
+```
+
+This uses `MAX_INT64` rather than `upper_inf()` to match PostGraphile's default behaviour.
+
+## Relations and block height
+
+Block height propagates through relations. If you query:
+
+```graphql
+{
+  transfers(blockHeight: "5000000") {
+    nodes {
+      id
+      account {
+        name
+      }
+      eventsByTransferId {
+        nodes { type }
+      }
+    }
+  }
+}
+```
+
+The `blockHeight` value is embedded in the response context and inherited by both forward and backward relation resolvers. The related tables (`accounts`, `events`) also get filtered with `_block_range @> 5000000::bigint`, so you get a consistent snapshot across all related data.
+
+## Relation filter subqueries
+
+When using relation filters on historical tables, the `_block_range` condition is included in the `EXISTS` subquery:
+
+```sql
+WHERE EXISTS (
+  SELECT 1 FROM "app"."accounts" AS r
+  WHERE r.id = t.account_id
+    AND r._block_range @> $N::bigint
+    AND r."name" = $1
+)
+```

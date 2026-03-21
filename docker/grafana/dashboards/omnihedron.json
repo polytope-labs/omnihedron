@@ -1,0 +1,371 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Process Memory (RSS)",
+      "description": "Resident set size — physical memory actually used by the process.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 0 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_process_resident_memory_bytes", "legendFormat": "RSS" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "noValue": "0" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "RSS" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Tokio Runtime",
+      "description": "Alive tasks, worker threads, and global queue depth.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_tokio_alive_tasks", "legendFormat": "alive tasks" },
+        { "expr": "omnihedron_tokio_num_workers", "legendFormat": "workers" },
+        { "expr": "omnihedron_tokio_global_queue_depth", "legendFormat": "global queue depth" }
+      ],
+      "fieldConfig": {
+        "defaults": { "min": 0, "noValue": "0" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "alive tasks" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "workers" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "global queue depth" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "HTTP Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_http_requests_total[30s])", "legendFormat": "{{method}} {{path}} {{status}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "HTTP Latency (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_http_request_duration_seconds{quantile=\"0.5\"}", "legendFormat": "p50 {{method}} {{path}}" },
+        { "expr": "omnihedron_http_request_duration_seconds{quantile=\"0.99\"}", "legendFormat": "p99 {{method}} {{path}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "In-Flight Requests",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_in_flight_requests", "legendFormat": "in-flight" }
+      ],
+      "fieldConfig": {
+        "defaults": { "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "GraphQL Query Rate (by type)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_graphql_queries_total[30s])", "legendFormat": "{{type}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "GraphQL Latency (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_graphql_query_duration_seconds{quantile=\"0.5\"}", "legendFormat": "p50 {{type}}" },
+        { "expr": "omnihedron_graphql_query_duration_seconds{quantile=\"0.99\"}", "legendFormat": "p99 {{type}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "GraphQL Errors Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_graphql_errors_total[30s])", "legendFormat": "errors/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "SQL Query Rate (by type)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_sql_queries_total[30s])", "legendFormat": "{{type}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "SQL Latency (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_sql_query_duration_seconds{quantile=\"0.5\"}", "legendFormat": "p50 {{type}}" },
+        { "expr": "omnihedron_sql_query_duration_seconds{quantile=\"0.99\"}", "legendFormat": "p99 {{type}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Response Size (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_graphql_response_size_bytes{quantile=\"0.5\"}", "legendFormat": "p50" },
+        { "expr": "omnihedron_graphql_response_size_bytes{quantile=\"0.99\"}", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "DB Pool — Busy Connections",
+      "description": "How many of the pool's connections are currently in use (busy = size - available). Gauge max set dynamically from omnihedron_db_pool_max_size.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 4, "x": 0, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_db_pool_size - omnihedron_db_pool_available", "legendFormat": "busy", "refId": "A" },
+        { "expr": "omnihedron_db_pool_max_size", "legendFormat": "Max", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "noValue": "0",
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 60 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "B",
+            "mappings": [{ "fieldName": "Max", "handlerKey": "max" }]
+          }
+        }
+      ]
+    },
+    {
+      "title": "DB Pool Usage Over Time",
+      "description": "Busy vs available connections over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 4, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_db_pool_size - omnihedron_db_pool_available", "legendFormat": "busy" },
+        { "expr": "omnihedron_db_pool_available", "legendFormat": "available" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "noValue": "0",
+          "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "busy" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "available" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Pool Checkout Wait (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_db_pool_wait_duration_seconds{quantile=\"0.5\"}", "legendFormat": "p50" },
+        { "expr": "omnihedron_db_pool_wait_duration_seconds{quantile=\"0.99\"}", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Pool Checkout Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_connection_checkout_total[30s])", "legendFormat": "{{result}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Statement Cache Hit Rate",
+      "description": "Overall hit rate: (request hits + connection hits) / total lookups. Request hits = same SQL reused within one request. Connection hits = SQL already prepared on this pooled PG connection.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 4, "x": 8, "y": 40 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "(sum(rate(omnihedron_stmt_cache_hits_request_total[1m]) or vector(0)) + sum(rate(omnihedron_stmt_cache_hits_connection_total[1m]) or vector(0))) / (sum(rate(omnihedron_stmt_cache_hits_request_total[1m]) or vector(0)) + sum(rate(omnihedron_stmt_cache_hits_connection_total[1m]) or vector(0)) + sum(rate(omnihedron_stmt_cache_misses_total[1m]) or vector(0)))", "legendFormat": "hit ratio" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "title": "Statement Cache Hit/Miss Over Time",
+      "description": "Request hits = same SQL reused within one request. Connection hits = already prepared on this PG connection. Misses = sent to PG for parse+plan.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_stmt_cache_hits_request_total[30s])", "legendFormat": "request hits/s" },
+        { "expr": "rate(omnihedron_stmt_cache_hits_connection_total[30s])", "legendFormat": "connection hits/s" },
+        { "expr": "rate(omnihedron_stmt_cache_misses_total[30s])", "legendFormat": "misses/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "request hits/s" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "connection hits/s" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "misses/s" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "DataLoader Batch Size (p50 / p99)",
+      "description": "Number of distinct keys per DataLoader batch. Higher = more efficient batching of forward relation lookups.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "omnihedron_dataloader_batch_size{quantile=\"0.5\"}", "legendFormat": "p50" },
+        { "expr": "omnihedron_dataloader_batch_size{quantile=\"0.99\"}", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "DataLoader Batch Rate",
+      "description": "How many DataLoader batches are executed per second.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(omnihedron_dataloader_batch_size_count[30s])", "legendFormat": "batches/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
+        "overrides": []
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["omnihedron"],
+  "templating": { "list": [] },
+  "time": { "from": "now-5m", "to": "now" },
+  "title": "Omnihedron",
+  "uid": "omnihedron-main"
+}

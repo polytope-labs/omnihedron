@@ -87,6 +87,15 @@ pub struct Config {
 	#[arg(long, env = "OMNIHEDRON_INDEXER")]
 	pub indexer: Option<String>,
 
+	// ── Observability ─────────────────────────────────────────────────────────
+	/// Enable Prometheus metrics endpoint at /metrics
+	#[arg(long, env = "OMNIHEDRON_METRICS", default_value_t = true)]
+	pub metrics: bool,
+
+	/// Graceful shutdown timeout in seconds (default: 30)
+	#[arg(long, env = "OMNIHEDRON_SHUTDOWN_TIMEOUT", default_value_t = 30)]
+	pub shutdown_timeout: u64,
+
 	// ── Schema reload ──────────────────────────────────────────────────────────
 	/// Disable hot schema reload via PostgreSQL LISTEN/NOTIFY
 	#[arg(long, env = "OMNIHEDRON_DISABLE_HOT_SCHEMA", default_value_t = false)]

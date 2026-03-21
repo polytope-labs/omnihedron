@@ -1,0 +1,23 @@
+{
+  "title": "Omnihedron",
+  "pages": [
+    "index",
+    "---Getting Started---",
+    "installation",
+    "configuration",
+    "docker",
+    "migration",
+    "deployment",
+    "---Architecture---",
+    "how-it-works",
+    "schema-generation",
+    "naming-conventions",
+    "sql-patterns",
+    "historical-queries",
+    "---Reference---",
+    "api-reference",
+    "performance",
+    "testing",
+    "changelog"
+  ]
+}

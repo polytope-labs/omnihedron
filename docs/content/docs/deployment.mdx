@@ -1,0 +1,804 @@
+---
+title: Deployment Guide
+description: Deploying omnihedron in production — Docker, systemd, Kubernetes, and reverse proxies
+---
+
+
+## 1. Overview
+
+Omnihedron is a high-performance Rust GraphQL query service for SubQuery Network indexers. It replaces the TypeScript `@subql/query` service with a multi-threaded Rust binary that handles tens of thousands of concurrent connections.
+
+### Requirements
+
+| Component | Minimum |
+|---|---|
+| **Runtime** | Pre-built binary *or* Docker image (`polytopelabs/omnihedron`) |
+| **PostgreSQL** | 14+ with a populated SubQuery indexer schema |
+| **Default port** | 3000 (configurable via `--port` / `OMNIHEDRON_PORT`) |
+| **Memory** | ~21 MB idle, ~47 MB peak (8 worker threads) |
+
+### Endpoints
+
+| Path | Method | Purpose |
+|---|---|---|
+| `/` | `POST` | GraphQL queries (single and batch) |
+| `/` | `GET` | GraphiQL playground (when `--playground` enabled) |
+| `/ws` | `GET` | WebSocket subscriptions (when `--subscription` enabled) |
+| `/health` | `GET` | Liveness probe (checks DB connectivity, returns pool stats) |
+| `/metrics` | `GET` | Prometheus metrics (when `--metrics` enabled) |
+
+### Environment variables (database)
+
+```bash
+DB_HOST=localhost        # PostgreSQL host
+DB_HOST_READ=            # Optional read-replica host
+DB_PORT=5432             # PostgreSQL port
+DB_USER=postgres         # PostgreSQL user
+DB_PASS=postgres         # PostgreSQL password
+DB_DATABASE=indexer      # PostgreSQL database name
+```
+
+---
+
+## 2. Docker
+
+### Dockerfile
+
+The project ships a Dockerfile at `docker/Dockerfile`. It uses a minimal Debian Bookworm slim base with only `ca-certificates` and `libssl3` installed. The binary must be built on the host first:
+
+```bash
+cargo build --release --bin omnihedron
+```
+
+The Dockerfile copies the pre-built binary:
+
+```dockerfile
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/omnihedron /usr/local/bin/omnihedron
+
+EXPOSE 3000
+ENTRYPOINT ["omnihedron"]
+```
+
+### Multi-stage build (recommended for CI)
+
+For a fully self-contained build that does not require the host to have Rust installed:
+
+```dockerfile
+# Stage 1: Build
+FROM rust:1.85-bookworm AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release --bin omnihedron
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/omnihedron /usr/local/bin/omnihedron
+EXPOSE 3000
+ENTRYPOINT ["omnihedron"]
+```
+
+### Production docker-compose
+
+```yaml
+services:
+  omnihedron:
+    image: polytopelabs/omnihedron:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: "${DB_PASS}"
+      DB_DATABASE: indexer
+      DB_HOST_READ: postgres-replica          # optional read replica
+      OMNIHEDRON_NAME: "${SCHEMA_NAME}"
+      OMNIHEDRON_PORT: "3000"
+      OMNIHEDRON_LOG_LEVEL: info
+      OMNIHEDRON_OUTPUT_FMT: json
+      OMNIHEDRON_METRICS: "true"
+      OMNIHEDRON_MAX_CONNECTION: "20"
+      OMNIHEDRON_QUERY_LIMIT: "100"
+      OMNIHEDRON_QUERY_DEPTH_LIMIT: "10"
+      OMNIHEDRON_QUERY_COMPLEXITY: "500"
+      OMNIHEDRON_QUERY_BATCH_LIMIT: "5"
+      OMNIHEDRON_QUERY_TIMEOUT: "10000"
+      TOKIO_WORKER_THREADS: "8"
+    command: ["--name", "${SCHEMA_NAME}"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "2"
+        reservations:
+          memory: 64M
+          cpus: "0.5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: indexer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${DB_PASS}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## 3. Systemd
+
+### Service file
+
+Create `/etc/systemd/system/omnihedron.service`:
+
+```ini
+[Unit]
+Description=Omnihedron GraphQL Query Service
+Documentation=https://github.com/polytope-labs/omnihedron
+After=network-online.target postgresql.service
+Requires=network-online.target
+Wants=postgresql.service
+
+[Service]
+Type=exec
+User=omnihedron
+Group=omnihedron
+ExecStart=/usr/local/bin/omnihedron --name %i
+Restart=on-failure
+RestartSec=5
+WatchdogSec=60
+
+# Environment
+EnvironmentFile=/etc/omnihedron/env
+
+# Graceful shutdown — omnihedron handles SIGTERM
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Environment file
+
+Create `/etc/omnihedron/env`:
+
+```bash
+# Database
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_USER=omnihedron
+DB_PASS=<secret>
+DB_DATABASE=indexer
+
+# Application
+OMNIHEDRON_NAME=my_schema
+OMNIHEDRON_PORT=3000
+OMNIHEDRON_LOG_LEVEL=info
+OMNIHEDRON_OUTPUT_FMT=json
+OMNIHEDRON_METRICS=true
+OMNIHEDRON_MAX_CONNECTION=20
+OMNIHEDRON_QUERY_LIMIT=100
+OMNIHEDRON_QUERY_DEPTH_LIMIT=10
+OMNIHEDRON_QUERY_COMPLEXITY=500
+OMNIHEDRON_QUERY_BATCH_LIMIT=5
+OMNIHEDRON_QUERY_TIMEOUT=10000
+
+# Runtime
+TOKIO_WORKER_THREADS=8
+```
+
+### Setup and start
+
+```bash
+# Create system user
+sudo useradd --system --shell /usr/sbin/nologin omnihedron
+
+# Create config directory
+sudo mkdir -p /etc/omnihedron
+sudo chmod 750 /etc/omnihedron
+sudo chown root:omnihedron /etc/omnihedron
+
+# Copy environment file (edit with real values)
+sudo cp env /etc/omnihedron/env
+sudo chmod 640 /etc/omnihedron/env
+sudo chown root:omnihedron /etc/omnihedron/env
+
+# Copy binary
+sudo cp target/release/omnihedron /usr/local/bin/omnihedron
+sudo chmod 755 /usr/local/bin/omnihedron
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable omnihedron
+sudo systemctl start omnihedron
+
+# Check status
+sudo systemctl status omnihedron
+sudo journalctl -u omnihedron -f
+```
+
+---
+
+## 4. Kubernetes
+
+### ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnihedron-config
+data:
+  OMNIHEDRON_NAME: "my_schema"
+  OMNIHEDRON_PORT: "3000"
+  OMNIHEDRON_LOG_LEVEL: "info"
+  OMNIHEDRON_OUTPUT_FMT: "json"
+  OMNIHEDRON_METRICS: "true"
+  OMNIHEDRON_MAX_CONNECTION: "20"
+  OMNIHEDRON_QUERY_LIMIT: "100"
+  OMNIHEDRON_QUERY_DEPTH_LIMIT: "10"
+  OMNIHEDRON_QUERY_COMPLEXITY: "500"
+  OMNIHEDRON_QUERY_BATCH_LIMIT: "5"
+  OMNIHEDRON_QUERY_TIMEOUT: "10000"
+  TOKIO_WORKER_THREADS: "8"
+  DB_HOST: "postgres.default.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_DATABASE: "indexer"
+```
+
+### Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: omnihedron-db-secret
+type: Opaque
+stringData:
+  DB_USER: "omnihedron"
+  DB_PASS: "<secret>"
+```
+
+### Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnihedron
+  labels:
+    app: omnihedron
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: omnihedron
+  template:
+    metadata:
+      labels:
+        app: omnihedron
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: omnihedron
+          image: polytopelabs/omnihedron:latest
+          args: ["--name", "$(OMNIHEDRON_NAME)"]
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: omnihedron-config
+            - secretRef:
+                name: omnihedron-db-secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 64Mi
+            limits:
+              cpu: "2"
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+```
+
+### Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnihedron
+  labels:
+    app: omnihedron
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+  selector:
+    app: omnihedron
+```
+
+### HorizontalPodAutoscaler
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: omnihedron
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: omnihedron
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+```
+
+### PodDisruptionBudget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: omnihedron
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: omnihedron
+```
+
+### Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: omnihedron
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - query.example.com
+      secretName: omnihedron-tls
+  rules:
+    - host: query.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: omnihedron
+                port:
+                  number: 3000
+```
+
+### Graceful shutdown notes
+
+Omnihedron registers handlers for both SIGINT and SIGTERM. On receiving either signal, the axum server stops accepting new connections and waits for in-flight requests to complete before exiting. In Kubernetes:
+
+- `terminationGracePeriodSeconds` (set to 30 above) controls how long the kubelet waits after sending SIGTERM before sending SIGKILL.
+- The readiness probe will begin failing once the shutdown signal is received, removing the pod from service endpoints so no new traffic is routed to it.
+- The PostgreSQL connection pool (`deadpool-postgres`) drops all idle connections on process exit. In-flight queries complete or are cancelled by the `statement_timeout` set on each connection.
+- If using WebSocket subscriptions, clients will receive a close frame and should reconnect to another pod.
+
+---
+
+## 5. Reverse Proxy
+
+### Nginx
+
+```nginx
+upstream omnihedron {
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name query.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/query.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/query.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Security headers
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Frame-Options DENY;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Request limits
+    client_max_body_size 1m;
+
+    # GraphQL endpoint
+    location / {
+        proxy_pass http://omnihedron;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+        proxy_send_timeout 10s;
+
+        # Cache GraphQL responses (omnihedron sets Cache-Control: public, max-age=5)
+        proxy_cache graphql_cache;
+        proxy_cache_valid 200 5s;
+        proxy_cache_methods POST;
+        proxy_cache_key "$request_method$request_uri$request_body";
+        proxy_cache_use_stale error timeout updating;
+    }
+
+    # WebSocket subscriptions
+    location /ws {
+        proxy_pass http://omnihedron;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # Health check (no caching)
+    location /health {
+        proxy_pass http://omnihedron;
+        proxy_cache off;
+    }
+
+    # Metrics (restrict access)
+    location /metrics {
+        allow 10.0.0.0/8;
+        allow 172.16.0.0/12;
+        allow 192.168.0.0/16;
+        deny all;
+        proxy_pass http://omnihedron;
+        proxy_cache off;
+    }
+}
+
+# Cache zone (declared in http block)
+# proxy_cache_path /var/cache/nginx/graphql levels=1:2
+#     keys_zone=graphql_cache:10m max_size=100m inactive=10s;
+```
+
+### Caddy
+
+```text
+query.example.com {
+    # TLS is automatic with Caddy
+    encode gzip
+
+    # Metrics — internal only
+    @metrics path /metrics
+    handle @metrics {
+        respond 403
+    }
+
+    # WebSocket subscriptions
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+        path /ws
+    }
+    handle @websocket {
+        reverse_proxy localhost:3000
+    }
+
+    # All other traffic
+    handle {
+        reverse_proxy localhost:3000 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            transport http {
+                keepalive 30s
+                keepalive_idle_conns 32
+            }
+        }
+    }
+}
+```
+
+---
+
+## 6. TLS — PostgreSQL
+
+Omnihedron supports mutual TLS authentication to PostgreSQL via three flags:
+
+| Flag | Env var | Purpose |
+|---|---|---|
+| `--pg-ca` | `OMNIHEDRON_PG_CA` | Path to the CA certificate that signed the server cert |
+| `--pg-key` | `OMNIHEDRON_PG_KEY` | Path to the client private key |
+| `--pg-cert` | `OMNIHEDRON_PG_CERT` | Path to the client certificate |
+
+### Binary usage
+
+```bash
+omnihedron \
+  --name my_schema \
+  --port 3000 \
+  --pg-ca /etc/ssl/pg/ca.crt \
+  --pg-key /etc/ssl/pg/client.key \
+  --pg-cert /etc/ssl/pg/client.crt
+```
+
+### Docker usage
+
+Mount certificates as read-only volumes:
+
+```yaml
+services:
+  omnihedron:
+    image: polytopelabs/omnihedron:latest
+    volumes:
+      - ./certs/ca.crt:/etc/ssl/pg/ca.crt:ro
+      - ./certs/client.key:/etc/ssl/pg/client.key:ro
+      - ./certs/client.crt:/etc/ssl/pg/client.crt:ro
+    environment:
+      OMNIHEDRON_PG_CA: /etc/ssl/pg/ca.crt
+      OMNIHEDRON_PG_KEY: /etc/ssl/pg/client.key
+      OMNIHEDRON_PG_CERT: /etc/ssl/pg/client.crt
+```
+
+### Kubernetes usage
+
+Store certificates in a Secret and mount them:
+
+```yaml
+volumes:
+  - name: pg-tls
+    secret:
+      secretName: omnihedron-pg-tls
+      defaultMode: 0400
+containers:
+  - name: omnihedron
+    volumeMounts:
+      - name: pg-tls
+        mountPath: /etc/ssl/pg
+        readOnly: true
+    env:
+      - name: OMNIHEDRON_PG_CA
+        value: /etc/ssl/pg/ca.crt
+      - name: OMNIHEDRON_PG_KEY
+        value: /etc/ssl/pg/client.key
+      - name: OMNIHEDRON_PG_CERT
+        value: /etc/ssl/pg/client.crt
+```
+
+### PostgreSQL server-side configuration
+
+Ensure `postgresql.conf` has:
+
+```
+ssl = on
+ssl_cert_file = '/etc/ssl/pg/server.crt'
+ssl_key_file = '/etc/ssl/pg/server.key'
+ssl_ca_file = '/etc/ssl/pg/ca.crt'
+```
+
+And `pg_hba.conf` requires TLS for the omnihedron user:
+
+```
+hostssl  indexer  omnihedron  0.0.0.0/0  cert
+```
+
+---
+
+## 7. Production Checklist
+
+### Connection pool sizing
+
+The default pool size is 10 (`--max-connection` / `OMNIHEDRON_MAX_CONNECTION`). Tune based on your PostgreSQL `max_connections` and the number of omnihedron replicas:
+
+```
+pool_size_per_replica = floor(pg_max_connections / (num_replicas + headroom))
+```
+
+For example, with `max_connections = 200`, 4 replicas, and 40 connections reserved for other services:
+
+```
+pool_size = floor((200 - 40) / 4) = 40
+```
+
+Set `OMNIHEDRON_MAX_CONNECTION=40` on each replica.
+
+If using `DB_HOST_READ` for a read replica, the pool is split across primary (writes/subscriptions) and replica (reads). The same `max_connection` value applies to each.
+
+### Query limits
+
+Enable all query protections in production. Do **not** use `--unsafe-mode`:
+
+| Setting | Recommended | Purpose |
+|---|---|---|
+| `OMNIHEDRON_QUERY_LIMIT` | `100` (default) | Max rows returned per entity query |
+| `OMNIHEDRON_QUERY_DEPTH_LIMIT` | `10` | Prevents deeply nested relation traversals |
+| `OMNIHEDRON_QUERY_COMPLEXITY` | `500` | Blocks expensive queries before execution |
+| `OMNIHEDRON_QUERY_ALIAS_LIMIT` | `30` | Prevents alias-based DoS amplification |
+| `OMNIHEDRON_QUERY_BATCH_LIMIT` | `5` | Limits queries per batch request |
+| `OMNIHEDRON_QUERY_TIMEOUT` | `10000` | Query timeout in ms (enforced via PostgreSQL `statement_timeout`) |
+
+### Timeouts
+
+- **Query timeout** (`OMNIHEDRON_QUERY_TIMEOUT`): Enforced at the PostgreSQL level via `statement_timeout` set on every pool connection. The database kills any query exceeding this limit. Default: 10,000 ms.
+- **Reverse proxy timeout**: Set `proxy_read_timeout` slightly above the query timeout (e.g., 30s) to account for network latency and request parsing.
+- **Kubernetes probes**: Use generous `timeoutSeconds` (5s) and `failureThreshold` (3) so transient slow health checks do not trigger pod restarts.
+
+### Logging
+
+For production, use structured JSON output:
+
+```bash
+OMNIHEDRON_OUTPUT_FMT=json
+OMNIHEDRON_LOG_LEVEL=info
+```
+
+Every HTTP request logs: `request_id`, `method`, `path`, `status`, and `duration_ms`. GraphQL queries at debug level log: `operation`, `duration_ms`, `has_errors`, and a compact `query` preview.
+
+Optional file logging with rotation:
+
+```bash
+OMNIHEDRON_LOG_PATH=/var/log/omnihedron/query.log
+OMNIHEDRON_LOG_ROTATE=true
+```
+
+### Metrics
+
+Enable Prometheus metrics with `OMNIHEDRON_METRICS=true`. The `/metrics` endpoint exposes:
+
+| Metric | Type | Description |
+|---|---|---|
+| `omnihedron_http_requests_total` | Counter | HTTP requests by method, path, status |
+| `omnihedron_http_request_duration_seconds` | Histogram | Request latency by method, path |
+
+Restrict access to `/metrics` in your reverse proxy or network policy.
+
+### Tokio worker threads
+
+On machines with many cores, set `TOKIO_WORKER_THREADS` to avoid excessive memory from idle thread stacks:
+
+| Cores | Recommended threads | Idle RSS |
+|---|---|---|
+| 2-8 | Leave default | ~21 MB |
+| 16-32 | 8-16 | ~21-30 MB |
+| 64+ | 8-16 | ~21-30 MB |
+
+For a PostgreSQL-bound service with a pool of 10-40 connections, 8-16 worker threads is optimal regardless of core count.
+
+### Schema hot reload
+
+By default, omnihedron listens for PostgreSQL `LISTEN/NOTIFY` events on the SubQuery schema channel. When the indexer updates the schema, the service re-introspects and atomically swaps the GraphQL schema. In-flight requests are unaffected.
+
+- Keep-alive interval: `OMNIHEDRON_SL_KEEP_ALIVE_INTERVAL` (default: 180,000 ms / 3 minutes).
+- To disable: `OMNIHEDRON_DISABLE_HOT_SCHEMA=true`.
+
+### Security
+
+- Never run with `--unsafe-mode` in production.
+- Disable `--playground` in production (it is off by default).
+- Use PostgreSQL TLS (`--pg-ca`, `--pg-key`, `--pg-cert`) for encrypted database connections.
+- Run as a non-root user (systemd `User=omnihedron`, Kubernetes `runAsNonRoot: true`).
+- Restrict `/metrics` endpoint to internal networks.
+- All user-supplied values in SQL use parameterized `$N` placeholders. Column and table names come from introspection and are never interpolated from user input.

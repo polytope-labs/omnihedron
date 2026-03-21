@@ -1,0 +1,582 @@
+---
+title: Migration from @subql/query
+description: How to switch from the TypeScript query service to omnihedron
+---
+
+
+## 1. Overview
+
+**omnihedron** is a high-performance Rust reimplementation of [`@subql/query`](https://github.com/subquery/subql/tree/main/packages/query), the GraphQL query service for SubQuery Network indexers. The TypeScript original uses PostGraphile to auto-generate a GraphQL API from a live PostgreSQL schema. omnihedron replicates that behaviour entirely in Rust, producing an identical external API.
+
+### Why migrate?
+
+- **6-12x higher throughput** under concurrent load (benchmarked on real SubQuery databases)
+- **2-5x lower p99 tail latency** — Rust p99 stays under 2s at 5,000 concurrency; TypeScript hits 30s timeout
+- **8.7x less memory** under load (47 MB vs 408 MB peak RSS at concurrency=500)
+- **No event loop saturation** — TypeScript collapses at ~5,000 concurrent connections; Rust maintains stable throughput past 10,000
+- **No GC pauses or JIT deoptimisations**
+- Native multi-core dispatch via Tokio
+
+### What stays identical
+
+- The generated **GraphQL schema** is the same (verified by CI introspection tests comparing 716+ types)
+- **Query syntax** — all existing queries, filters, ordering, pagination, aggregates work unchanged
+- **Database compatibility** — connects to the same PostgreSQL database with the same schema
+- **Cursor format** — base64-encoded JSON, fully compatible
+- **nodeId format** — base64-encoded `["TypeName", pkValue]`, fully compatible
+- **Environment variables** for database connection (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_DATABASE`)
+
+---
+
+## 2. Quick start — drop-in replacement
+
+### Step 1: Stop the TypeScript service
+
+```bash
+# If running via docker compose
+docker compose stop subql-query-ts
+
+# If running directly
+kill $(pgrep -f "subql-query")
+```
+
+### Step 2: Pull the omnihedron image (or build from source)
+
+```bash
+# Docker Hub
+docker pull polytopelabs/omnihedron:latest
+
+# Or build from source
+cargo build --release
+```
+
+### Step 3: Start omnihedron with equivalent flags
+
+```bash
+# TypeScript command:
+#   subql-query --name my_project --port 3000 --unsafe
+
+# Rust equivalent:
+omnihedron --name my_project --port 3000 --unsafe-mode
+```
+
+### Step 4: Verify
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# Run a test query
+curl -X POST http://localhost:3000 \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ _metadata { lastProcessedHeight } }"}'
+```
+
+No client-side changes are needed. The GraphQL schema, endpoints, and response format are identical.
+
+---
+
+## 3. CLI flag mapping
+
+| @subql/query flag | omnihedron flag | omnihedron env var | Notes |
+|---|---|---|---|
+| `--name` / `-n` | `--name` / `-n` | `OMNIHEDRON_NAME` | Identical — PostgreSQL schema name |
+| `--port` | `--port` / `-p` | `OMNIHEDRON_PORT` | Identical |
+| `--playground` | `--playground` | `OMNIHEDRON_PLAYGROUND` | Identical — enables GraphiQL |
+| `--unsafe` | `--unsafe-mode` | `OMNIHEDRON_UNSAFE` | **Renamed** — disables all query limits |
+| `--subscription` | `--subscription` | `OMNIHEDRON_SUBSCRIPTION` | Identical — enables WebSocket subscriptions |
+| `--aggregate` | `--aggregate` | `OMNIHEDRON_AGGREGATE` | Identical — enables aggregation queries (default: on) |
+| `--query-limit` | `--query-limit` | `OMNIHEDRON_QUERY_LIMIT` | Identical — max records per query (default: 100) |
+| `--query-batch-limit` | `--query-batch-limit` | `OMNIHEDRON_QUERY_BATCH_LIMIT` | Identical — max queries per batch request |
+| `--query-depth-limit` | `--query-depth-limit` | `OMNIHEDRON_QUERY_DEPTH_LIMIT` | Identical — max query nesting depth |
+| `--query-alias-limit` | `--query-alias-limit` | `OMNIHEDRON_QUERY_ALIAS_LIMIT` | Identical — max field aliases per query |
+| `--query-complexity` | `--query-complexity` | `OMNIHEDRON_QUERY_COMPLEXITY` | Identical — max query complexity score |
+| `--query-timeout` | `--query-timeout` | `OMNIHEDRON_QUERY_TIMEOUT` | Identical — timeout in ms (default: 10000). Enforced via PostgreSQL `statement_timeout` |
+| `--max-connection` | `--max-connection` | `OMNIHEDRON_MAX_CONNECTION` | Identical — PostgreSQL connection pool size (default: 10) |
+| `--indexer` | `--indexer` | `OMNIHEDRON_INDEXER` | Identical — indexer URL for metadata fallback |
+| `--dictionary-optimisation` | `--dictionary-optimisation` | `OMNIHEDRON_DICTIONARY_OPTIMISATION` | Identical |
+| `--log-level` | `--log-level` | `OMNIHEDRON_LOG_LEVEL` | Identical — `fatal\|error\|warn\|info\|debug\|trace` |
+| `--output-fmt` | `--output-fmt` | `OMNIHEDRON_OUTPUT_FMT` | Identical — `json\|colored` |
+| N/A | `--metrics` | `OMNIHEDRON_METRICS` | **New** — enable Prometheus `/metrics` endpoint |
+| N/A | `--query-explain` | `OMNIHEDRON_QUERY_EXPLAIN` | **New** — log SQL EXPLAIN for each query |
+| N/A | `--disable-hot-schema` | `OMNIHEDRON_DISABLE_HOT_SCHEMA` | **New** — disable schema hot reload via LISTEN/NOTIFY |
+| N/A | `--sl-keep-alive-interval` | `OMNIHEDRON_SL_KEEP_ALIVE_INTERVAL` | **New** — schema listener keep-alive interval in ms (default: 180000) |
+| N/A | `--pg-ca` | `OMNIHEDRON_PG_CA` | **New** — path to PostgreSQL CA certificate |
+| N/A | `--pg-key` | `OMNIHEDRON_PG_KEY` | **New** — path to PostgreSQL client key |
+| N/A | `--pg-cert` | `OMNIHEDRON_PG_CERT` | **New** — path to PostgreSQL client certificate |
+| N/A | `--log-path` | `OMNIHEDRON_LOG_PATH` | **New** — path to log file |
+| N/A | `--log-rotate` | `OMNIHEDRON_LOG_ROTATE` | **New** — enable log file rotation |
+
+---
+
+## 4. Feature parity table
+
+| Feature | @subql/query | omnihedron | Notes |
+|---|---|---|---|
+| Connection queries (list + pagination) | Yes | Yes | Identical schema |
+| Single record by ID | Yes | Yes | |
+| Single record by nodeId | Yes | Yes | |
+| Node interface (`node(nodeId: ...)`) | Yes | Yes | |
+| Cursor-based pagination (`after`/`before`) | Yes | Yes | Same base64 JSON cursor format |
+| Offset pagination | Yes | Yes | |
+| `first`/`last` pagination | Yes | Yes | |
+| Filter operators (`equalTo`, `in`, `like`, `isNull`, etc.) | Yes | Yes | All operators supported |
+| Logical filters (`and`/`or`/`not`) | Yes | Yes | |
+| Relation filters (`some`/`none`/`every`, `Exists`) | Yes | Yes | |
+| Multi-column ordering | Yes | Yes | |
+| `NullOrder` (`NULLS_FIRST`/`NULLS_LAST`) | Yes | Yes | |
+| `DISTINCT ON` | Yes | Yes | |
+| Forward relation fields | Yes | Yes | Same PostGraphile inflector naming |
+| Backward relation fields | Yes | Yes | `{childPlural}By{FkCol}` naming |
+| One-to-one backward relations | Yes | Yes | Detected via unique FK constraint |
+| Aggregates (sum, min, max, avg, count) | Yes | Yes | See Known Divergences for `count` |
+| Grouped aggregates (`groupedAggregates`) | Yes | Yes | With time-truncation variants |
+| Statistical aggregates (stddev, variance) | Yes | Yes | |
+| Distinct count aggregates | Yes | Yes | |
+| Historical block height queries | Yes | Yes | `blockHeight` and `timestamp` modes |
+| `_metadata` / `_metadatas` queries | Yes | Yes | Multi-chain support |
+| Batch queries (JSON array POST) | Yes | Yes | |
+| GraphQL variables | Yes | Yes | |
+| GraphiQL playground | Yes | Yes | `--playground` flag |
+| WebSocket subscriptions | Yes | Yes | `--subscription` flag |
+| Schema hot reload (LISTEN/NOTIFY) | Yes | Yes | |
+| Query depth limiting | Yes | Yes | |
+| Query complexity limiting | Yes | Yes | Returns `query-complexity` response header |
+| Query alias limiting | Yes | Yes | |
+| Batch query limiting | Yes | Yes | |
+| Health endpoint | Yes | Yes | `/health` — includes DB pool status in omnihedron |
+| Fulltext search (`@fullText` directive) | No | Yes | **New** — `search_{table}` root query fields |
+| Prometheus metrics | No | Yes | **New** — `--metrics` enables `/metrics` |
+| SQL EXPLAIN logging | No | Yes | **New** — `--query-explain` |
+| Read replicas | No | Yes | **New** — `DB_HOST_READ` env var |
+| PostgreSQL TLS (mTLS) | No | Yes | **New** — `--pg-ca`, `--pg-key`, `--pg-cert` |
+| Log file output + rotation | No | Yes | **New** — `--log-path`, `--log-rotate` |
+| Selective column fetching | No | Yes | **New** — only fetches columns in the selection set |
+| Selective aggregate computation | No | Yes | **New** — only computes requested aggregate functions |
+| Count-only fast path | No | Yes | **New** — queries with only `totalCount` skip row fetching |
+| Forward-relation scalar ordering | Yes | Yes | `{ENTITY}_BY_{FK}__{COL}_ASC/DESC` enum values |
+| Response compression (gzip) | No | Yes | Automatic via `CompressionLayer` |
+| Cache-Control header | No | Yes | `public, max-age=5` |
+| Request tracing with request ID | No | Yes | UUID-prefixed spans in logs |
+
+---
+
+## 5. Known divergences
+
+### 5.1 Aggregates: `count` field
+
+| | @subql/query (PostGraphile) | omnihedron |
+|---|---|---|
+| `aggregates { count }` | `count` field does **not** exist on `{Entity}Aggregates` | `count: BigInt!` **is** present |
+| Getting a filtered count | Use `{ entities { totalCount } }` | Same — or use `aggregates { count }` |
+
+**Impact:** Queries using `aggregates { count }` will work on omnihedron but fail on the TypeScript service. If you need to support both during migration, use `totalCount` on the connection instead.
+
+### 5.2 Aggregate helper types
+
+omnihedron does not generate certain PostGraphile aggregate helper types that are present in the TypeScript schema but unused by standard queries:
+
+- `Having*` types
+- `*AggregatesFilter` types
+- `*AggregateFilter` types
+- `*ToMany*` filter helper types
+
+These types exist in the PostGraphile schema for advanced pg-aggregates plugin features that are not used by SubQuery indexer consumers. If your client introspects the schema and caches type definitions, be aware the type set is slightly smaller.
+
+### 5.3 Naming conventions
+
+Both services use identical PostGraphile-compatible naming:
+
+- `snake_case` columns become `camelCase` fields
+- Table names are singularized for type names (`transfers` -> `Transfer`)
+- Leading underscores are preserved (`_global` -> `_Global`)
+- Consecutive uppercase runs are normalised (`cumulative_volume_u_s_ds` -> `CumulativeVolumeUsds`)
+- Latin neuter irregulars handled (`metadata` -> `Metadatum`)
+
+The inflection logic in omnihedron has been verified against PostGraphile's exact output for all 716+ types in the test database. No naming divergences are expected.
+
+### 5.4 Error message format
+
+Both services return standard GraphQL error responses (`{ "errors": [...] }`), but the error message text may differ:
+
+- **Query validation errors** (depth, complexity, alias limits) use omnihedron-specific wording
+- **Database errors** surface the PostgreSQL error message directly in both, but omnihedron may include different context
+- **Batch request errors** are returned per-item in the response array on both services
+
+### 5.5 Subscriptions
+
+Both services support WebSocket subscriptions via the `graphql-ws` protocol. omnihedron uses the `async-graphql-axum` WebSocket handler. Subscription behaviour is functionally equivalent but the underlying implementation differs (PostGraphile LISTEN/NOTIFY vs async-graphql's subscription engine).
+
+### 5.6 Query timeout enforcement
+
+- **@subql/query:** enforces timeout at the application layer (Node.js)
+- **omnihedron:** enforces timeout via PostgreSQL's `statement_timeout` set on every pool connection, letting the database kill long-running queries directly
+
+### 5.7 `first: 0` behaviour
+
+omnihedron treats `first: 0` as unset (matching JavaScript's truthiness semantics where `0` is falsy). This matches the TypeScript service behaviour.
+
+---
+
+## 6. New features in omnihedron
+
+### 6.1 Query validation with response headers
+
+omnihedron returns query complexity information in response headers:
+
+```
+query-complexity: 42
+max-query-complexity: 1000
+```
+
+This allows clients to monitor how close their queries are to the complexity limit without hitting errors.
+
+### 6.2 Schema hot reload
+
+Enabled by default. A dedicated PostgreSQL connection listens on the SubQuery schema channel. When a `schema_updated` notification arrives, introspection reruns and the schema is atomically swapped. In-flight requests are unaffected.
+
+Disable with `--disable-hot-schema` if you prefer manual restarts. Configure the keep-alive interval with `--sl-keep-alive-interval` (default: 180,000 ms).
+
+### 6.3 Prometheus metrics
+
+Enable with `--metrics`. Exposes a `/metrics` endpoint with:
+
+- `omnihedron_http_requests_total` (counter) — labeled by method, path, status
+- `omnihedron_http_request_duration_seconds` (histogram) — labeled by method, path
+- GraphQL-level counters for queries and errors
+
+### 6.4 SQL EXPLAIN logging
+
+Enable with `--query-explain` to log the PostgreSQL `EXPLAIN` output for every query at trace level. Useful for identifying slow queries and missing indexes during migration testing.
+
+### 6.5 Fulltext search
+
+omnihedron supports SubQuery's `@fullText` directive. PostgreSQL functions created by the indexer (pattern: `search_{hash}(search text) RETURNS SETOF table`) are automatically detected and exposed as root query fields with the GraphQL name from the function comment (`@name search_{table}`).
+
+### 6.6 Read replicas
+
+Set the `DB_HOST_READ` environment variable to route read queries to a replica:
+
+```bash
+DB_HOST=primary.db.example.com
+DB_HOST_READ=replica.db.example.com
+```
+
+Subscription connections always use the primary host.
+
+### 6.7 PostgreSQL TLS (mTLS)
+
+```bash
+omnihedron --name my_project \
+  --pg-ca /path/to/ca.crt \
+  --pg-key /path/to/client.key \
+  --pg-cert /path/to/client.crt
+```
+
+### 6.8 Selective query optimisation
+
+omnihedron automatically optimises queries:
+
+- **Selective column fetching** — only columns referenced in the GraphQL selection set are included in the SQL `SELECT`
+- **Selective aggregate computation** — only requested aggregate functions (sum, min, max, etc.) are computed in SQL
+- **Count-only fast path** — queries requesting only `totalCount` (no `nodes`/`edges`) skip row fetching entirely
+- **Window function** — `COUNT(*) OVER()` fetches total count and rows in a single SQL round-trip
+
+### 6.9 Response compression and caching
+
+- Automatic gzip/deflate compression via Tower's `CompressionLayer`
+- `Cache-Control: public, max-age=5` header on all responses
+
+---
+
+## 7. Environment variables mapping
+
+### Database connection (identical)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
+| `DB_USER` | `postgres` | PostgreSQL user |
+| `DB_PASS` | (empty) | PostgreSQL password |
+| `DB_DATABASE` | `postgres` | PostgreSQL database name |
+| `DB_HOST_READ` | (none) | **New** — Read replica host |
+
+### Application configuration
+
+| @subql/query env var | omnihedron env var | Notes |
+|---|---|---|
+| `SUBQL_QUERY_NAME` | `OMNIHEDRON_NAME` | Schema name |
+| `SUBQL_QUERY_PORT` | `OMNIHEDRON_PORT` | HTTP port |
+| `SUBQL_QUERY_PLAYGROUND` | `OMNIHEDRON_PLAYGROUND` | GraphiQL toggle |
+| `SUBQL_QUERY_UNSAFE` | `OMNIHEDRON_UNSAFE` | Disable query limits |
+| `SUBQL_QUERY_SUBSCRIPTION` | `OMNIHEDRON_SUBSCRIPTION` | WebSocket subscriptions |
+| `SUBQL_QUERY_AGGREGATE` | `OMNIHEDRON_AGGREGATE` | Aggregation queries |
+| `SUBQL_QUERY_LIMIT` | `OMNIHEDRON_QUERY_LIMIT` | Max records per query |
+| `SUBQL_QUERY_BATCH_LIMIT` | `OMNIHEDRON_QUERY_BATCH_LIMIT` | Max batch size |
+| `SUBQL_QUERY_DEPTH_LIMIT` | `OMNIHEDRON_QUERY_DEPTH_LIMIT` | Max query depth |
+| `SUBQL_QUERY_ALIAS_LIMIT` | `OMNIHEDRON_QUERY_ALIAS_LIMIT` | Max aliases |
+| `SUBQL_QUERY_COMPLEXITY` | `OMNIHEDRON_QUERY_COMPLEXITY` | Max complexity |
+| `SUBQL_QUERY_TIMEOUT` | `OMNIHEDRON_QUERY_TIMEOUT` | Query timeout (ms) |
+| `SUBQL_QUERY_MAX_CONNECTION` | `OMNIHEDRON_MAX_CONNECTION` | Pool size |
+| `SUBQL_QUERY_INDEXER` | `OMNIHEDRON_INDEXER` | Indexer URL |
+| N/A | `OMNIHEDRON_METRICS` | Prometheus metrics |
+| N/A | `OMNIHEDRON_QUERY_EXPLAIN` | SQL EXPLAIN logging |
+| N/A | `OMNIHEDRON_DISABLE_HOT_SCHEMA` | Disable hot reload |
+| N/A | `OMNIHEDRON_PG_CA` | PostgreSQL CA cert path |
+| N/A | `OMNIHEDRON_PG_KEY` | PostgreSQL client key path |
+| N/A | `OMNIHEDRON_PG_CERT` | PostgreSQL client cert path |
+| N/A | `OMNIHEDRON_LOG_PATH` | Log file path |
+| N/A | `OMNIHEDRON_LOG_ROTATE` | Log rotation |
+| N/A | `OMNIHEDRON_OUTPUT_FMT` | Output format (`json`/`colored`) |
+| N/A | `OMNIHEDRON_LOG_LEVEL` | Log level |
+| N/A | `TOKIO_WORKER_THREADS` | Tokio worker thread count (see Performance tips) |
+
+### Performance tip: Tokio worker threads
+
+Tokio defaults to one worker thread per CPU core. On many-core machines this inflates memory from thread stacks (128 cores x 2 MB = 256 MB idle). For a PostgreSQL-bound service with a pool of 10 connections, 8-16 worker threads is optimal:
+
+```bash
+TOKIO_WORKER_THREADS=8
+```
+
+---
+
+## 8. Docker migration
+
+### Before: @subql/query
+
+```yaml
+services:
+  subql-query:
+    image: subquerynetwork/subql-query:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+    ports:
+      - "3000:3000"
+    command: ["--name", "my_project", "--port", "3000", "--unsafe"]
+```
+
+### After: omnihedron
+
+```yaml
+services:
+  omnihedron:
+    image: polytopelabs/omnihedron:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+      OMNIHEDRON_LOG_LEVEL: info
+      # Optional: limit worker threads on many-core machines
+      # TOKIO_WORKER_THREADS: "8"
+    ports:
+      - "3000:3000"
+    command: ["--name", "my_project", "--port", "3000", "--unsafe-mode"]
+    restart: unless-stopped
+```
+
+### Key changes in docker-compose.yml
+
+1. **Image:** `subquerynetwork/subql-query:latest` -> `polytopelabs/omnihedron:latest`
+2. **`--unsafe`** -> **`--unsafe-mode`** (the only renamed flag)
+3. **DB env vars** stay the same (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_DATABASE`)
+4. **Optional:** Add `OMNIHEDRON_LOG_LEVEL`, `OMNIHEDRON_METRICS`, `TOKIO_WORKER_THREADS`
+
+### Building from source with Docker
+
+```yaml
+services:
+  omnihedron:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+    ports:
+      - "3000:3000"
+    command: ["--name", "my_project", "--port", "3000", "--unsafe-mode"]
+```
+
+---
+
+## 9. Testing the migration — side-by-side comparison
+
+The recommended approach is to run both services in parallel and compare responses before cutting over.
+
+### Step 1: Run both services
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: indexer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+
+  subql-query-ts:
+    image: subquerynetwork/subql-query:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+    ports:
+      - "3001:3001"
+    command: ["--name", "my_project", "--port", "3001", "--unsafe"]
+
+  omnihedron:
+    image: polytopelabs/omnihedron:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_DATABASE: indexer
+    ports:
+      - "3000:3000"
+    command: ["--name", "my_project", "--port", "3000", "--unsafe-mode"]
+```
+
+### Step 2: Compare responses
+
+```bash
+# Query both services with the same request and diff the output
+QUERY='{"query": "{ transfers(first: 5, orderBy: [ID_ASC]) { nodes { id blockNumber } } }"}'
+
+TS_RESP=$(curl -s http://localhost:3001 -H "Content-Type: application/json" -d "$QUERY")
+RS_RESP=$(curl -s http://localhost:3000 -H "Content-Type: application/json" -d "$QUERY")
+
+# Compare (should be identical)
+diff <(echo "$TS_RESP" | jq -S .) <(echo "$RS_RESP" | jq -S .)
+```
+
+### Step 3: Compare schema introspection
+
+```bash
+INTROSPECTION='{"query": "{ __schema { types { name fields { name type { name kind ofType { name } } } } } }"}'
+
+TS_TYPES=$(curl -s http://localhost:3001 -H "Content-Type: application/json" -d "$INTROSPECTION" | jq -S '.data.__schema.types | sort_by(.name)')
+RS_TYPES=$(curl -s http://localhost:3000 -H "Content-Type: application/json" -d "$INTROSPECTION" | jq -S '.data.__schema.types | sort_by(.name)')
+
+diff <(echo "$TS_TYPES") <(echo "$RS_TYPES")
+```
+
+Note: Some PostGraphile-internal types (e.g., `Having*`, `*AggregatesFilter`) will be absent from the omnihedron schema. Filter these from the diff if needed.
+
+### Step 4: Run the omnihedron integration tests
+
+The project includes 62 integration tests that verify correctness:
+
+```bash
+# Clone the omnihedron repo and run its test suite against your database
+git clone https://github.com/polytope-labs/omnihedron.git
+cd omnihedron
+cargo test
+```
+
+---
+
+## 10. Troubleshooting
+
+### "Unknown flag `--unsafe`"
+
+omnihedron renamed `--unsafe` to `--unsafe-mode`. Update your command or set `OMNIHEDRON_UNSAFE=true`.
+
+### Schema types are missing or different
+
+1. Verify both services connect to the same PostgreSQL schema:
+   ```bash
+   curl http://localhost:3000/health | jq .
+   ```
+2. Check that the `--name` flag matches your PostgreSQL schema name exactly.
+3. If using hot reload, wait a few seconds for the schema to refresh, or restart omnihedron.
+
+### Queries return fewer/more results than expected
+
+- Check `--query-limit` (default: 100). If you were previously using `--unsafe` with no limit, set `--unsafe-mode` on omnihedron or specify an explicit `--query-limit`.
+- Ensure `first`/`last`/`offset` arguments in your queries match expectations. omnihedron clamps negative values to zero and treats `first: 0` as unset (same as TypeScript).
+
+### `aggregates { count }` works on omnihedron but fails on TypeScript
+
+This is expected. omnihedron adds a `count` field to `{Entity}Aggregates` that PostGraphile does not expose. If you need to work with both services, use `totalCount` on the connection instead.
+
+### Connection pool exhaustion
+
+omnihedron defaults to a pool of 10 connections (`--max-connection 10`). Under very high load, increase this value. Also consider setting `TOKIO_WORKER_THREADS` to match your pool size (8-16 is optimal for most deployments).
+
+### High memory usage on many-core machines
+
+Tokio defaults to one worker thread per CPU core. Each thread allocates up to 2 MB of stack. On a 128-core machine, this alone accounts for ~256 MB of idle memory. Set `TOKIO_WORKER_THREADS=8` (or 16) to reduce this.
+
+### Query timeout errors
+
+omnihedron enforces timeouts via PostgreSQL's `statement_timeout` (default: 10,000 ms). If you see `canceling statement due to statement timeout` errors:
+
+```bash
+# Increase to 30 seconds
+omnihedron --name my_project --query-timeout 30000
+```
+
+### WebSocket subscriptions not working
+
+Ensure `--subscription` is passed (it is off by default). The WebSocket endpoint is at `/ws`:
+
+```
+ws://localhost:3000/ws
+```
+
+### Log output is hard to read
+
+Switch to structured JSON logging for production:
+
+```bash
+omnihedron --output-fmt json --log-level info
+```
+
+Or write to a file with rotation:
+
+```bash
+omnihedron --log-path /var/log/omnihedron.log --log-rotate
+```
+
+### PostgreSQL TLS connection errors
+
+If your database requires TLS, provide the certificate paths:
+
+```bash
+omnihedron --name my_project \
+  --pg-ca /path/to/ca.crt \
+  --pg-key /path/to/client.key \
+  --pg-cert /path/to/client.crt
+```
+
+### Debugging query performance
+
+Enable SQL EXPLAIN logging to identify slow queries:
+
+```bash
+omnihedron --name my_project --query-explain --log-level trace
+```
+
+Enable Prometheus metrics for ongoing monitoring:
+
+```bash
+omnihedron --name my_project --metrics
+# Then scrape http://localhost:3000/metrics
+```

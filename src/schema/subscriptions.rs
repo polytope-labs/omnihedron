@@ -299,8 +299,10 @@ async fn fetch_entity(
 	table: &str,
 	id: &str,
 ) -> anyhow::Result<Option<Value>> {
-	let client = pool.get().await?;
+	let client = crate::db::checkout(pool).await?;
 	let sql = format!(r#"SELECT * FROM "{schema}"."{table}" WHERE id = $1 LIMIT 1"#);
+	let start = std::time::Instant::now();
 	let rows = client.query(&sql, &[&id]).await?;
+	crate::metrics::record_sql_query("select", start.elapsed().as_secs_f64());
 	Ok(rows.first().map(row_to_json))
 }

@@ -21,11 +21,10 @@
 //! SQL query, executing it, and assembling the `{Entity}Connection` response
 //! (nodes, edges, pageInfo, totalCount).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_graphql::dynamic::ResolverContext;
 use bytes::BytesMut;
-use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type};
 use tracing::trace;
@@ -46,12 +45,12 @@ use crate::{
 /// Accepts a [`FilterContext`] for relation-aware filtering (exists, forward, some/none/every).
 pub async fn resolve_connection_ctx(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	table: &str,
 	cfg: &Config,
 	is_historical: bool,
 	columns: &[String],
 	filter_ctx: &crate::sql::filter::FilterContext,
+	fk_field_to_col: &HashMap<String, String>,
 ) -> async_graphql::Result<Option<Value>> {
 	// ── Extract arguments ─────────────────────────────────────────────────────
 	// Match TS: first/last of 0 is treated as "not specified" (JS falsy: !0 === true).
@@ -208,7 +207,10 @@ pub async fn resolve_connection_ctx(
 		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{table}" AS t {where_clause}"#);
 
 	// ── Execute ───────────────────────────────────────────────────────────────
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?
+		.clone();
 
 	let pg_params = json_to_pg_params(&params);
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
@@ -220,12 +222,18 @@ pub async fn resolve_connection_ctx(
 
 	let (rows, total) = if !needs_rows {
 		trace!(count_sql = %count_sql, "Executing count-only query");
-		let row = client.query_one(&count_sql, &pg_refs).await?;
+		let row = req_client.query_one(&count_sql, &pg_refs).await?;
 		(vec![], row.get::<_, i64>("total"))
 	} else {
 		// Build a selective column list from the GraphQL lookahead.
-		let select_cols =
-			build_select_cols(ctx, columns, &order_cols, &distinct_cols, is_historical);
+		let select_cols = build_select_cols(
+			ctx,
+			columns,
+			&order_cols,
+			&distinct_cols,
+			is_historical,
+			fk_field_to_col,
+		);
 
 		// For non-DISTINCT queries embed COUNT(*) OVER() to get the total in a
 		// single round-trip. For DISTINCT queries the window function fires before
@@ -253,16 +261,13 @@ pub async fn resolve_connection_ctx(
 		};
 
 		trace!(sql = %sql, "Executing connection query");
-		if cfg.query_explain {
-			run_explain(&client, &sql, &pg_refs).await;
-		}
-		let rows = client.query(&sql, &pg_refs).await?;
+		let rows = req_client.query(&sql, &pg_refs).await?;
 		let total = if use_window_count {
 			rows.first()
 				.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
 				.unwrap_or(0)
 		} else {
-			let total_row = client.query_one(&count_sql, &pg_refs).await?;
+			let total_row = req_client.query_one(&count_sql, &pg_refs).await?;
 			total_row.get("total")
 		};
 		(rows, total)
@@ -370,6 +375,7 @@ fn build_select_cols(
 	order_cols: &[String],
 	distinct_cols: &[String],
 	is_historical: bool,
+	fk_field_to_col: &HashMap<String, String>,
 ) -> String {
 	let mut requested: HashSet<String> = HashSet::new();
 
@@ -379,14 +385,24 @@ fn build_select_cols(
 			"nodes" => {
 				// nodes { id chain blockNumber … }
 				for child in top.selection_set() {
-					requested.insert(child.name().to_string());
+					let name = child.name().to_string();
+					// If this field is a forward relation, include the FK column
+					// so the relation resolver can read it from the row data.
+					if let Some(fk_col) = fk_field_to_col.get(&name) {
+						requested.insert(to_camel_case(fk_col));
+					}
+					requested.insert(name);
 				}
 			},
 			"edges" => {
 				// edges { node { id chain … } }
 				for node_field in top.selection_set().filter(|f| f.name() == "node") {
 					for child in node_field.selection_set() {
-						requested.insert(child.name().to_string());
+						let name = child.name().to_string();
+						if let Some(fk_col) = fk_field_to_col.get(&name) {
+							requested.insert(to_camel_case(fk_col));
+						}
+						requested.insert(name);
 					}
 				}
 			},
@@ -1253,22 +1269,4 @@ pub fn json_to_pg_params(params: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> 
 			}
 		})
 		.collect()
-}
-
-/// Execute `EXPLAIN` on a query and log the plan at INFO level.
-pub async fn run_explain(
-	client: &deadpool_postgres::Object,
-	sql: &str,
-	params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-) {
-	let explain_sql = format!("EXPLAIN {sql}");
-	match client.query(&explain_sql, params).await {
-		Ok(rows) => {
-			let plan: Vec<String> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
-			tracing::info!(sql = %sql, plan = %plan.join("\n"), "EXPLAIN");
-		},
-		Err(e) => {
-			tracing::warn!(error = %e, sql = %sql, "EXPLAIN failed");
-		},
-	}
 }

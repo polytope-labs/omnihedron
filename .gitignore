@@ -2,3 +2,6 @@
 
 .env
 .env.*
+.next/
+node_modules/
+docs/out/

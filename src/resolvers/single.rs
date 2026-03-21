@@ -20,7 +20,6 @@
 //!   the PostGraphile-compatible base64 nodeId before performing the lookup.
 
 use async_graphql::dynamic::ResolverContext;
-use deadpool_postgres::Pool;
 use serde_json::Value;
 use tokio_postgres::types::ToSql;
 use tracing::trace;
@@ -32,7 +31,6 @@ use crate::{config::Config, resolvers::connection::row_to_json, schema::cursor::
 /// `ctx.parent_value.try_downcast_ref::<serde_json::Value>()`.
 pub async fn resolve_single(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	table: &str,
 	cfg: &Config,
 ) -> async_graphql::Result<Option<Value>> {
@@ -48,12 +46,14 @@ pub async fn resolve_single(
 
 	trace!(sql = %sql, "Executing single query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(id)];
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await?;
 	if rows.is_empty() {
 		return Ok(None);
 	}
@@ -67,7 +67,6 @@ pub async fn resolve_single(
 /// and performs a lookup by the internal `_id` UUID column.
 pub async fn resolve_by_node_id(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	table: &str,
 	cfg: &Config,
 ) -> async_graphql::Result<Option<Value>> {
@@ -94,12 +93,14 @@ pub async fn resolve_by_node_id(
 
 	trace!(sql = %sql, "Executing byNodeId query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(pk_str)];
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await?;
 	if rows.is_empty() {
 		return Ok(None);
 	}

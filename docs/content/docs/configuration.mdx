@@ -1,0 +1,67 @@
+---
+title: Configuration
+description: CLI flags, environment variables, and database settings
+---
+
+All CLI flags accept environment variables with the `OMNIHEDRON_` prefix.
+
+## CLI flags
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--name` / `-n` | `OMNIHEDRON_NAME` | required | PostgreSQL schema name |
+| `--port` / `-p` | `OMNIHEDRON_PORT` | `3000` | HTTP port |
+| `--playground` | `OMNIHEDRON_PLAYGROUND` | off | Enable GraphiQL UI |
+| `--subscription` | `OMNIHEDRON_SUBSCRIPTION` | off | Enable WebSocket subscriptions |
+| `--aggregate` | `OMNIHEDRON_AGGREGATE` | on | Enable aggregation queries |
+| `--unsafe-mode` | `OMNIHEDRON_UNSAFE` | off | Disable all query limits |
+| `--query-limit` | `OMNIHEDRON_QUERY_LIMIT` | `100` | Max records per query |
+| `--query-timeout` | `OMNIHEDRON_QUERY_TIMEOUT` | `10000` | Query timeout in ms |
+| `--max-connection` | `OMNIHEDRON_MAX_CONNECTION` | `10` | PostgreSQL pool size |
+| `--disable-hot-schema` | `OMNIHEDRON_DISABLE_HOT_SCHEMA` | off | Disable schema hot reload |
+| `--log-level` | `OMNIHEDRON_LOG_LEVEL` | `info` | `fatal\|error\|warn\|info\|debug\|trace` |
+| `--output-fmt` | `OMNIHEDRON_OUTPUT_FMT` | `colored` | `json\|colored` |
+| `--query-explain` | — | off | Log SQL EXPLAIN output |
+| `--indexer` | — | — | Metadata HTTP fallback URL |
+
+## Database environment variables
+
+| Variable | Description |
+|---|---|
+| `DB_HOST` | PostgreSQL host |
+| `DB_PORT` | PostgreSQL port |
+| `DB_USER` | Database user |
+| `DB_PASS` | Database password |
+| `DB_DATABASE` | Database name |
+| `DB_HOST_READ` | Read replica host (optional) |
+
+## Runtime tuning
+
+### Tokio worker threads
+
+```bash
+TOKIO_WORKER_THREADS=8
+```
+
+Tokio defaults to one thread per CPU core. On a 128-core machine that's 256MB of idle thread stacks (128 cores × 2MB). For a PostgreSQL-bound service with a pool of 10 connections, **8–16 threads** is optimal.
+
+### Logging
+
+```bash
+# Use RUST_LOG for fine-grained control
+RUST_LOG=omnihedron=debug,tokio_postgres=warn
+```
+
+## Example
+
+```bash
+omnihedron \
+  --name app \
+  --port 3000 \
+  --max-connection 15 \
+  --query-limit 200 \
+  --query-timeout 15000 \
+  --log-level debug \
+  --aggregate \
+  --playground
+```

@@ -78,7 +78,7 @@ pub fn build_schema(
 
 	// ── Per-entity types ─────────────────────────────────────────────────────
 	for table in tables {
-		builder = register_table_types(table, tables, builder, pool.clone(), cfg.clone());
+		builder = register_table_types(table, tables, builder, cfg.clone());
 	}
 
 	// ── Root Query type ───────────────────────────────────────────────────────
@@ -102,7 +102,6 @@ pub fn build_schema(
 		let filter_type = format!("{type_name}Filter");
 		let orderby_enum = format!("{plural_type_name}OrderBy");
 		let distinct_enum = format!("{}_distinct_enum", &table.name);
-		let pool_clone = pool.clone();
 		let cfg_clone = cfg.clone();
 		let is_historical = table.is_historical;
 		let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
@@ -111,28 +110,36 @@ pub fn build_schema(
 		let filter_ctx = build_filter_context(table, tables, &cfg.name);
 		let filter_ctx = Arc::new(filter_ctx);
 
+		// Build FK field → column map for selective SELECT (forward relations)
+		let fk_field_to_col: std::collections::HashMap<String, String> = table
+			.foreign_keys
+			.iter()
+			.map(|fk| (forward_relation_field(&fk.column), fk.column.clone()))
+			.collect();
+		let fk_field_to_col = Arc::new(fk_field_to_col);
+
 		// Connection (list) query
 		let mut conn_field = Field::new(&connection_field, TypeRef::named_nn(&connection_type), {
-			let pool = pool_clone.clone();
 			let table_name = table.name.clone();
 			let cfg = cfg_clone.clone();
 			let col_names = col_names.clone();
 			let filter_ctx = filter_ctx.clone();
+			let fk_map = fk_field_to_col.clone();
 			move |ctx| {
-				let pool = pool.clone();
 				let table_name = table_name.clone();
 				let cfg = cfg.clone();
 				let col_names = col_names.clone();
 				let filter_ctx = filter_ctx.clone();
+				let fk_map = fk_map.clone();
 				FieldFuture::new(async move {
 					let maybe = resolvers::connection::resolve_connection_ctx(
 						&ctx,
-						&pool,
 						&table_name,
 						&cfg,
 						is_historical,
 						&col_names,
 						&filter_ctx,
+						&fk_map,
 					)
 					.await?;
 					Ok(maybe.map(FieldValue::owned_any))
@@ -157,17 +164,14 @@ pub fn build_schema(
 		query = query.field(conn_field);
 
 		// Single-record query
-		let pool_clone2 = pool.clone();
 		let table_name2 = table.name.clone();
 		let cfg_clone2 = cfg.clone();
 		query = query.field(
 			Field::new(&single_field, TypeRef::named(&type_name), move |ctx| {
-				let pool = pool_clone2.clone();
 				let table_name = table_name2.clone();
 				let cfg = cfg_clone2.clone();
 				FieldFuture::new(async move {
-					let maybe =
-						resolvers::single::resolve_single(&ctx, &pool, &table_name, &cfg).await?;
+					let maybe = resolvers::single::resolve_single(&ctx, &table_name, &cfg).await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			})
@@ -176,18 +180,15 @@ pub fn build_schema(
 
 		// {entity}ByNodeId query
 		let by_node_id_field = format!("{single_field}ByNodeId");
-		let pool_clone3 = pool.clone();
 		let table_name3 = table.name.clone();
 		let cfg_clone3 = cfg.clone();
 		query = query.field(
 			Field::new(&by_node_id_field, TypeRef::named(&type_name), move |ctx| {
-				let pool = pool_clone3.clone();
 				let table_name = table_name3.clone();
 				let cfg = cfg_clone3.clone();
 				FieldFuture::new(async move {
 					let maybe =
-						resolvers::single::resolve_by_node_id(&ctx, &pool, &table_name, &cfg)
-							.await?;
+						resolvers::single::resolve_by_node_id(&ctx, &table_name, &cfg).await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			})
@@ -223,12 +224,10 @@ pub fn build_schema(
 	// table_name → GraphQL TypeName, fetches by _id, and returns with the
 	// concrete type so inline fragments (`... on AssetTeleported { id }`) work.
 	{
-		let pool_node = pool.clone();
 		let cfg_node = cfg.clone();
 		let table_to_type_node = table_to_type.clone();
 		query = query.field(
 			Field::new("node", TypeRef::named("Node"), move |ctx| {
-				let pool = pool_node.clone();
 				let cfg = cfg_node.clone();
 				let table_to_type = table_to_type_node.clone();
 				FieldFuture::new(async move {
@@ -255,12 +254,15 @@ pub fn build_schema(
 					let sql = format!(
 						r#"SELECT * FROM "{schema}"."{table_name}" AS t WHERE t."_id"::text = $1 LIMIT 1"#
 					);
-					let client = pool.get().await?;
+					let req_client =
+						ctx.data::<std::sync::Arc<crate::db::RequestClient>>().map_err(|_| {
+							async_graphql::Error::new("Missing RequestClient in context")
+						})?;
 					use tokio_postgres::types::ToSql;
 					let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(pk_str)];
 					let pg_refs: Vec<&(dyn ToSql + Sync)> =
 						params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
-					let rows = client.query(&sql, &pg_refs).await?;
+					let rows = req_client.query(&sql, &pg_refs).await?;
 					if rows.is_empty() {
 						return Ok(None);
 					}
@@ -275,28 +277,24 @@ pub fn build_schema(
 
 	// ── _metadata queries ─────────────────────────────────────────────────────
 	{
-		let pool_m = pool.clone();
 		let cfg_m = cfg.clone();
 		query = query.field(
 			Field::new("_metadata", TypeRef::named("_Metadata"), move |ctx| {
-				let pool = pool_m.clone();
 				let cfg = cfg_m.clone();
 				FieldFuture::new(async move {
-					let maybe = resolvers::metadata::resolve_metadata(&ctx, &pool, &cfg).await?;
+					let maybe = resolvers::metadata::resolve_metadata(&ctx, &cfg).await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			})
 			.argument(InputValue::new("chainId", TypeRef::named(TypeRef::STRING))),
 		);
 
-		let pool_m2 = pool.clone();
 		let cfg_m2 = cfg.clone();
 		query = query.field(
 			Field::new("_metadatas", TypeRef::named_nn("_Metadatas"), move |ctx| {
-				let pool = pool_m2.clone();
 				let cfg = cfg_m2.clone();
 				FieldFuture::new(async move {
-					let maybe = resolvers::metadata::resolve_metadatas(&ctx, &pool, &cfg).await?;
+					let maybe = resolvers::metadata::resolve_metadatas(&ctx, &cfg).await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			})
@@ -316,17 +314,14 @@ pub fn build_schema(
 		let plural_type_name = table_to_plural_type_name(&search_fn.returns_table);
 		let connection_type = format!("{plural_type_name}Connection");
 		let pg_func = search_fn.pg_name.clone();
-		let pool_s = pool.clone();
 		let cfg_s = cfg.clone();
 
 		query = query.field(
 			Field::new(&search_fn.graphql_name, TypeRef::named_nn(&connection_type), move |ctx| {
-				let pool = pool_s.clone();
 				let cfg = cfg_s.clone();
 				let pg_func = pg_func.clone();
 				FieldFuture::new(async move {
-					let maybe =
-						resolvers::search::resolve_search(&ctx, &pool, &pg_func, &cfg).await?;
+					let maybe = resolvers::search::resolve_search(&ctx, &pg_func, &cfg).await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			})
@@ -439,7 +434,6 @@ fn register_table_types(
 	table: &TableInfo,
 	all_tables: &[TableInfo],
 	mut builder: SchemaBuilder,
-	pool: Arc<Pool>,
 	cfg: Arc<Config>,
 ) -> SchemaBuilder {
 	let type_name = table_to_type_name(&table.name);
@@ -521,27 +515,26 @@ fn register_table_types(
 		let field_name = forward_relation_field(&fk.column); // e.g. author (from author_id)
 		let fk_col = fk.column.clone();
 		let foreign_table = fk.foreign_table.clone();
-		let pool_clone = pool.clone();
 		// Determine whether the related table is historical so the resolver can
 		// apply `_block_range` filtering when a blockHeight is inherited.
-		let foreign_is_historical = all_tables
-			.iter()
-			.find(|t| t.name == fk.foreign_table)
-			.map(|t| t.is_historical)
-			.unwrap_or(false);
+		let foreign_info = all_tables.iter().find(|t| t.name == fk.foreign_table);
+		let foreign_is_historical = foreign_info.map(|t| t.is_historical).unwrap_or(false);
+		let foreign_columns: Vec<String> = foreign_info
+			.map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+			.unwrap_or_default();
 
 		entity_obj =
 			entity_obj.field(Field::new(field_name, TypeRef::named(&related_type), move |ctx| {
-				let pool = pool_clone.clone();
 				let fk_col = fk_col.clone();
 				let foreign_table = foreign_table.clone();
+				let foreign_columns = foreign_columns.clone();
 				FieldFuture::new(async move {
 					let maybe = resolvers::relations::resolve_forward_relation(
 						&ctx,
-						&pool,
 						&foreign_table,
 						&fk_col,
 						foreign_is_historical,
+						&foreign_columns,
 					)
 					.await?;
 					Ok(maybe.map(FieldValue::owned_any))
@@ -558,7 +551,6 @@ fn register_table_types(
 				let default_field_name = backward_relation_field(&other_table.name, &fk.column);
 				let child_table = other_table.name.clone();
 				let fk_col = fk.column.clone();
-				let pool_clone = pool.clone();
 				let cfg_clone = cfg.clone();
 				let child_is_historical = other_table.is_historical;
 
@@ -578,13 +570,11 @@ fn register_table_types(
 						field_name,
 						TypeRef::named(&child_type_name),
 						move |ctx| {
-							let pool = pool_clone.clone();
 							let child_table = child_table.clone();
 							let fk_col = fk_col.clone();
 							FieldFuture::new(async move {
 								let maybe = resolvers::relations::resolve_backward_single(
 									&ctx,
-									&pool,
 									&child_table,
 									&fk_col,
 									child_is_historical,
@@ -607,14 +597,12 @@ fn register_table_types(
 
 					entity_obj = entity_obj.field(
 						Field::new(field_name, TypeRef::named_nn(&child_conn_type), move |ctx| {
-							let pool = pool_clone.clone();
 							let child_table = child_table.clone();
 							let fk_col = fk_col.clone();
 							let cfg = cfg_clone.clone();
 							FieldFuture::new(async move {
 								let maybe = resolvers::relations::resolve_backward_relation(
 									&ctx,
-									&pool,
 									&child_table,
 									&fk_col,
 									child_is_historical,
@@ -665,12 +653,10 @@ fn register_table_types(
 			let fk_to_source = fk.column.clone();
 			let fk_to_target = other_fk.column.clone();
 			let target_table = other_fk.foreign_table.clone();
-			let pool_clone = pool.clone();
 			let cfg_clone = cfg.clone();
 
 			entity_obj = entity_obj.field(
 				Field::new(&field_name, TypeRef::named_nn(&target_conn), move |ctx| {
-					let pool = pool_clone.clone();
 					let junction = junction_name.clone();
 					let fk_src = fk_to_source.clone();
 					let fk_tgt = fk_to_target.clone();
@@ -678,7 +664,7 @@ fn register_table_types(
 					let cfg = cfg_clone.clone();
 					FieldFuture::new(async move {
 						let maybe = resolvers::relations::resolve_many_to_many(
-							&ctx, &pool, &junction, &fk_src, &fk_tgt, &target, &cfg,
+							&ctx, &junction, &fk_src, &fk_tgt, &target, &cfg,
 						)
 						.await?;
 						Ok(maybe.map(FieldValue::owned_any))
@@ -758,16 +744,13 @@ fn register_table_types(
 		let numeric_cols_gagg = numeric_cols.clone();
 		let all_cols_gagg = all_cols.clone();
 
-		let pool_agg = pool.clone();
 		conn_obj =
 			conn_obj.field(Field::new("aggregates", TypeRef::named(&agg_type_name), move |ctx| {
-				let pool = pool_agg.clone();
 				let num_cols = numeric_cols.clone();
 				let all = all_cols.clone();
 				FieldFuture::new(async move {
 					let maybe =
-						resolvers::aggregates::resolve_aggregates(&ctx, &pool, &num_cols, &all)
-							.await?;
+						resolvers::aggregates::resolve_aggregates(&ctx, &num_cols, &all).await?;
 					Ok(maybe.map(FieldValue::owned_any))
 				})
 			}));
@@ -776,18 +759,16 @@ fn register_table_types(
 			register_grouped_aggregate_types(table, builder);
 		builder = new_builder;
 
-		let pool_gagg = pool.clone();
 		conn_obj = conn_obj.field(
 			Field::new(
 				"groupedAggregates",
 				TypeRef::named_nn_list(&agg_group_type_name),
 				move |ctx| {
-					let pool = pool_gagg.clone();
 					let num_cols = numeric_cols_gagg.clone();
 					let all = all_cols_gagg.clone();
 					FieldFuture::new(async move {
 						let maybe = resolvers::aggregates::resolve_grouped_aggregates(
-							&ctx, &pool, &num_cols, &all,
+							&ctx, &num_cols, &all,
 						)
 						.await?;
 						match maybe {

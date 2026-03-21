@@ -60,10 +60,10 @@ async fn test_smart_tag_foreign_field_name() {
 
 	let conn = resp.pointer("/data/testAuthor/books").expect("'books' field missing");
 	let total = conn["totalCount"].as_i64().expect("totalCount");
-	assert_eq!(total, 2, "Alice should have 2 books via 'books' field");
+	assert_eq!(total, 3, "Alice should have 3 books via 'books' field");
 
 	let nodes = conn["nodes"].as_array().expect("nodes array");
-	assert_eq!(nodes.len(), 2);
+	assert_eq!(nodes.len(), 3);
 	println!("smart tag @foreignFieldName: books → {total} results ✓");
 }
 

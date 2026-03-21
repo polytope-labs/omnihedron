@@ -1,0 +1,141 @@
+---
+title: How It Works
+description: A walkthrough of omnihedron's architecture from startup to query execution
+---
+
+## The big picture
+
+Omnihedron is a **translator** between GraphQL and SQL:
+
+```
+Client speaks GraphQL  →  omnihedron translates  →  PostgreSQL speaks SQL
+         ←  omnihedron translates back  ←
+```
+
+The translation rules are auto-generated from the database structure itself. There's no hand-written GraphQL schema.
+
+## Startup flow
+
+When you run `omnihedron --name app --port 3000`:
+
+### 1. Parse configuration
+
+CLI flags and environment variables are parsed via `clap` into a `Config` struct (`src/config.rs`). Every flag has an `OMNIHEDRON_*` env var equivalent.
+
+### 2. Connect to PostgreSQL
+
+A connection pool is created using `deadpool-postgres` (`src/db/pool.rs`). Each pooled connection has `statement_timeout` set to enforce query timeouts at the database level.
+
+If `DB_HOST_READ` is set, a separate read-only pool is created for query traffic.
+
+### 3. Detect historical mode
+
+Omnihedron queries the `_metadata` table:
+
+```sql
+SELECT value FROM "{schema}"."_metadata"
+WHERE key = 'historicalStateEnabled' LIMIT 1
+```
+
+If the value is `"timestamp"`, the GraphQL argument on historical tables is named `timestamp`. Otherwise it defaults to `blockHeight`. This is purely an API-level distinction — the underlying SQL is identical for both modes.
+
+### 4. Introspect the database
+
+This is omnihedron asking PostgreSQL: "What tables, columns, types, and relationships do you have?"
+
+Queries run against `information_schema` and `pg_catalog` to discover:
+
+- **Tables** in the target schema
+- **Columns** with their PostgreSQL types (mapped to GraphQL scalars)
+- **Primary keys** and **unique constraints**
+- **Foreign keys** (relationships between tables)
+- **Enum types** and their values
+- **Historical tables** (detected by the presence of a `_block_range` column)
+
+The result is a list of `TableInfo` structs — a Rust representation of your database schema. This lives in `src/introspection/`.
+
+### 5. Build the GraphQL schema
+
+The `TableInfo` list is fed into `src/schema/builder.rs`, which constructs a full `async-graphql` dynamic schema. For every table, it creates:
+
+- Object types with fields for each column
+- `nodeId` computed fields
+- Connection types with pagination (`first`, `last`, `after`, `before`, `offset`)
+- Filter input types with per-column operators
+- OrderBy enums
+- Forward and backward relation fields
+- Aggregate types (if `--aggregate` is enabled)
+- `_metadata` and `_metadatas` queries
+
+See [Schema Generation](/docs/schema-generation) for details.
+
+### 6. Start the HTTP server
+
+An `axum` server starts with:
+
+- `POST /` — GraphQL endpoint (single queries and batch arrays)
+- `GET /health` — health check
+- Optional GraphiQL playground (if `--playground` is set)
+
+### 7. Listen for schema changes
+
+Unless `--disable-hot-schema` is set, a background task opens a dedicated PostgreSQL connection and runs `LISTEN` on the SubQuery schema channel. When a `schema_updated` notification arrives:
+
+1. Introspection reruns
+2. A new schema is built
+3. The schema is atomically swapped behind an `Arc<RwLock<Schema>>`
+
+In-flight requests continue with the old schema. New requests pick up the new one. Zero downtime.
+
+## Query execution flow
+
+When a GraphQL query arrives:
+
+```graphql
+{
+  transfers(first: 5, filter: { chain: { equalTo: "KUSAMA" } }) {
+    totalCount
+    nodes {
+      id
+      amount
+      chain
+    }
+  }
+}
+```
+
+### 1. Parse and validate
+
+`async-graphql` parses the query, validates it against the schema, and routes it to the appropriate resolver.
+
+### 2. Determine selected columns
+
+The connection resolver inspects the GraphQL selection set using `ctx.field().selection_set()`. It drills into `nodes { ... }` and `edges { node { ... } }` to find which entity fields the client actually requested. Only those columns appear in the SQL `SELECT` clause.
+
+### 3. Build the SQL query
+
+The resolver constructs a parameterised SQL query:
+
+```sql
+SELECT t."id", t."amount", t."chain", COUNT(*) OVER() AS __total_count
+FROM "app"."transfers" AS t
+WHERE t."chain" = $1
+ORDER BY t."id" ASC
+LIMIT 5
+```
+
+Key details:
+
+- **Parameterised** — user values use `$N` placeholders, never string interpolation
+- **`COUNT(*) OVER()`** — total count and rows in a single round-trip
+- **Only requested columns** — if you didn't ask for `amount`, it's not in the SELECT
+
+### 4. Execute and respond
+
+The query runs against the connection pool. Results are mapped back to GraphQL types (with cursor encoding, `nodeId` generation, etc.) and returned as JSON.
+
+### Optimisations
+
+- **Count-only fast-path** — if the query has no `nodes`/`edges` selection, the row fetch is skipped entirely
+- **`TextParam` wrapper** — numeric and array values are sent as PostgreSQL text-format parameters to avoid OID mismatch errors
+- **Selective aggregates** — only requested aggregate functions (sum, avg, etc.) appear in the SQL

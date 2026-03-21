@@ -20,11 +20,14 @@
 //! `--indexer` URL is configured, additional fields are fetched from the
 //! indexer's HTTP API and merged into the response.
 
+use std::sync::Arc;
+
 use async_graphql::dynamic::ResolverContext;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
+
+use crate::{config::Config, db::RequestClient};
 
 fn base64_cursor(idx: usize) -> String {
 	BASE64.encode(format!("[{idx}]"))
@@ -49,8 +52,6 @@ fn try_reparse_json_string(v: Value) -> Value {
 	v
 }
 
-use crate::config::Config;
-
 /// Cached default metadata table name (no chainId).
 static DEFAULT_METADATA_TABLE: std::sync::OnceLock<tokio::sync::Mutex<Option<String>>> =
 	std::sync::OnceLock::new();
@@ -65,7 +66,7 @@ fn default_cache() -> &'static tokio::sync::Mutex<Option<String>> {
 ///   2. `_metadata_0x<hash>` matching the requested chainId
 ///   3. First `_metadata_0x<hash>` table found (fallback)
 async fn find_metadata_table(
-	client: &deadpool_postgres::Object,
+	client: &RequestClient,
 	schema: &str,
 	chain_id: Option<&str>,
 ) -> Option<String> {
@@ -124,11 +125,12 @@ async fn find_metadata_table(
 
 pub async fn resolve_metadata(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	cfg: &Config,
 ) -> async_graphql::Result<Option<Value>> {
 	let schema = &cfg.name;
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<Arc<RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 
 	// Extract optional chainId argument
 	let chain_id_owned: Option<String> = ctx
@@ -138,7 +140,7 @@ pub async fn resolve_metadata(
 		.filter(|s| !s.is_empty());
 	let chain_id = chain_id_owned.as_deref();
 
-	let table = find_metadata_table(&client, schema, chain_id).await;
+	let table = find_metadata_table(req_client, schema, chain_id).await;
 
 	let Some(table) = table else {
 		// No metadata table found – return an object with just the node version
@@ -150,7 +152,7 @@ pub async fn resolve_metadata(
 	debug!(table = %table, "Fetching metadata from table");
 
 	let sql = format!(r#"SELECT key, value FROM "{schema}"."{table}""#);
-	let rows = client.query(&sql, &[]).await.map_err(|e| {
+	let rows = req_client.query(&sql, &[]).await.map_err(|e| {
 		warn!(error = %e, table = %table, "Failed to query metadata table");
 		e
 	})?;
@@ -178,7 +180,7 @@ pub async fn resolve_metadata(
             SELECT table_name FROM information_schema.tables WHERE table_schema = $1
           )
     "#;
-	let est_rows = client.query(estimate_sql, &[&schema.as_str()]).await.unwrap_or_else(|e| {
+	let est_rows = req_client.query(estimate_sql, &[&schema.as_str()]).await.unwrap_or_else(|e| {
 		warn!(error = %e, "Failed to query row count estimates");
 		vec![]
 	});
@@ -193,7 +195,7 @@ pub async fn resolve_metadata(
 
 	// DB size
 	let size_sql = "SELECT pg_database_size(current_database()) AS db_size";
-	let db_size: i64 = match client.query_one(size_sql, &[]).await {
+	let db_size: i64 = match req_client.query_one(size_sql, &[]).await {
 		Ok(row) => row.try_get("db_size").unwrap_or(0),
 		Err(e) => {
 			warn!(error = %e, "Failed to query database size");
@@ -215,11 +217,12 @@ pub async fn resolve_metadata(
 
 pub async fn resolve_metadatas(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	cfg: &Config,
 ) -> async_graphql::Result<Option<Value>> {
 	let schema = &cfg.name;
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<Arc<RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 
 	// Find all metadata tables
 	let sql = "SELECT table_name FROM information_schema.tables \
@@ -227,7 +230,7 @@ pub async fn resolve_metadatas(
                  AND (table_name = '_metadata' OR table_name LIKE '_metadata_0x%' \
                       OR table_name LIKE '_multi_metadata_%') \
                ORDER BY table_name";
-	let table_rows = client.query(sql, &[&schema.as_str()]).await.map_err(|e| {
+	let table_rows = req_client.query(sql, &[&schema.as_str()]).await.map_err(|e| {
 		warn!(error = %e, "Failed to list metadata tables");
 		e
 	})?;
@@ -238,7 +241,7 @@ pub async fn resolve_metadatas(
 	let mut nodes: Vec<Value> = Vec::new();
 	for table in &metadata_tables {
 		let q = format!(r#"SELECT key, value FROM "{schema}"."{table}""#);
-		let rows = client.query(&q, &[]).await.unwrap_or_else(|e| {
+		let rows = req_client.query(&q, &[]).await.unwrap_or_else(|e| {
 			warn!(error = %e, table = %table, "Failed to query metadata table");
 			vec![]
 		});
@@ -256,7 +259,7 @@ pub async fn resolve_metadatas(
 
 	if nodes.is_empty() {
 		// Fallback: single resolved metadata
-		let meta = resolve_metadata(ctx, pool, cfg).await?;
+		let meta = resolve_metadata(ctx, cfg).await?;
 		if let Some(m) = meta {
 			nodes.push(m);
 		}

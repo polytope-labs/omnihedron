@@ -1,0 +1,123 @@
+---
+title: Changelog
+description: Release history and notable changes
+---
+
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.9.0] - 2026-03-19
+
+### Fixed
+
+- Comprehensive PostgreSQL type serialization -- PostGraphile-compatible GraphQL types for UUID, Time, Interval, Point, BitString, and InternetAddress; wire list filter types for array columns ([#9])
+
+## [0.8.0] - 2026-03-19
+
+### Fixed
+
+- NUMERIC columns returning null -- switched to `rust_decimal` for NUMERIC column deserialization; fixed BigFloat filter params ([#8])
+
+## [0.7.0] - 2026-03-19
+
+### Fixed
+
+- Synthetic foreign keys for historical tables -- create synthetic FKs from table comments so relations resolve correctly on `_block_range` tables ([#7])
+
+## [0.6.1] - 2026-03-19
+
+_No user-facing changes (tag co-located with v0.6.0)._
+
+## [0.6.0] - 2026-03-19
+
+### Added
+
+- Fulltext search support via `@fullText` directive -- `sanitize_tsquery` input sanitization, `ts_rank` ordering ([#6])
+
+### Fixed
+
+- Create synthetic FKs from table comments for historical tables
+- Read smart tags from table comments (historical mode)
+
+## [0.5.0] - 2026-03-19
+
+### Added
+
+- PostGraphile `@derivedFrom` smart tag support -- backward relation field names resolved via column and table comment smart tags ([#5])
+
+## [0.4.0] - 2026-03-19
+
+### Fixed
+
+- GraphiQL playground and route conflict on `/` -- playground now serves correctly alongside the GraphQL endpoint ([#4])
+
+## [0.3.0] - 2026-03-19
+
+### Changed
+
+- Serve GraphQL on `/` instead of `/graphql` to match PostGraphile routing ([#3])
+
+### Fixed
+
+- Use git tag for GitHub Release name instead of Cargo.toml version
+
+## [0.2.0] - 2026-03-19
+
+### Added
+
+- Order by related entity scalar fields -- `pg-order-by-related` parity with correlated subquery ORDER BY enum values ([#2])
+
+## [0.1.0] - 2026-03-19
+
+### Added
+
+- Initial Rust implementation of omnihedron ([#1])
+- Full dynamic GraphQL schema generation from PostgreSQL introspection
+- Connection queries with cursor-based and offset pagination
+- Filter input types with per-column operators (`equalTo`, `in`, `like`, `isNull`, logical `and`/`or`/`not`)
+- Forward and backward relation fields (FK resolution)
+- Relation filters (`some`/`none`/`every`, `Exists` boolean)
+- Aggregation queries (`sum`, `count`, `min`, `max`, `average`, `stddev`, `variance`)
+- Historical table support (`_block_range` detection, `blockHeight` argument)
+- `_metadata` and `_metadatas` multi-chain queries
+- `node(nodeId)` and `{entity}ByNodeId` root queries (Node interface)
+- Batch query support (POST with JSON array)
+- GraphQL subscriptions via WebSocket
+- Schema hot reload (LISTEN/NOTIFY with atomic `Arc<RwLock<Schema>>` swap)
+- Selective `SELECT` -- only columns referenced in the query are fetched
+- Count-only fast-path -- queries without `nodes`/`edges` skip row fetch
+- Window function `COUNT(*) OVER()` for single-roundtrip total count
+- Selective aggregate computation (only requested aggregates in SQL)
+- Query validation: complexity, depth, alias, and batch limits
+- Cache-Control headers (`public, max-age=5`)
+- HTTP request tracing with UUID request IDs
+- `DB_HOST_READ` read replica support
+- `--indexer` metadata HTTP fallback
+- `/health` endpoint
+- Docker image published to `polytopelabs/omnihedron`
+- 62 integration tests across 8 test files
+- CI workflows for formatting, integration tests, and Docker publishing
+
+[0.9.0]: https://github.com/polytope-labs/omnihedron/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/polytope-labs/omnihedron/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/polytope-labs/omnihedron/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/polytope-labs/omnihedron/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/polytope-labs/omnihedron/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/polytope-labs/omnihedron/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/polytope-labs/omnihedron/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/polytope-labs/omnihedron/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/polytope-labs/omnihedron/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/polytope-labs/omnihedron/releases/tag/v0.1.0
+
+[#1]: https://github.com/polytope-labs/omnihedron/pull/1
+[#2]: https://github.com/polytope-labs/omnihedron/pull/2
+[#3]: https://github.com/polytope-labs/omnihedron/pull/3
+[#4]: https://github.com/polytope-labs/omnihedron/pull/4
+[#5]: https://github.com/polytope-labs/omnihedron/pull/5
+[#6]: https://github.com/polytope-labs/omnihedron/pull/6
+[#7]: https://github.com/polytope-labs/omnihedron/pull/7
+[#8]: https://github.com/polytope-labs/omnihedron/pull/8
+[#9]: https://github.com/polytope-labs/omnihedron/pull/9

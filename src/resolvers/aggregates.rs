@@ -27,7 +27,6 @@
 //!   - min / max on BigInt/BigFloat columns → BigFloat string
 
 use async_graphql::{self, dynamic::ResolverContext};
-use deadpool_postgres::Pool;
 use serde_json::{Value, json};
 use tracing::trace;
 
@@ -44,7 +43,6 @@ fn is_native_number(gql_type: &str) -> bool {
 /// numbers (Int/Float) or BigFloat strings.
 pub async fn resolve_aggregates(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	numeric_cols: &[(String, String)],
 	all_cols: &[String],
 ) -> async_graphql::Result<Option<Value>> {
@@ -140,12 +138,14 @@ pub async fn resolve_aggregates(
 
 	trace!(sql = %sql, "Executing aggregates query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let pg_params = json_to_pg_params(&params);
 	let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as _).collect();
 
-	let row = client.query_one(&sql, &pg_refs).await?;
+	let row = req_client.query_one(&sql, &pg_refs).await?;
 
 	let count: i64 = row.try_get("_count").unwrap_or(0);
 
@@ -273,7 +273,6 @@ impl GroupByParsed {
 /// `{COL}_TRUNCATED_TO_DAY` emit `date_trunc('hour'/'day', t."col")` expressions.
 pub async fn resolve_grouped_aggregates(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	numeric_cols: &[(String, String)],
 	all_cols: &[String],
 ) -> async_graphql::Result<Option<Value>> {
@@ -395,12 +394,14 @@ pub async fn resolve_grouped_aggregates(
 
 	trace!(sql = %sql, "Executing groupedAggregates query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let pg_params = json_to_pg_params(&params);
 	let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as _).collect();
 
-	let rows = client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await?;
 
 	let mut groups: Vec<Value> = Vec::with_capacity(rows.len());
 

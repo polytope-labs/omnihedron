@@ -1,0 +1,80 @@
+---
+title: Naming Conventions
+description: How omnihedron maps PostgreSQL names to GraphQL names (PostGraphile-compatible)
+---
+
+All naming logic lives in `src/schema/inflector.rs` and must match PostGraphile's conventions exactly. Existing clients depend on these names being identical.
+
+## snake_case to camelCase
+
+- Leading underscores are preserved: `_my_field` → `_myField`
+- Consecutive uppercase runs are normalised: `cumulative_volume_u_s_ds` → `cumulativeVolumeUsds`
+
+## snake_case to PascalCase
+
+Same rules as camelCase, but the initial character is uppercased: `asset_teleported` → `AssetTeleported`.
+
+## Pluralisation rules
+
+Some non-obvious cases:
+
+| Input | Output | Rule |
+|---|---|---|
+| `metadatum` | `metadata` | Latin neuter |
+| `responses` | `response` | Vowel-before-S (not `respons`) |
+| `V2` | `V2s` | Digit suffix gets lowercase `s` |
+| `CumulativeVolumeUSDS` | `CumulativeVolumeUsds` | Consecutive uppercase normalised |
+
+## Table to field names
+
+Given a table `transfers`:
+
+| Purpose | Name |
+|---|---|
+| GraphQL type | `Transfer` |
+| Connection query | `transfers` |
+| Single query | `transfer` |
+| Connection type | `TransferConnection` |
+| Edge type | `TransferEdge` |
+| Filter type | `TransferFilter` |
+| OrderBy enum | `TransfersOrderBy` |
+| Distinct enum | `TransfersDistinctEnum` |
+
+## Relation field names
+
+### Forward relations
+
+The FK column name with `_id` stripped, then camelCased.
+
+Example: FK column `account_id` → field name `account`.
+
+### Backward relations
+
+Pattern: `{relatedEntitiesPlural}By{FkColumn}`
+
+Example: `accounts` table has FK `creator_id → users.id` → the `User` type gets a field `accountsByCreatorId`.
+
+If the FK has a unique constraint (one-to-one), the backward relation returns a single record instead of a connection.
+
+## Enum type names
+
+PostgreSQL enum type names go through a separate path that replicates PostGraphile's `coerceToGraphQLName` + lodash `upperCamelCase`:
+
+1. Prepend `_` if the name starts with a digit
+2. Apply `upperCamelCase` with digit→letter transitions as word boundaries
+
+This handles SubQuery's blake2 10-character hex hash enum names:
+
+```
+869e90c211 → _869E90C211
+```
+
+This logic is **separate** from regular `to_camel_case` — the digit→letter split only applies to enum type names.
+
+## OrderBy enum values
+
+Standard columns: `{COLUMN_NAME}_ASC` / `{COLUMN_NAME}_DESC`
+
+Forward-relation scalar ordering: `{SINGULAR_TABLE}_BY_{FK_COL}__{TARGET_COL}_ASC` / `_DESC`
+
+Example: `TEST_AUTHOR_BY_CREATOR_ID__NAME_ASC`

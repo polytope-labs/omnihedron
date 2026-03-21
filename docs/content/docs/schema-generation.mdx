@@ -1,0 +1,195 @@
+---
+title: Schema Generation
+description: How omnihedron builds a GraphQL schema from PostgreSQL tables
+---
+
+For every table discovered during introspection, omnihedron generates a complete set of GraphQL types. This happens at runtime using `async-graphql`'s dynamic schema module — no code generation, no compile-time schema.
+
+## What gets generated per table
+
+Given a table `transfers` with columns `id`, `amount`, `chain`, `block_number`, and a foreign key `account_id → accounts.id`:
+
+### Object type
+
+```graphql
+type Transfer {
+  id: String!
+  amount: BigInt
+  chain: String
+  blockNumber: Int
+  nodeId: ID!
+
+  # Forward relation (FK → parent record)
+  account: Account
+
+  # Backward relation (other tables pointing here)
+  # e.g., if "events" has FK "transfer_id → transfers.id"
+  eventsByTransferId(first: Int, filter: EventFilter, ...): EventConnection
+}
+```
+
+### Root queries
+
+```graphql
+type Query {
+  # Single record by primary key
+  transfer(id: ID!): Transfer
+
+  # Single record by nodeId
+  transferByNodeId(nodeId: ID!): Transfer
+
+  # Connection (list with pagination)
+  transfers(
+    first: Int
+    last: Int
+    after: Cursor
+    before: Cursor
+    offset: Int
+    orderBy: [TransfersOrderBy!]
+    orderByNull: NullOrder
+    filter: TransferFilter
+    distinct: [TransfersDistinctEnum!]
+    blockHeight: String  # only on historical tables
+  ): TransferConnection
+}
+```
+
+### Connection types
+
+```graphql
+type TransferConnection {
+  nodes: [Transfer!]!
+  edges: [TransferEdge!]!
+  totalCount: Int!
+  pageInfo: PageInfo!
+  aggregates: TransferAggregates  # if --aggregate is enabled
+}
+
+type TransferEdge {
+  node: Transfer!
+  cursor: Cursor!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: Cursor
+  endCursor: Cursor
+}
+```
+
+### Filter input type
+
+Every column gets a set of filter operators based on its type:
+
+```graphql
+input TransferFilter {
+  id: StringFilter
+  amount: BigIntFilter
+  chain: StringFilter
+  blockNumber: IntFilter
+
+  # Logical operators
+  and: [TransferFilter!]
+  or: [TransferFilter!]
+  not: TransferFilter
+
+  # Relation filters
+  accountExists: Boolean
+  account: AccountFilter
+  eventsByTransferIdSome: EventFilter
+  eventsByTransferIdNone: EventFilter
+  eventsByTransferIdEvery: EventFilter
+}
+```
+
+String filters include: `equalTo`, `notEqualTo`, `in`, `notIn`, `contains`, `notContains`, `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`, `like`, `notLike`, `ilike`, `likeInsensitive`, `notLikeInsensitive`, `isNull`.
+
+Numeric filters include: `equalTo`, `notEqualTo`, `in`, `notIn`, `greaterThan`, `greaterThanOrEqualTo`, `lessThan`, `lessThanOrEqualTo`, `isNull`.
+
+### OrderBy enum
+
+```graphql
+enum TransfersOrderBy {
+  ID_ASC
+  ID_DESC
+  AMOUNT_ASC
+  AMOUNT_DESC
+  CHAIN_ASC
+  CHAIN_DESC
+  BLOCK_NUMBER_ASC
+  BLOCK_NUMBER_DESC
+  # Forward-relation scalar ordering
+  ACCOUNT_BY_ACCOUNT_ID__NAME_ASC
+  ACCOUNT_BY_ACCOUNT_ID__NAME_DESC
+}
+```
+
+Forward-relation ordering generates correlated subqueries in the SQL `ORDER BY`.
+
+### Aggregates
+
+```graphql
+type TransferAggregates {
+  count: BigInt!
+  sum: TransferSumAggregates
+  distinctCount: TransferDistinctCountAggregates
+  min: TransferMinAggregates
+  max: TransferMaxAggregates
+  average: TransferAverageAggregates
+  stddevSample: TransferStddevSampleAggregates
+  stddevPopulation: TransferStddevPopulationAggregates
+  varianceSample: TransferVarianceSampleAggregates
+  variancePopulation: TransferVariancePopulationAggregates
+}
+```
+
+Only aggregate functions actually requested in the query are computed in SQL.
+
+## Special types
+
+### Node interface
+
+```graphql
+interface Node {
+  nodeId: ID!
+}
+
+type Query {
+  node(nodeId: ID!): Node
+}
+```
+
+The `node` root query decodes a `nodeId`, determines the type, and fetches the record.
+
+### Metadata
+
+```graphql
+type Query {
+  _metadata(chainId: String): _Metadata
+  _metadatas(after: Cursor, first: Int): _MetadatasConnection
+}
+```
+
+Multi-chain projects store metadata in per-chain tables (`_metadata_<genesisHash>`). The `chainId` argument maps to the correct table.
+
+## Type mapping
+
+| PostgreSQL type | GraphQL scalar |
+|---|---|
+| `text`, `varchar`, `char`, `name`, `citext` | `String` |
+| `int2`, `int4` | `Int` |
+| `int8` | `BigInt` (JSON **string**) |
+| `numeric`, `decimal` | `BigFloat` (JSON **string**) |
+| `float4`, `float8` | `Float` |
+| `bool` | `Boolean` |
+| `timestamp`, `timestamptz` | `Datetime` (RFC3339) |
+| `date` | `Date` (ISO date) |
+| `json`, `jsonb` | `JSON` |
+| `uuid` | `String` |
+| `bytea` | `String` (hex-encoded) |
+| enum types | Custom scalar with `EnumFilter` |
+| arrays | `JSON` |
+| unknown | `String` (fallback) |
+
+`BigInt` and `BigFloat` are serialised as JSON strings to preserve precision — JavaScript `Number` can't represent large integers without loss.

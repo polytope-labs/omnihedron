@@ -21,17 +21,19 @@
 //!   foreign key (records in another table that reference this one), returned as a
 //!   `{Child}Connection`.
 
-use async_graphql::dynamic::ResolverContext;
-use deadpool_postgres::Pool;
+use async_graphql::{dataloader::DataLoader, dynamic::ResolverContext};
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 use tracing::trace;
 
 use crate::{
 	config::Config,
-	resolvers::connection::{
-		extract_order_cols, json_to_pg_params, parse_distinct, parse_orderby, reverse_order_clause,
-		row_to_json,
+	resolvers::{
+		connection::{
+			extract_order_cols, json_to_pg_params, parse_distinct, parse_orderby,
+			reverse_order_clause, row_to_json,
+		},
+		dataloader::{RelationKey, RelationLoader},
 	},
 	sql::{
 		filter::build_filter_sql,
@@ -49,10 +51,10 @@ use crate::{
 /// (`upper_inf(_block_range)`).
 pub async fn resolve_forward_relation(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	foreign_table: &str,
 	fk_column: &str,
 	foreign_is_historical: bool,
+	foreign_columns: &[String],
 ) -> async_graphql::Result<Option<Value>> {
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
 	let fk_val = match parent.get(fk_column) {
@@ -69,52 +71,52 @@ pub async fn resolve_forward_relation(
 		.map_err(|_| async_graphql::Error::new("Missing schema name in context"))?
 		.clone();
 
+	let loader = ctx
+		.data::<DataLoader<RelationLoader>>()
+		.map_err(|_| async_graphql::Error::new("Missing DataLoader in context"))?;
+
 	let id_str = match &fk_val {
 		Value::String(s) => s.clone(),
 		v => v.to_string(),
 	};
 
-	let mut params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(id_str)];
-	let mut where_parts = vec!["t.id = $1".to_string()];
-
-	if foreign_is_historical {
-		let bh_int: i64 =
-			inherited_height.as_ref().and_then(|s| s.parse().ok()).unwrap_or(i64::MAX);
-		params.push(Box::new(bh_int));
-		where_parts.push(format!("t._block_range @> ${}::bigint", params.len()));
+	// Collect requested columns from the GraphQL selection set, ensuring `id` is always included.
+	let mut columns: Vec<String> = ctx
+		.field()
+		.selection_set()
+		.map(|field| field.name().to_string())
+		.filter(|name| foreign_columns.contains(name))
+		.collect();
+	if !columns.contains(&"id".to_string()) {
+		columns.push("id".to_string());
 	}
-
-	let where_clause = format!("WHERE {}", where_parts.join(" AND "));
-	let sql = format!(
-		r#"SELECT * FROM "{schema}"."{foreign_table}" AS t {where_clause} ORDER BY t._id ASC LIMIT 1"#
-	);
-
-	trace!(sql = %sql, "Executing forward relation query");
-
-	let client = pool.get().await?;
-	let pg_refs: Vec<&(dyn ToSql + Sync)> =
-		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
-
-	let rows = client.query(&sql, &pg_refs).await?;
-	if rows.is_empty() {
-		return Ok(None);
-	}
-
-	let mut result = row_to_json(&rows[0]);
-	// Propagate blockHeight so further nested relations can inherit it.
+	// Include _id for historical ordering and _block_range for historical filtering
 	if foreign_is_historical {
-		if let (Value::Object(map), Some(bh)) = (&mut result, &inherited_height) {
-			map.insert("_block_height".to_string(), json!(bh));
+		for col in &["_id", "_block_range"] {
+			let s = col.to_string();
+			if !columns.contains(&s) {
+				columns.push(s);
+			}
 		}
 	}
+	columns.sort();
 
-	Ok(Some(result))
+	let key = RelationKey {
+		id: id_str,
+		schema,
+		table: foreign_table.to_string(),
+		columns,
+		is_historical: foreign_is_historical,
+		block_height: inherited_height,
+	};
+
+	let result = loader.load_one(key).await?;
+	Ok(result)
 }
 
 /// Resolve a backward one-to-one relation (unique FK → single child record).
 pub async fn resolve_backward_single(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	child_table: &str,
 	fk_column: &str,
 	child_is_historical: bool,
@@ -152,11 +154,13 @@ pub async fn resolve_backward_single(
 		r#"SELECT * FROM "{schema}"."{child_table}" AS t {where_clause} ORDER BY t._id ASC LIMIT 1"#
 	);
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await?;
 	match rows.first() {
 		Some(row) => {
 			let mut node = row_to_json(row);
@@ -181,7 +185,6 @@ pub async fn resolve_backward_single(
 /// `_block_range`, using the `_block_height` embedded in the parent entity JSON.
 pub async fn resolve_backward_relation(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	child_table: &str,
 	fk_column: &str,
 	child_is_historical: bool,
@@ -317,23 +320,38 @@ pub async fn resolve_backward_relation(
 		forward_order_clause
 	};
 
-	let count_sql =
-		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{child_table}" AS t {where_clause}"#);
+	let use_window_count = distinct_cols.is_empty();
+
+	let count_col = if use_window_count { ", COUNT(*) OVER() AS __total_count" } else { "" };
 	let sql = format!(
-		r#"SELECT {distinct_clause}t.* FROM "{schema}"."{child_table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
+		r#"SELECT {distinct_clause}t.*{count_col} FROM "{schema}"."{child_table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
 		pagination.offset
 	);
 
 	trace!(sql = %sql, "Executing backward relation query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let pg_params = json_to_pg_params(&params);
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = client.query(&sql, &pg_refs).await?;
-	let count_row = client.query_one(&count_sql, &pg_refs).await?;
-	let total: i64 = count_row.get("total");
+	let rows = req_client.query(&sql, &pg_refs).await?;
+
+	let total: i64 = if use_window_count {
+		// Extract total from the window function in the first row
+		rows.first()
+			.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
+			.unwrap_or(0)
+	} else {
+		// DISTINCT queries need a separate count query (window fires before dedup)
+		let count_sql = format!(
+			r#"SELECT COUNT(*) AS total FROM "{schema}"."{child_table}" AS t {where_clause}"#
+		);
+		let count_row = req_client.query_one(&count_sql, &pg_refs).await?;
+		count_row.get("total")
+	};
 
 	let mut nodes = vec![];
 	let mut edges = vec![];
@@ -388,7 +406,6 @@ pub async fn resolve_backward_relation(
 /// returns a `{B}Connection` by JOINing through J.
 pub async fn resolve_many_to_many(
 	ctx: &ResolverContext<'_>,
-	pool: &Pool,
 	junction_table: &str,
 	fk_to_source: &str, // FK column in junction pointing to parent
 	fk_to_target: &str, // FK column in junction pointing to target
@@ -428,24 +445,24 @@ pub async fn resolve_many_to_many(
 	};
 
 	let sql = format!(
-		r#"SELECT b.* FROM "{schema}"."{target_table}" AS b
+		r#"SELECT b.*, COUNT(*) OVER() AS __total_count FROM "{schema}"."{target_table}" AS b
 		   JOIN "{schema}"."{junction_table}" AS j ON j."{fk_to_target}" = b."id"
 		   WHERE j."{fk_to_source}" = $1
 		   ORDER BY b.id ASC LIMIT {first} OFFSET {offset}"#
 	);
-	let count_sql = format!(
-		r#"SELECT COUNT(*) AS total FROM "{schema}"."{junction_table}" AS j
-		   WHERE j."{fk_to_source}" = $1"#
-	);
 
 	trace!(sql = %sql, "Executing many-to-many relation query");
 
-	let client = pool.get().await?;
+	let req_client = ctx
+		.data::<std::sync::Arc<crate::db::RequestClient>>()
+		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let params: Vec<&(dyn ToSql + Sync)> = vec![&id_str];
 
-	let rows = client.query(&sql, &params).await?;
-	let count_row = client.query_one(&count_sql, &params).await?;
-	let total: i64 = count_row.get("total");
+	let rows = req_client.query(&sql, &params).await?;
+	let total: i64 = rows
+		.first()
+		.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
+		.unwrap_or(0);
 
 	let mut nodes = vec![];
 	let mut edges = vec![];
