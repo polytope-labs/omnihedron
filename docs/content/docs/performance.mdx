@@ -90,23 +90,13 @@ These are Postgres config knobs (in `postgresql.conf`), not omnihedron settings:
 
 If you need many omnihedron instances sharing one Postgres, put PgBouncer in front of Postgres in **transaction mode**. This lets 50 omnihedron instances each with 10 pool connections share, say, 30 actual Postgres connections.
 
-## Future optimisations
+### 8. Prepared statement caching
 
-These are not yet implemented but would provide significant gains:
+Omnihedron uses a three-tier statement cache to let PostgreSQL skip the parse+plan phase on repeated query shapes. On each request, the cache is checked in order: **request-level** (statements reused within the same GraphQL resolve), **connection-level** (statements surviving across requests on the same pooled connection via deadpool), and **PostgreSQL misses** (a fresh prepare round-trip only on the first encounter). This matters most when the same query shape is called thousands of times with different parameters.
 
-### Prepared statements / statement caching
+### 9. Dataloader for relation batching
 
-Currently omnihedron builds SQL strings per request. `tokio-postgres` supports prepared statements which let Postgres skip the parse+plan phase on repeated queries. This matters when the same query shape is called thousands of times with different parameters.
-
-### Dataloader / batching for relations
-
-Currently, `transfers { nodes { account { name } } }` with 100 transfers fires **100 individual queries** for related accounts (the N+1 problem). A dataloader would batch these into:
-
-```sql
-SELECT * FROM accounts WHERE id IN ($1, $2, ..., $100)
-```
-
-This would be a significant win for deeply nested queries.
+Forward relation lookups are batched via async-graphql's `DataLoader`. Instead of firing N individual queries for N parent rows (the classic N+1 problem), the dataloader collects all foreign key values in a tick and resolves them in a single `WHERE id IN ($1, $2, …, $N)` query. This is a significant win for deeply nested queries like `transfers { nodes { account { name } } }`.
 
 ## Benchmarking
 

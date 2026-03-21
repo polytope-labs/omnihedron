@@ -16,13 +16,26 @@ All CLI flags accept environment variables with the `OMNIHEDRON_` prefix.
 | `--aggregate` | `OMNIHEDRON_AGGREGATE` | on | Enable aggregation queries |
 | `--unsafe-mode` | `OMNIHEDRON_UNSAFE` | off | Disable all query limits |
 | `--query-limit` | `OMNIHEDRON_QUERY_LIMIT` | `100` | Max records per query |
+| `--query-batch-limit` | `OMNIHEDRON_QUERY_BATCH_LIMIT` | — | Max queries in a single batch request |
+| `--query-depth-limit` | `OMNIHEDRON_QUERY_DEPTH_LIMIT` | — | Max query nesting depth |
+| `--query-alias-limit` | `OMNIHEDRON_QUERY_ALIAS_LIMIT` | — | Max field aliases per query |
+| `--query-complexity` | `OMNIHEDRON_QUERY_COMPLEXITY` | — | Max query complexity score |
 | `--query-timeout` | `OMNIHEDRON_QUERY_TIMEOUT` | `10000` | Query timeout in ms |
 | `--max-connection` | `OMNIHEDRON_MAX_CONNECTION` | `10` | PostgreSQL pool size |
 | `--disable-hot-schema` | `OMNIHEDRON_DISABLE_HOT_SCHEMA` | off | Disable schema hot reload |
+| `--sl-keep-alive-interval` | `OMNIHEDRON_SL_KEEP_ALIVE_INTERVAL` | `180000` | Schema listener keep-alive interval in ms |
+| `--metrics` | `OMNIHEDRON_METRICS` | on | Enable Prometheus metrics endpoint at `/metrics` |
+| `--shutdown-timeout` | `OMNIHEDRON_SHUTDOWN_TIMEOUT` | `30` | Graceful shutdown timeout in seconds |
+| `--dictionary-optimisation` | `OMNIHEDRON_DICTIONARY_OPTIMISATION` | off | Enable dictionary optimisation for distinct queries |
+| `--query-explain` | `OMNIHEDRON_QUERY_EXPLAIN` | off | Log SQL EXPLAIN output |
+| `--indexer` | `OMNIHEDRON_INDEXER` | — | Metadata HTTP fallback URL |
+| `--pg-ca` | `OMNIHEDRON_PG_CA` | — | Path to PostgreSQL CA certificate |
+| `--pg-key` | `OMNIHEDRON_PG_KEY` | — | Path to PostgreSQL client key |
+| `--pg-cert` | `OMNIHEDRON_PG_CERT` | — | Path to PostgreSQL client certificate |
 | `--log-level` | `OMNIHEDRON_LOG_LEVEL` | `info` | `fatal\|error\|warn\|info\|debug\|trace` |
 | `--output-fmt` | `OMNIHEDRON_OUTPUT_FMT` | `colored` | `json\|colored` |
-| `--query-explain` | — | off | Log SQL EXPLAIN output |
-| `--indexer` | — | — | Metadata HTTP fallback URL |
+| `--log-path` | `OMNIHEDRON_LOG_PATH` | — | Path to log file |
+| `--log-rotate` | `OMNIHEDRON_LOG_ROTATE` | off | Enable log file rotation |
 
 ## Database environment variables
 

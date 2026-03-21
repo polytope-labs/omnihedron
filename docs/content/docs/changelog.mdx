@@ -9,6 +9,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-03-21
+
+### Added
+
+- Three-tier prepared statement cache metrics: request hits, connection hits, and true PG misses
+- Process memory (RSS/VSZ) and Tokio runtime gauges (alive tasks, workers, global queue depth)
+- DataLoader for batching forward relation lookups
+- Per-request DB client (`RequestClient`) sharing a single pooled connection across all resolvers
+- Grafana dashboard with dynamic pool utilization gauge
+- Prometheus scrape config and `hey_blast.sh` parallel load testing
+- Full documentation site (fumadocs)
+- `--metrics` now defaults to `true`
+
+### Fixed
+
+- Statement cache metrics: previously all deadpool lookups were counted as misses (96% false miss rate), now correctly shows 99.99% hit rate
+- `graphql_errors_total` counter initialized at startup to prevent NaN in Prometheus rate() expressions
+- DB pool `max_size` gauge seeded at startup
+
+### Removed
+
+- Schema reload metrics (`schema_reloads_total`, `schema_reload_duration_seconds`, `schema_reload_failures_total`)
+
 ## [0.9.0] - 2026-03-19
 
 ### Fixed
@@ -101,6 +124,7 @@ _No user-facing changes (tag co-located with v0.6.0)._
 - 62 integration tests across 8 test files
 - CI workflows for formatting, integration tests, and Docker publishing
 
+[1.0.0]: https://github.com/polytope-labs/omnihedron/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/polytope-labs/omnihedron/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/polytope-labs/omnihedron/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/polytope-labs/omnihedron/compare/v0.6.1...v0.7.0
