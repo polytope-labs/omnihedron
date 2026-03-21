@@ -217,47 +217,45 @@
     },
     {
       "title": "DB Pool Usage Over Time",
-      "description": "Busy vs available connections over time, with max pool size as reference line.",
+      "description": "Busy vs available connections over time. Y-axis max set from --max-connection.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 4, "y": 32 },
       "datasource": "Prometheus",
       "targets": [
         { "expr": "omnihedron_db_pool_size - omnihedron_db_pool_available", "legendFormat": "busy", "refId": "A" },
         { "expr": "omnihedron_db_pool_available", "legendFormat": "available", "refId": "B" },
-        { "expr": "omnihedron_db_pool_max_size", "legendFormat": "max", "refId": "C" }
+        { "expr": "omnihedron_db_pool_max_size", "legendFormat": "Max", "refId": "C" }
       ],
       "fieldConfig": {
         "defaults": {
           "min": 0,
           "noValue": "0",
-          "custom": { "fillOpacity": 20, "stacking": { "mode": "none" } }
+          "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } }
         },
         "overrides": [
           {
             "matcher": { "id": "byName", "options": "busy" },
-            "properties": [
-              { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } },
-              { "id": "custom.fillOpacity", "value": 20 }
-            ]
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
           },
           {
             "matcher": { "id": "byName", "options": "available" },
-            "properties": [
-              { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } },
-              { "id": "custom.fillOpacity", "value": 20 }
-            ]
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
           },
           {
-            "matcher": { "id": "byName", "options": "max" },
-            "properties": [
-              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
-              { "id": "custom.fillOpacity", "value": 0 },
-              { "id": "custom.lineWidth", "value": 2 }
-            ]
+            "matcher": { "id": "byName", "options": "Max" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
           }
         ]
-      }
+      },
+      "transformations": [
+        {
+          "id": "configFromData",
+          "options": {
+            "configRefId": "C",
+            "mappings": [{ "fieldName": "Max", "handlerKey": "max" }]
+          }
+        }
+      ]
     },
     {
       "title": "Pool Checkout Wait (p50 / p99)",
