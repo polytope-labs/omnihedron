@@ -1,0 +1,62 @@
+---
+title: Docker
+description: Running omnihedron with Docker and Docker Compose
+---
+
+## Docker image
+
+Omnihedron is published to Docker Hub as `polytopelabs/omnihedron`.
+
+```bash
+docker pull polytopelabs/omnihedron:latest
+```
+
+Tags follow semver (`v0.1.0`, `v0.2.0`, etc.) plus SHA-based tags for each release.
+
+## Docker Compose (development)
+
+The repository includes a development compose file at `docker/docker-compose.yml`:
+
+```bash
+cd docker
+docker compose up -d
+```
+
+This starts:
+
+| Service | Description | Port |
+|---|---|---|
+| `postgres` | PostgreSQL 17 with fixture data | `5433` |
+| `db-init` | One-shot fixture loader (skips if DB already populated) | — |
+| `subql-query-ts` | TypeScript `@subql/query` for comparison | `3001` |
+| `omnihedron` | Rust service (built from local Dockerfile) | `3000` |
+
+The development compose file is **idempotent** — it checks whether the database already has data before loading fixtures, so it's safe to restart without duplicating data. It also uses a named volume (`subql_postgres_data`) so your data survives restarts.
+
+You can set the schema name via environment variable:
+
+```bash
+SCHEMA_NAME=my_schema docker compose up -d
+```
+
+## Docker Compose (CI)
+
+The CI compose file at `docker/docker-compose.ci.yml` is stripped down:
+
+- **No persistence** — no named volumes, data is ephemeral
+- **No idempotency check** — always loads fixtures fresh
+- **No omnihedron container** — CI builds and runs the binary on the host
+
+The CI workflow uses this to spin up PostgreSQL + TypeScript for integration testing.
+
+## Building the image locally
+
+The Dockerfile expects a pre-built binary:
+
+```bash
+# Build the binary first
+cargo build --release
+
+# Then build the Docker image
+docker build -t omnihedron:latest -f docker/Dockerfile .
+```

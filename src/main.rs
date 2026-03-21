@@ -17,13 +17,17 @@ mod config;
 mod db;
 mod hot_reload;
 mod introspection;
+mod metrics;
 mod resolvers;
 mod schema;
 mod server;
 mod sql;
 mod validation;
 
-use std::sync::Arc;
+use std::sync::{
+	Arc,
+	atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use clap::Parser;
 use tokio::sync::RwLock;
@@ -35,7 +39,7 @@ use db::{create_pool, discover_schema};
 use hot_reload::start_schema_listener;
 use introspection::{introspect_enums, introspect_schema, introspect_search_functions};
 use schema::build_schema;
-use server::{AppState, SharedSchema, build_router};
+use server::{AppState, SchemaState, SharedSchema, build_router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,8 +86,12 @@ async fn main() -> anyhow::Result<()> {
 		"GraphQL schema built"
 	);
 
+	// ── Schema state (for health checks) ─────────────────────────────────────
+	let schema_state = Arc::new(SchemaState::new(schema_name.clone(), tables.len()));
+
 	// ── Hot reload ────────────────────────────────────────────────────────────
-	start_schema_listener(pool.clone(), shared_schema.clone(), cfg.clone()).await;
+	start_schema_listener(pool.clone(), shared_schema.clone(), cfg.clone(), schema_state.clone())
+		.await;
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
 	let port = cfg.port.unwrap_or(3000);
@@ -97,9 +105,93 @@ async fn main() -> anyhow::Result<()> {
 		info!(url = %format!("http://localhost:{actual_port}/"), "GraphiQL playground available");
 	}
 
-	let app = build_router(AppState { schema: shared_schema, cfg });
+	// ── Metrics ──────────────────────────────────────────────────────────────
+	let metrics_handle = if cfg.metrics {
+		let handle = metrics::init_recorder();
+		metrics::start_runtime_sampler();
+		// Seed pool max_size so the gauge is available before any requests arrive
+		let pool_status = pool.status();
+		metrics::set_db_pool_metrics(
+			pool_status.size as f64,
+			pool_status.available as f64,
+			pool_status.max_size as f64,
+		);
+		info!("Prometheus metrics enabled at /metrics");
+		Some(handle)
+	} else {
+		None
+	};
 
-	axum::serve(listener, app).await?;
+	// ── Shutdown state ───────────────────────────────────────────────────────
+	let shutting_down = Arc::new(AtomicBool::new(false));
+	let in_flight = Arc::new(AtomicUsize::new(0));
+	let shutdown_timeout = cfg.shutdown_timeout;
+
+	let app = build_router(AppState {
+		schema: shared_schema,
+		cfg,
+		pool: pool.clone(),
+		metrics_handle,
+		schema_state,
+		shutting_down: shutting_down.clone(),
+		in_flight: in_flight.clone(),
+	});
+
+	let shutdown_signal = {
+		let shutting_down = shutting_down.clone();
+		let in_flight = in_flight.clone();
+		async move {
+			// Wait for SIGINT or SIGTERM
+			let signal_name = {
+				let ctrl_c = tokio::signal::ctrl_c();
+				let mut sigterm =
+					tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+						.expect("failed to register SIGTERM handler");
+				tokio::select! {
+					_ = ctrl_c => "SIGINT",
+					_ = sigterm.recv() => "SIGTERM",
+				}
+			};
+
+			info!("Received {signal_name}, starting graceful shutdown");
+
+			// Mark as shutting down — health endpoint will return 503
+			shutting_down.store(true, Ordering::SeqCst);
+
+			// Drain in-flight requests
+			let current = in_flight.load(Ordering::Relaxed);
+			if current > 0 {
+				info!(
+					in_flight = current,
+					timeout_secs = shutdown_timeout,
+					"Waiting for in-flight requests to complete"
+				);
+
+				let deadline =
+					tokio::time::Instant::now() + std::time::Duration::from_secs(shutdown_timeout);
+
+				loop {
+					let remaining = in_flight.load(Ordering::Relaxed);
+					if remaining == 0 {
+						info!("All in-flight requests completed");
+						break;
+					}
+					if tokio::time::Instant::now() >= deadline {
+						tracing::warn!(
+							remaining,
+							"Shutdown timeout reached, {remaining} requests forcefully terminated"
+						);
+						break;
+					}
+					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+				}
+			}
+		}
+	};
+
+	axum::serve(listener, app).with_graceful_shutdown(shutdown_signal).await?;
+
+	info!("Server shut down");
 	Ok(())
 }
 

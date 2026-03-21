@@ -4671,12 +4671,28 @@ ALTER TABLE app.test_author_profiles ADD CONSTRAINT test_author_profiles_author_
 -- Smart tag: overrides backward relation from "testAuthorProfileByAuthorId" to "profile".
 COMMENT ON CONSTRAINT test_author_profiles_author_id_fkey ON app.test_author_profiles IS '@singleForeignFieldName profile';
 
--- Two authors visible at all block heights.
+-- Ten authors visible at all block heights.
 INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
     ('11111111-1111-1111-1111-111111111111'::uuid,
      'author-alice', 'Alice', '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111112'::uuid,
-     'author-bob', 'Bob', '[0,)'::int8range);
+     'author-bob', 'Bob', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111113'::uuid,
+     'author-charlie', 'Charlie', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111114'::uuid,
+     'author-diana', 'Diana', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111115'::uuid,
+     'author-eve', 'Eve', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111116'::uuid,
+     'author-frank', 'Frank', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111117'::uuid,
+     'author-grace', 'Grace', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111118'::uuid,
+     'author-henry', 'Henry', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-111111111119'::uuid,
+     'author-iris', 'Iris', '[0,)'::int8range),
+    ('11111111-1111-1111-1111-11111111111a'::uuid,
+     'author-jack', 'Jack', '[0,)'::int8range);
 
 INSERT INTO app.test_author_profiles (_id, id, bio, author_id, _block_range) VALUES
     ('33333333-3333-3333-3333-333333333301'::uuid,
@@ -4688,6 +4704,7 @@ INSERT INTO app.test_author_profiles (_id, id, bio, author_id, _block_range) VAL
 -- book-1 v2: visible at blocks [500, ∞).
 -- book-2: always visible [0, ∞).
 -- book-3: by Bob, always visible [0, ∞).
+-- book-4: by Alice, always visible [0, ∞).
 INSERT INTO app.test_books (_id, id, title, creator_id, _block_range) VALUES
     ('22222222-2222-2222-2222-222222222201'::uuid,
      'book-1', 'Book One v1', 'author-alice', '[100,500)'::int8range),
@@ -4696,7 +4713,9 @@ INSERT INTO app.test_books (_id, id, title, creator_id, _block_range) VALUES
     ('22222222-2222-2222-2222-222222222203'::uuid,
      'book-2', 'Book Two', 'author-alice', '[0,)'::int8range),
     ('22222222-2222-2222-2222-222222222204'::uuid,
-     'book-3', 'Book Three', 'author-bob', '[0,)'::int8range);
+     'book-3', 'Book Three', 'author-bob', '[0,)'::int8range),
+    ('22222222-2222-2222-2222-222222222205'::uuid,
+     'book-4', 'Book Four', 'author-alice', '[0,)'::int8range);
 
 -- ---------------------------------------------------------------------------
 -- Fulltext search: @fullText directive creates a tsvector column + search function.

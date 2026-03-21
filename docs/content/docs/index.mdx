@@ -1,0 +1,57 @@
+---
+title: Introduction
+description: What is omnihedron and why does it exist?
+---
+
+Omnihedron is a high-performance Rust rewrite of [`@subql/query`](https://github.com/subquery/subql) — the GraphQL query service for SubQuery Network indexers.
+
+The original TypeScript service uses PostGraphile to auto-generate a full GraphQL API from a live PostgreSQL schema at runtime. Omnihedron replicates that behaviour entirely in Rust, producing an **identical external API** while handling high concurrent load across all CPU cores.
+
+## Why a rewrite?
+
+| | TypeScript (`@subql/query`) | Rust (omnihedron) |
+|---|---|---|
+| Runtime | Node.js (single-threaded event loop) | Tokio (multi-threaded async runtime) |
+| GraphQL | PostGraphile (plugin-based) | async-graphql (dynamic schema) |
+| DB driver | pg (JavaScript) | tokio-postgres (native async) |
+| Memory | Higher baseline, GC pauses | Lower baseline, no GC |
+
+The Rust version handles the same queries with lower latency and higher throughput, especially under concurrent load.
+
+## What it does
+
+```
+PostgreSQL database (populated by a SubQuery indexer)
+       ↓
+  omnihedron starts up
+       ↓
+  Introspects tables, columns, types, relations
+       ↓
+  Builds a full GraphQL API automatically
+       ↓
+  Serves queries over HTTP
+```
+
+No one writes the GraphQL schema by hand. It is **generated at runtime** from whatever is in the database. Add a table to Postgres and a GraphQL API for it appears automatically.
+
+## Key features
+
+- **Dynamic schema generation** — full GraphQL API built at runtime from PostgreSQL introspection
+- **PostGraphile-compatible** — same naming, cursors, `nodeId`, filters, ordering, aggregates
+- **Schema hot reload** — `LISTEN`/`NOTIFY` triggers automatic schema rebuild without downtime
+- **Historical queries** — `blockHeight` and `timestamp` arguments for versioned table data
+- **Connection pooling** — `deadpool-postgres` with configurable pool size
+- **Selective SQL** — only columns referenced in the GraphQL query are fetched
+- **Read replica support** — `DB_HOST_READ` for separating read traffic
+
+## Stack
+
+| Concern | Crate |
+|---|---|
+| HTTP server | `axum` |
+| GraphQL engine | `async-graphql` (dynamic schema module) |
+| PostgreSQL driver | `tokio-postgres` |
+| Connection pooling | `deadpool-postgres` |
+| CLI | `clap` |
+| Logging | `tracing` + `tracing-subscriber` |
+| Serialisation | `serde` + `serde_json` |

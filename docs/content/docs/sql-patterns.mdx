@@ -1,0 +1,142 @@
+---
+title: SQL Patterns
+description: The SQL queries omnihedron generates from GraphQL operations
+---
+
+Understanding the SQL omnihedron generates helps with debugging, indexing, and performance tuning. You can enable `--query-explain` to log `EXPLAIN` output for every query.
+
+## List query (connection resolver)
+
+```sql
+SELECT t."id", t."col1", ..., COUNT(*) OVER() AS __total_count
+FROM "{schema}"."{table}" AS t
+WHERE {filter_clauses}
+ORDER BY t.id ASC
+LIMIT $N OFFSET $N
+```
+
+Key details:
+
+- **Selective columns** — only columns referenced in the GraphQL `nodes`/`edges` selection are fetched
+- **`COUNT(*) OVER()`** — window function fetches total count in the same round-trip as the rows (omitted for `DISTINCT` queries)
+- **Count-only fast-path** — if the query only asks for `totalCount` with no `nodes`/`edges`, the row fetch is skipped entirely
+
+## Historical table queries
+
+For tables with a `_block_range` column:
+
+```sql
+-- Without blockHeight argument (latest version)
+SELECT ... FROM "{schema}"."{table}" AS t
+WHERE upper_inf(t._block_range)
+
+-- With blockHeight argument (specific point in time)
+SELECT ... FROM "{schema}"."{table}" AS t
+WHERE t._block_range @> $N::bigint
+```
+
+An `_id ASC` tiebreaker is appended to `ORDER BY` for historical tables to ensure deterministic ordering.
+
+## Single record
+
+```sql
+-- By primary key
+SELECT * FROM "{schema}"."{table}" AS t
+WHERE t.id = $1 LIMIT 1
+
+-- By nodeId (decoded from base64)
+SELECT * FROM "{schema}"."{table}" AS t
+WHERE t.id = $1 LIMIT 1
+```
+
+## Forward relation
+
+When resolving a FK field like `transfer.account`:
+
+```sql
+SELECT * FROM "{schema}"."{related_table}" AS t
+WHERE t.id = $1 LIMIT 1
+```
+
+## Backward relation
+
+When resolving a reverse FK like `account.transfersByAccountId`:
+
+```sql
+SELECT * FROM "{schema}"."{child_table}" AS t
+WHERE t.{fk_column} = $1
+ORDER BY t.id ASC
+LIMIT $N OFFSET $N
+```
+
+Backward relations support the full set of connection arguments: `filter`, `orderBy`, `orderByNull`, `distinct`, `first`, `last`, `after`, `before`, `offset`.
+
+## DISTINCT queries
+
+```sql
+SELECT DISTINCT ON (t.{col}) t.*
+FROM "{schema}"."{table}" AS t
+ORDER BY t.{col} {dir}
+```
+
+`DISTINCT ON` columns are prepended to `ORDER BY` as PostgreSQL requires.
+
+When `DISTINCT` is active, `COUNT(*) OVER()` is omitted (the window function doesn't work correctly with `DISTINCT ON`).
+
+## Relation filters
+
+### Forward relation EXISTS
+
+```graphql
+filter: { account: { name: { equalTo: "Alice" } } }
+```
+
+```sql
+WHERE EXISTS (
+  SELECT 1 FROM "{schema}"."accounts" AS r
+  WHERE r.id = t.account_id AND r."name" = $1
+)
+```
+
+### Backward relation some/none/every
+
+```graphql
+filter: { transfersByAccountIdSome: { amount: { greaterThan: "100" } } }
+```
+
+- **some** → `WHERE EXISTS (SELECT 1 FROM child WHERE fk = t.id AND {filter})`
+- **none** → `WHERE NOT EXISTS (...)`
+- **every** → `WHERE NOT EXISTS (SELECT 1 FROM child WHERE fk = t.id AND NOT ({filter}))`
+
+## Forward-relation scalar ordering
+
+```graphql
+orderBy: [ACCOUNT_BY_ACCOUNT_ID__NAME_ASC]
+```
+
+```sql
+ORDER BY (
+  SELECT r."name" FROM "{schema}"."accounts" AS r
+  WHERE r.id = t.account_id LIMIT 1
+) ASC
+```
+
+## Aggregates
+
+Aggregate queries reuse the same `WHERE` clause as the connection query via a sidecar `_agg_ctx` JSON field:
+
+```sql
+SELECT
+  SUM(t."amount") AS sum_amount,
+  MIN(t."block_number") AS min_block_number
+FROM "{schema}"."{table}" AS t
+WHERE {same_filter_as_connection}
+```
+
+Only the aggregate functions actually requested in the GraphQL query are computed.
+
+## Parameter safety
+
+All user-supplied values use parameterised `$N` placeholders. Table and column names come from introspection results — they are never interpolated from user input.
+
+The `TextParam` wrapper sends numeric and array JSON values as PostgreSQL text-format parameters, which avoids OID mismatch errors when filtering on `INT4`, `NUMERIC`, or `JSONB` columns.

@@ -24,6 +24,7 @@
 
 pub mod aggregates;
 pub mod connection;
+pub mod dataloader;
 pub mod metadata;
 pub mod relations;
 pub mod search;

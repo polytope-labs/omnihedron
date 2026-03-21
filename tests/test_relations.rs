@@ -57,7 +57,7 @@ async fn test_backward_relation() {
 
 	let conn = rust.pointer("/data/testAuthor/books").expect("connection missing");
 	let total = conn["totalCount"].as_i64().expect("totalCount");
-	assert_eq!(total, 2, "Alice should have 2 books");
+	assert_eq!(total, 3, "Alice should have 3 books");
 
 	compare_responses("backward relation", &ts, &rust);
 	println!("backward relation: {total} books ✓");
@@ -124,7 +124,7 @@ async fn test_backward_relation_pagination() {
 	let rust = rust_client.query(query).await;
 
 	let conn = rust.pointer("/data/testAuthor/books").expect("connection missing");
-	assert_eq!(conn["totalCount"], 2, "totalCount should be 2");
+	assert_eq!(conn["totalCount"], 3, "totalCount should be 3");
 
 	compare_responses("backward relation pagination", &ts, &rust);
 	println!("backward relation pagination: first:1 of 2 ✓");
@@ -149,7 +149,7 @@ async fn test_forward_relation_filter() {
 	let rust = rust_client.query(query).await;
 
 	let total = rust.pointer("/data/testBooks/totalCount").and_then(|v| v.as_i64()).unwrap_or(0);
-	assert_eq!(total, 2, "Alice has 2 books");
+	assert_eq!(total, 3, "Alice has 3 books");
 
 	compare_responses("forward relation filter", &ts, &rust);
 	println!("forward relation filter: author.name=Alice → {total} books ✓");
@@ -241,7 +241,7 @@ async fn test_relation_none_filter() {
 		.pointer("/data/testAuthors/totalCount")
 		.and_then(|v| v.as_i64())
 		.unwrap_or(-1);
-	assert_eq!(total, 1, "Bob has no 'Book Two' → none returns Bob");
+	assert_eq!(total, 9, "9 authors have no 'Book Two'");
 
 	compare_responses("none filter", &ts, &rust);
 	println!("none filter: 1 author (Bob) ✓");
@@ -269,7 +269,7 @@ async fn test_relation_every_filter() {
 		.pointer("/data/testAuthors/totalCount")
 		.and_then(|v| v.as_i64())
 		.unwrap_or(0);
-	assert_eq!(total, 2, "Both authors' books all start with 'Book'");
+	assert_eq!(total, 10, "All authors' books start with 'Book'");
 
 	compare_responses("every filter", &ts, &rust);
 	println!("every filter: 2 authors ✓");

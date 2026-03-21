@@ -1,0 +1,109 @@
+---
+title: Performance Tuning
+description: How to squeeze maximum performance out of omnihedron and PostgreSQL
+---
+
+## Understanding connection pools
+
+Each connection to PostgreSQL is a **full OS process** on the server (not a thread). Every connection costs:
+
+- ~5–10MB of RAM on the Postgres side
+- A process context switch when the OS schedules it
+- Shared buffer contention (locks on buffer pool, WAL, etc.)
+
+### More connections does not mean more performance
+
+This is counterintuitive but well-established. Past a sweet spot, performance **degrades**.
+
+PostgreSQL uses locks internally — even `SELECT` queries take lightweight locks on buffer pages. More concurrent connections means more lock contention, more context switching, and more CPU cache thrashing.
+
+### The rule of thumb
+
+```
+optimal connections ≈ (CPU cores × 2) + effective_spindle_count
+```
+
+For SSDs, the spindle count is effectively 1. On an 8-core machine:
+
+```
+(8 × 2) + 1 = 17 connections
+```
+
+| Connection count | Effect |
+|---|---|
+| 5–20 | Sweet spot for most workloads |
+| 20–50 | Marginal returns, slightly more lock contention |
+| 50–100 | Context switching overhead starts hurting |
+| 100+ | Active performance degradation |
+
+If you need to handle more concurrent requests than your pool allows, requests **queue** in the pool. A short queue is fine — waiting 1ms for a free connection is faster than having 200 Postgres processes fighting over CPU.
+
+Omnihedron's default is `--max-connection 10`, which is close to optimal for most deployments.
+
+## Priority list
+
+Roughly ordered from highest impact to diminishing returns:
+
+### 1. Use a read replica
+
+Omnihedron supports `DB_HOST_READ`. Point read traffic at a replica to offload the primary. The primary only needs to handle writes from the indexer. This is probably the **single biggest win** for scaling.
+
+### 2. Add database indexes
+
+Omnihedron generates `WHERE` clauses from filters. Without an index on the filtered column, Postgres does a sequential scan. Use `--query-explain` to identify slow queries, then:
+
+```sql
+CREATE INDEX CONCURRENTLY ON "app"."transfers" ("chain");
+CREATE INDEX CONCURRENTLY ON "app"."transfers" ("block_number");
+```
+
+The indexer may already create some indexes, but verify the ones that matter for your query patterns.
+
+### 3. Keep pool size reasonable
+
+Don't blindly crank up `--max-connection`. On a 4-core Postgres box, 10–15 connections is already near optimal. Going to 100 will make things slower.
+
+### 4. Put a cache in front
+
+Omnihedron sets `Cache-Control: public, max-age=5` on responses. Put a CDN or reverse proxy (nginx, Varnish, Cloudflare) in front of it. For read-heavy workloads where data updates every few seconds, a 5-second cache eliminates the vast majority of redundant queries.
+
+### 5. Tune Tokio worker threads
+
+```bash
+TOKIO_WORKER_THREADS=8
+```
+
+Tokio defaults to one thread per CPU core. On many-core machines this wastes memory on idle thread stacks (128 cores × 2MB = 256MB). For a Postgres-bound service, 8–16 threads is plenty since most time is spent waiting on I/O.
+
+### 6. PostgreSQL server tuning
+
+These are Postgres config knobs (in `postgresql.conf`), not omnihedron settings:
+
+| Setting | Recommendation | Why |
+|---|---|---|
+| `shared_buffers` | 25% of total RAM | PostgreSQL's own buffer cache |
+| `effective_cache_size` | 75% of total RAM | Tells the query planner how much OS page cache to expect |
+| `work_mem` | Increase for complex sorts/aggregates | Per-operation, not per-connection — be careful |
+| `random_page_cost` | `1.1` on SSDs | Default `4.0` assumes spinning disks, makes planner avoid indexes |
+
+### 7. Connection multiplexing with PgBouncer
+
+If you need many omnihedron instances sharing one Postgres, put PgBouncer in front of Postgres in **transaction mode**. This lets 50 omnihedron instances each with 10 pool connections share, say, 30 actual Postgres connections.
+
+### 8. Prepared statement caching
+
+Omnihedron uses a three-tier statement cache to let PostgreSQL skip the parse+plan phase on repeated query shapes. On each request, the cache is checked in order: **request-level** (statements reused within the same GraphQL resolve), **connection-level** (statements surviving across requests on the same pooled connection via deadpool), and **PostgreSQL misses** (a fresh prepare round-trip only on the first encounter). This matters most when the same query shape is called thousands of times with different parameters.
+
+### 9. Dataloader for relation batching
+
+Forward relation lookups are batched via async-graphql's `DataLoader`. Instead of firing N individual queries for N parent rows (the classic N+1 problem), the dataloader collects all foreign key values in a tick and resolves them in a single `WHERE id IN ($1, $2, …, $N)` query. This is a significant win for deeply nested queries like `transfers { nodes { account { name } } }`.
+
+## Benchmarking
+
+The repository includes a benchmark script:
+
+```bash
+bash scripts/bench_compare.sh
+```
+
+This runs throughput benchmarks comparing the Rust and TypeScript services side-by-side.

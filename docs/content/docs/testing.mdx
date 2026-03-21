@@ -1,0 +1,76 @@
+---
+title: Testing
+description: Integration test suite and how to run it
+---
+
+## Test architecture
+
+Tests are split across 8 files in `tests/` with shared infrastructure in `tests/common/mod.rs`. Most tests **compare Rust vs TypeScript** responses to verify correctness.
+
+Both services must be running for the full suite:
+
+```bash
+# Start services
+bash scripts/start_services.sh
+
+# Run all tests (62 tests, 1 ignored)
+cargo test
+```
+
+Tests will **skip** (not fail) if services aren't reachable, so CI doesn't break when services are down.
+
+## Test files
+
+| File | Tests | What it covers |
+|---|---|---|
+| `test_basics.rs` | 12 | Health, metadata, introspection, batch queries, variables |
+| `test_pagination.rs` | 8 | Cursor, offset, last pagination |
+| `test_filters.rs` | 14 | All filter operators including enum filters |
+| `test_ordering.rs` | 7 | Multi-column, non-id, forward-relation scalar ordering |
+| `test_aggregates.rs` | 7 | sum, count, min, max, stddev, variance |
+| `test_relations.rs` | 10 | Forward, backward, nested relations |
+| `test_historical.rs` | 3 | Block height queries |
+| `test_limits.rs` | 2 | Query limits (1 ignored) |
+
+## How comparison works
+
+The test infrastructure:
+
+1. Sends the same GraphQL query to both Rust (`:3000`) and TypeScript (`:3001`)
+2. Strips implementation-specific fields: `cursor`, `startCursor`, `endCursor`, `queryNodeVersion`, `indexerNodeVersion`
+3. Recursively sorts arrays of objects by `id` for deterministic comparison
+4. Asserts the responses are identical
+
+## Rust-only tests
+
+Some tests only probe the Rust service (features not in TypeScript or implementation-specific behaviour):
+
+- `test_count_only` — count-only fast-path (no row fetch)
+- `test_total_count_accuracy` — window function count matches actual row count
+- `test_numeric_aggregates` — aggregate values are strings
+- `test_blockheight` — historical queries with different block heights
+- `test_by_node_id` — dynamic nodeId lookup
+- `test_node_interface` — Node interface resolution
+- `test_stddev_variance_aggregates` — statistical aggregates
+- `test_bigint_serialization` — BigInt as JSON string
+- `test_bigfloat_serialization` — BigFloat as JSON string
+
+## Test fixture
+
+The fixture at `tests/fixtures/test_db.sql` (1.6MB) contains full schema DDL, metadata rows, and 20 rows per entity table.
+
+To regenerate after schema changes:
+
+```bash
+bash scripts/create_fixture.sh
+```
+
+This requires the full database to be running.
+
+## Known divergences from PostGraphile
+
+| Area | PostGraphile | Omnihedron |
+|---|---|---|
+| `aggregates { count }` | Not present on entity aggregates | Present as `count: BigInt!` |
+
+The `test_aggregates` test uses `distinctCount { id }` instead of `count` so the query is valid on both services.

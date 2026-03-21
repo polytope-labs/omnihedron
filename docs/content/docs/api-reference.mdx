@@ -1,0 +1,1816 @@
+---
+title: API Reference
+description: Example GraphQL queries and responses for every operation omnihedron supports
+---
+
+
+This document covers every query pattern supported by the omnihedron GraphQL API. All examples use a hypothetical schema with `transfers` and `accounts` tables. Adapt entity names, field names, and filter types to match your own indexed schema.
+
+---
+
+## Table of Contents
+
+- [Connection Queries (List)](#connection-queries-list)
+- [Single Record Queries](#single-record-queries)
+- [Filters](#filters)
+- [Aggregates](#aggregates)
+- [Relations](#relations)
+- [Metadata](#metadata)
+- [Historical Queries](#historical-queries)
+- [Full-Text Search](#full-text-search)
+- [Subscriptions](#subscriptions)
+- [Batch Queries](#batch-queries)
+- [Node Interface](#node-interface)
+
+---
+
+## Connection Queries (List)
+
+Connection queries return a paginated list of records. Every entity table generates a root query field named after the plural form of the entity (e.g., `transfers`).
+
+### Response Shape
+
+All connection queries return the same structure:
+
+```
+{Entity}Connection {
+  nodes: [{Entity}]
+  edges: [{Entity}Edge]     # each edge has { cursor, node }
+  pageInfo: PageInfo         # { hasNextPage, hasPreviousPage, startCursor, endCursor }
+  totalCount: Int
+  aggregates: {Entity}Aggregates   # when --aggregate is enabled
+}
+```
+
+### Basic List Query
+
+```graphql
+query {
+  transfers(first: 10) {
+    totalCount
+    nodes {
+      id
+      fromId
+      toId
+      amount
+      blockNumber
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 248,
+      "nodes": [
+        {
+          "id": "0x001a2b3c",
+          "fromId": "0xAlice",
+          "toId": "0xBob",
+          "amount": "1000000000",
+          "blockNumber": 100
+        },
+        {
+          "id": "0x002d4e5f",
+          "fromId": "0xBob",
+          "toId": "0xCharlie",
+          "amount": "500000000",
+          "blockNumber": 101
+        }
+      ]
+    }
+  }
+}
+```
+
+### Forward Cursor Pagination (first / after)
+
+Fetch the first page, then use `endCursor` to get subsequent pages.
+
+```graphql
+# Page 1
+query {
+  transfers(first: 5) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "eyJpZCI6IjB4MDA1In0="
+      },
+      "nodes": [
+        { "id": "0x001", "amount": "1000000000" },
+        { "id": "0x002", "amount": "2000000000" },
+        { "id": "0x003", "amount": "500000000" },
+        { "id": "0x004", "amount": "750000000" },
+        { "id": "0x005", "amount": "100000000" }
+      ]
+    }
+  }
+}
+```
+
+```graphql
+# Page 2
+query {
+  transfers(first: 5, after: "eyJpZCI6IjB4MDA1In0=") {
+    pageInfo {
+      hasNextPage
+      hasPreviousPage
+      endCursor
+    }
+    nodes {
+      id
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "pageInfo": {
+        "hasNextPage": true,
+        "hasPreviousPage": true,
+        "endCursor": "eyJpZCI6IjB4MDEwIn0="
+      },
+      "nodes": [
+        { "id": "0x006", "amount": "300000000" },
+        { "id": "0x007", "amount": "900000000" },
+        { "id": "0x008", "amount": "120000000" },
+        { "id": "0x009", "amount": "450000000" },
+        { "id": "0x010", "amount": "670000000" }
+      ]
+    }
+  }
+}
+```
+
+### Backward Cursor Pagination (last / before)
+
+Fetch the last N records, or the N records before a given cursor.
+
+```graphql
+query {
+  transfers(last: 3) {
+    pageInfo {
+      hasPreviousPage
+      startCursor
+    }
+    nodes {
+      id
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "pageInfo": {
+        "hasPreviousPage": true,
+        "startCursor": "eyJpZCI6IjB4MjQ2In0="
+      },
+      "nodes": [
+        { "id": "0x246", "amount": "800000000" },
+        { "id": "0x247", "amount": "150000000" },
+        { "id": "0x248", "amount": "990000000" }
+      ]
+    }
+  }
+}
+```
+
+### Offset Pagination
+
+Use `offset` to skip a fixed number of records. Can be combined with `first`.
+
+```graphql
+query {
+  transfers(first: 5, offset: 10) {
+    totalCount
+    nodes {
+      id
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 248,
+      "nodes": [
+        { "id": "0x011" },
+        { "id": "0x012" },
+        { "id": "0x013" },
+        { "id": "0x014" },
+        { "id": "0x015" }
+      ]
+    }
+  }
+}
+```
+
+### Ordering
+
+Use `orderBy` with enum values in the format `{COLUMN_NAME}_ASC` or `{COLUMN_NAME}_DESC`. Multiple columns are supported. Use `orderByNull` to control null placement.
+
+```graphql
+query {
+  transfers(
+    first: 5
+    orderBy: [BLOCK_NUMBER_DESC, ID_ASC]
+    orderByNull: NULLS_LAST
+  ) {
+    nodes {
+      id
+      blockNumber
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        { "id": "0x248", "blockNumber": 9999 },
+        { "id": "0x247", "blockNumber": 9998 },
+        { "id": "0x246", "blockNumber": 9997 },
+        { "id": "0x245", "blockNumber": 9996 },
+        { "id": "0x244", "blockNumber": 9995 }
+      ]
+    }
+  }
+}
+```
+
+Valid `orderByNull` values: `NULLS_FIRST`, `NULLS_LAST`.
+
+### Distinct
+
+Use `distinct` to deduplicate results by one or more columns. The distinct columns are automatically prepended to the ORDER BY clause.
+
+```graphql
+query {
+  transfers(first: 10, distinct: [FROM_ID]) {
+    nodes {
+      id
+      fromId
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        { "id": "0x001", "fromId": "0xAlice", "amount": "1000000000" },
+        { "id": "0x002", "fromId": "0xBob", "amount": "500000000" },
+        { "id": "0x010", "fromId": "0xCharlie", "amount": "670000000" }
+      ]
+    }
+  }
+}
+```
+
+### Count-Only Query
+
+When you only request `totalCount` (no `nodes` or `edges`), the server skips fetching rows and runs only a count query.
+
+```graphql
+query {
+  transfers {
+    totalCount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 248
+    }
+  }
+}
+```
+
+### Edges with Cursors
+
+Each edge contains a `cursor` and a `node`. Use edges when you need individual cursors per record.
+
+```graphql
+query {
+  transfers(first: 3) {
+    edges {
+      cursor
+      node {
+        id
+        amount
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "edges": [
+        {
+          "cursor": "eyJpZCI6IjB4MDAxIn0=",
+          "node": { "id": "0x001", "amount": "1000000000" }
+        },
+        {
+          "cursor": "eyJpZCI6IjB4MDAyIn0=",
+          "node": { "id": "0x002", "amount": "500000000" }
+        },
+        {
+          "cursor": "eyJpZCI6IjB4MDAzIn0=",
+          "node": { "id": "0x003", "amount": "750000000" }
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Single Record Queries
+
+### Lookup by ID
+
+Each entity has a singular root query field that accepts an `id` argument.
+
+```graphql
+query {
+  transfer(id: "0x001a2b3c") {
+    id
+    fromId
+    toId
+    amount
+    blockNumber
+    nodeId
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfer": {
+      "id": "0x001a2b3c",
+      "fromId": "0xAlice",
+      "toId": "0xBob",
+      "amount": "1000000000",
+      "blockNumber": 100,
+      "nodeId": "WyJ0cmFuc2ZlcnMiLCJhM2YyYzFkOC0xMjM0Il0="
+    }
+  }
+}
+```
+
+### Lookup by nodeId
+
+Every entity also exposes a `{entity}ByNodeId` query. The `nodeId` is a base64-encoded JSON array `["table_name", "_id_uuid"]`.
+
+```graphql
+query {
+  transferByNodeId(nodeId: "WyJ0cmFuc2ZlcnMiLCJhM2YyYzFkOC0xMjM0Il0=") {
+    id
+    fromId
+    toId
+    amount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transferByNodeId": {
+      "id": "0x001a2b3c",
+      "fromId": "0xAlice",
+      "toId": "0xBob",
+      "amount": "1000000000"
+    }
+  }
+}
+```
+
+---
+
+## Filters
+
+Every entity generates a `{Entity}Filter` input type. Filters are passed via the `filter` argument on connection queries. Each field in the filter corresponds to a column and accepts a type-specific filter object.
+
+### Scalar Filter Operators
+
+The available operators depend on the field's scalar type. The following table lists common operators:
+
+| Operator | Types | Description |
+|---|---|---|
+| `equalTo` | All | Exact match |
+| `notEqualTo` | All | Not equal |
+| `isNull` | All | True if column IS NULL, false if IS NOT NULL |
+| `in` | All except Boolean/JSON | Value is in the given list |
+| `notIn` | All except Boolean/JSON | Value is not in the given list |
+| `greaterThan` | String, Int, BigInt, Float, BigFloat, Date, Datetime | Greater than |
+| `greaterThanOrEqualTo` | String, Int, BigInt, Float, BigFloat, Date, Datetime | Greater than or equal |
+| `lessThan` | String, Int, BigInt, Float, BigFloat, Date, Datetime | Less than |
+| `lessThanOrEqualTo` | String, Int, BigInt, Float, BigFloat, Date, Datetime | Less than or equal |
+| `distinctFrom` | All | Not equal (treats NULL as a comparable value) |
+| `notDistinctFrom` | All | Equal (treats NULL as a comparable value) |
+| `includes` | String | Contains substring (case-sensitive) |
+| `notIncludes` | String | Does not contain substring |
+| `includesInsensitive` | String | Contains substring (case-insensitive) |
+| `notIncludesInsensitive` | String | Does not contain substring (case-insensitive) |
+| `startsWith` | String | Starts with prefix |
+| `notStartsWith` | String | Does not start with prefix |
+| `startsWithInsensitive` | String | Starts with prefix (case-insensitive) |
+| `endsWith` | String | Ends with suffix |
+| `notEndsWith` | String | Does not end with suffix |
+| `endsWithInsensitive` | String | Ends with suffix (case-insensitive) |
+| `like` | String | SQL LIKE pattern (use `%` for wildcard) |
+| `notLike` | String | Not matching LIKE pattern |
+| `likeInsensitive` | String | SQL ILIKE pattern (case-insensitive) |
+| `notLikeInsensitive` | String | Not matching ILIKE pattern |
+| `equalToInsensitive` | String | Exact match (case-insensitive) |
+| `notEqualToInsensitive` | String | Not equal (case-insensitive) |
+
+### equalTo
+
+```graphql
+query {
+  transfers(filter: { fromId: { equalTo: "0xAlice" } }) {
+    totalCount
+    nodes {
+      id
+      fromId
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 42,
+      "nodes": [
+        { "id": "0x001", "fromId": "0xAlice", "amount": "1000000000" },
+        { "id": "0x003", "fromId": "0xAlice", "amount": "500000000" }
+      ]
+    }
+  }
+}
+```
+
+### notEqualTo
+
+```graphql
+query {
+  transfers(filter: { fromId: { notEqualTo: "0xAlice" } }) {
+    totalCount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 206
+    }
+  }
+}
+```
+
+### in / notIn
+
+```graphql
+query {
+  transfers(filter: { id: { in: ["0x001", "0x002", "0x003"] } }) {
+    nodes {
+      id
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        { "id": "0x001", "amount": "1000000000" },
+        { "id": "0x002", "amount": "500000000" },
+        { "id": "0x003", "amount": "750000000" }
+      ]
+    }
+  }
+}
+```
+
+### greaterThan / lessThan
+
+```graphql
+query {
+  transfers(filter: { blockNumber: { greaterThan: 500, lessThan: 1000 } }) {
+    totalCount
+    nodes {
+      id
+      blockNumber
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 73,
+      "nodes": [
+        { "id": "0x050", "blockNumber": 501 },
+        { "id": "0x051", "blockNumber": 502 }
+      ]
+    }
+  }
+}
+```
+
+### like / likeInsensitive
+
+Use `%` as a wildcard character. `like` is case-sensitive; `likeInsensitive` is case-insensitive.
+
+```graphql
+query {
+  accounts(filter: { id: { like: "0xAlice%" } }) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "accounts": {
+      "nodes": [
+        { "id": "0xAlice01" },
+        { "id": "0xAlice02" }
+      ]
+    }
+  }
+}
+```
+
+### includes / includesInsensitive (contains)
+
+```graphql
+query {
+  transfers(filter: { id: { includes: "2c5edd" } }) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        { "id": "0x2c5edd8ec6" }
+      ]
+    }
+  }
+}
+```
+
+### startsWith / endsWith
+
+```graphql
+query {
+  transfers(filter: { id: { startsWith: "0x2c5" } }) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        { "id": "0x2c5edd8ec6" }
+      ]
+    }
+  }
+}
+```
+
+### isNull
+
+```graphql
+query {
+  transfers(filter: { toId: { isNull: true } }) {
+    totalCount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 5
+    }
+  }
+}
+```
+
+### Logical Operators: and / or / not
+
+Combine multiple filter conditions with `and`, `or`, and `not`. These accept arrays of filter objects (or a single filter object for `not`).
+
+#### and
+
+```graphql
+query {
+  transfers(
+    filter: {
+      and: [
+        { fromId: { equalTo: "0xAlice" } }
+        { blockNumber: { greaterThan: 500 } }
+      ]
+    }
+  ) {
+    totalCount
+    nodes {
+      id
+      fromId
+      blockNumber
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 18,
+      "nodes": [
+        { "id": "0x060", "fromId": "0xAlice", "blockNumber": 501 },
+        { "id": "0x061", "fromId": "0xAlice", "blockNumber": 602 }
+      ]
+    }
+  }
+}
+```
+
+#### or
+
+```graphql
+query {
+  transfers(
+    filter: {
+      or: [
+        { fromId: { equalTo: "0xAlice" } }
+        { fromId: { equalTo: "0xBob" } }
+      ]
+    }
+  ) {
+    totalCount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 95
+    }
+  }
+}
+```
+
+#### not
+
+```graphql
+query {
+  transfers(
+    filter: {
+      not: { fromId: { equalTo: "0xAlice" } }
+    }
+  ) {
+    totalCount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 206
+    }
+  }
+}
+```
+
+### Relation Filters
+
+Filter parent records based on properties of their related records.
+
+#### Forward Relation Filter
+
+Filter by properties of a related parent entity (FK column points to another table).
+
+```graphql
+query {
+  transfers(
+    filter: {
+      account: { id: { equalTo: "0xAlice" } }
+    }
+  ) {
+    nodes {
+      id
+      amount
+    }
+  }
+}
+```
+
+#### Exists Filter
+
+Check whether a related record exists at all.
+
+```graphql
+query {
+  transfers(
+    filter: {
+      accountExists: true
+    }
+  ) {
+    totalCount
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 243
+    }
+  }
+}
+```
+
+#### Backward Relation Filters: some / none / every
+
+Filter parent records based on their child records (one-to-many relations).
+
+**some** -- at least one child matches:
+
+```graphql
+query {
+  accounts(
+    filter: {
+      transfersByFromId: {
+        some: { amount: { greaterThan: "5000000000" } }
+      }
+    }
+  ) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "accounts": {
+      "nodes": [
+        { "id": "0xAlice" },
+        { "id": "0xDave" }
+      ]
+    }
+  }
+}
+```
+
+**none** -- no children match:
+
+```graphql
+query {
+  accounts(
+    filter: {
+      transfersByFromId: {
+        none: { amount: { greaterThan: "5000000000" } }
+      }
+    }
+  ) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+**every** -- all children match:
+
+```graphql
+query {
+  accounts(
+    filter: {
+      transfersByFromId: {
+        every: { blockNumber: { greaterThan: 100 } }
+      }
+    }
+  ) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+### List (Array) Column Filters
+
+For array-typed columns, use list filter operators: `every`, `some`, `none`, `isEmpty`.
+
+```graphql
+query {
+  accounts(
+    filter: {
+      tags: { some: { equalTo: "validator" } }
+    }
+  ) {
+    nodes {
+      id
+    }
+  }
+}
+```
+
+---
+
+## Aggregates
+
+When the server is started with `--aggregate` (enabled by default), every connection type includes an `aggregates` field. Aggregates are computed against the same filter as the connection query.
+
+### Available Aggregate Fields
+
+| Field | Return Type | Description |
+|---|---|---|
+| `count` | `BigInt` (string) | Total row count matching the filter |
+| `distinctCount` | Per-column `BigInt` (string) | Count of distinct values per column |
+| `sum` | Per-numeric-column `BigFloat` (string) | Sum of values |
+| `average` | Per-numeric-column `BigFloat` (string) | Average of values |
+| `min` | Per-numeric-column (Int/Float as number, BigInt/BigFloat as string) | Minimum value |
+| `max` | Per-numeric-column (Int/Float as number, BigInt/BigFloat as string) | Maximum value |
+| `stddevSample` | Per-numeric-column `BigFloat` (string) | Sample standard deviation |
+| `stddevPopulation` | Per-numeric-column `BigFloat` (string) | Population standard deviation |
+| `varianceSample` | Per-numeric-column `BigFloat` (string) | Sample variance |
+| `variancePopulation` | Per-numeric-column `BigFloat` (string) | Population variance |
+
+### Basic Aggregates
+
+```graphql
+query {
+  transfers {
+    aggregates {
+      count
+      sum {
+        amount
+        blockNumber
+      }
+      average {
+        amount
+      }
+      min {
+        blockNumber
+      }
+      max {
+        blockNumber
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "aggregates": {
+        "count": "248",
+        "sum": {
+          "amount": "98500000000000",
+          "blockNumber": "1234500"
+        },
+        "average": {
+          "amount": "397177419354.84"
+        },
+        "min": {
+          "blockNumber": 1
+        },
+        "max": {
+          "blockNumber": 9999
+        }
+      }
+    }
+  }
+}
+```
+
+### Distinct Count
+
+```graphql
+query {
+  transfers {
+    aggregates {
+      distinctCount {
+        fromId
+        toId
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "aggregates": {
+        "distinctCount": {
+          "fromId": "15",
+          "toId": "22"
+        }
+      }
+    }
+  }
+}
+```
+
+### Statistical Aggregates
+
+```graphql
+query {
+  transfers {
+    aggregates {
+      stddevSample {
+        blockNumber
+      }
+      stddevPopulation {
+        blockNumber
+      }
+      varianceSample {
+        blockNumber
+      }
+      variancePopulation {
+        blockNumber
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "aggregates": {
+        "stddevSample": {
+          "blockNumber": "2886.7513459481287"
+        },
+        "stddevPopulation": {
+          "blockNumber": "2880.9238454923"
+        },
+        "varianceSample": {
+          "blockNumber": "8333309.12345"
+        },
+        "variancePopulation": {
+          "blockNumber": "8299731.98765"
+        }
+      }
+    }
+  }
+}
+```
+
+### Aggregates with Filters
+
+Aggregates respect the connection's `filter` argument.
+
+```graphql
+query {
+  transfers(filter: { fromId: { equalTo: "0xAlice" } }) {
+    totalCount
+    aggregates {
+      count
+      sum {
+        amount
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "totalCount": 42,
+      "aggregates": {
+        "count": "42",
+        "sum": {
+          "amount": "42000000000000"
+        }
+      }
+    }
+  }
+}
+```
+
+### Grouped Aggregates
+
+Use `groupedAggregates` with a `groupBy` argument to compute aggregates per group. Supports time-truncation variants: `{COLUMN}_TRUNCATED_TO_HOUR` and `{COLUMN}_TRUNCATED_TO_DAY`.
+
+```graphql
+query {
+  transfers {
+    groupedAggregates(groupBy: [FROM_ID]) {
+      keys
+      sum {
+        amount
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "groupedAggregates": [
+        {
+          "keys": ["0xAlice"],
+          "sum": { "amount": "42000000000000" }
+        },
+        {
+          "keys": ["0xBob"],
+          "sum": { "amount": "28000000000000" }
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Relations
+
+Relations are automatically derived from foreign key constraints in the database schema.
+
+### Forward Relation (Many-to-One)
+
+When a table has a foreign key column (e.g., `transfers.from_id` references `accounts.id`), the entity type gets a field that resolves to the single related parent record. The field name is derived from the FK column with `_id` stripped (e.g., `from_id` becomes `from`).
+
+```graphql
+query {
+  transfers(first: 3) {
+    nodes {
+      id
+      amount
+      from {
+        id
+        balance
+      }
+      to {
+        id
+        balance
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        {
+          "id": "0x001",
+          "amount": "1000000000",
+          "from": {
+            "id": "0xAlice",
+            "balance": "50000000000000"
+          },
+          "to": {
+            "id": "0xBob",
+            "balance": "30000000000000"
+          }
+        },
+        {
+          "id": "0x002",
+          "amount": "500000000",
+          "from": {
+            "id": "0xBob",
+            "balance": "30000000000000"
+          },
+          "to": {
+            "id": "0xCharlie",
+            "balance": "10000000000000"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+### Backward Relation (One-to-Many as Connection)
+
+When another table's FK points to this table, the entity type gets a connection field. The field is named `{childEntities}By{FkColumn}` (e.g., `transfersByFromId`).
+
+This field supports the full set of connection arguments: `first`, `last`, `after`, `before`, `offset`, `filter`, `orderBy`, `orderByNull`, `distinct`.
+
+```graphql
+query {
+  account(id: "0xAlice") {
+    id
+    balance
+    transfersByFromId(first: 5, orderBy: [BLOCK_NUMBER_DESC]) {
+      totalCount
+      nodes {
+        id
+        amount
+        blockNumber
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "account": {
+      "id": "0xAlice",
+      "balance": "50000000000000",
+      "transfersByFromId": {
+        "totalCount": 42,
+        "nodes": [
+          { "id": "0x200", "amount": "800000000", "blockNumber": 9500 },
+          { "id": "0x198", "amount": "300000000", "blockNumber": 9200 },
+          { "id": "0x180", "amount": "1500000000", "blockNumber": 8800 },
+          { "id": "0x170", "amount": "200000000", "blockNumber": 8500 },
+          { "id": "0x150", "amount": "950000000", "blockNumber": 8000 }
+        ]
+      }
+    }
+  }
+}
+```
+
+### One-to-One Backward Relation
+
+When a foreign key has a unique constraint, the backward relation resolves to a single record instead of a connection.
+
+```graphql
+query {
+  account(id: "0xAlice") {
+    id
+    profileByAccountId {
+      displayName
+      avatarUrl
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "account": {
+      "id": "0xAlice",
+      "profileByAccountId": {
+        "displayName": "Alice",
+        "avatarUrl": "https://example.com/alice.png"
+      }
+    }
+  }
+}
+```
+
+### Nested Relation Queries
+
+Relations can be nested arbitrarily deep.
+
+```graphql
+query {
+  accounts(first: 2) {
+    nodes {
+      id
+      transfersByFromId(first: 2) {
+        nodes {
+          id
+          amount
+          to {
+            id
+            balance
+            transfersByFromId(first: 1) {
+              nodes {
+                id
+                amount
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "accounts": {
+      "nodes": [
+        {
+          "id": "0xAlice",
+          "transfersByFromId": {
+            "nodes": [
+              {
+                "id": "0x001",
+                "amount": "1000000000",
+                "to": {
+                  "id": "0xBob",
+                  "balance": "30000000000000",
+                  "transfersByFromId": {
+                    "nodes": [
+                      { "id": "0x002", "amount": "500000000" }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Metadata
+
+The `_metadata` and `_metadatas` queries provide information about the indexer state and the indexed chain.
+
+### Single Metadata Query
+
+```graphql
+query {
+  _metadata {
+    lastProcessedHeight
+    lastProcessedTimestamp
+    targetHeight
+    chain
+    specName
+    genesisHash
+    indexerHealthy
+    indexerNodeVersion
+    queryNodeVersion
+    dynamicDatasources
+    deployments
+    rowCountEstimate
+    dbSize
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "_metadata": {
+      "lastProcessedHeight": 1234567,
+      "lastProcessedTimestamp": "2025-01-15T10:30:00Z",
+      "targetHeight": 1234600,
+      "chain": "11155111",
+      "specName": "sepolia",
+      "genesisHash": "0xabcdef1234567890",
+      "indexerHealthy": true,
+      "indexerNodeVersion": "4.7.1",
+      "queryNodeVersion": "0.2.0",
+      "dynamicDatasources": "[]",
+      "deployments": { "1234567": "QmXyz..." },
+      "rowCountEstimate": [
+        { "table": "transfers", "estimate": 248 },
+        { "table": "accounts", "estimate": 50 }
+      ],
+      "dbSize": "52428800"
+    }
+  }
+}
+```
+
+### Metadata with chainId Filter
+
+For multi-chain projects, pass the `chainId` argument to select a specific chain's metadata.
+
+```graphql
+query {
+  _metadata(chainId: "11155111") {
+    chain
+    lastProcessedHeight
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "_metadata": {
+      "chain": "11155111",
+      "lastProcessedHeight": 1234567
+    }
+  }
+}
+```
+
+### All Metadatas (Connection)
+
+The `_metadatas` query returns metadata for all chains in a connection format.
+
+```graphql
+query {
+  _metadatas {
+    totalCount
+    nodes {
+      chain
+      lastProcessedHeight
+      queryNodeVersion
+    }
+    edges {
+      cursor
+      node {
+        chain
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "_metadatas": {
+      "totalCount": 2,
+      "nodes": [
+        {
+          "chain": "11155111",
+          "lastProcessedHeight": 1234567,
+          "queryNodeVersion": "0.2.0"
+        },
+        {
+          "chain": "80002",
+          "lastProcessedHeight": 987654,
+          "queryNodeVersion": "0.2.0"
+        }
+      ],
+      "edges": [
+        { "cursor": "WzBd", "node": { "chain": "11155111" } },
+        { "cursor": "WzFd", "node": { "chain": "80002" } }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## Historical Queries
+
+Tables that track historical state (those with a `_block_range` column) expose a `blockHeight` argument on their connection queries. This argument lets you query the state of entities at a specific block height.
+
+When `blockHeight` is provided, only records whose `_block_range` contains that block height are returned. Without `blockHeight`, only the current (latest) version of each record is returned.
+
+### Query at a Specific Block Height
+
+```graphql
+query {
+  accounts(
+    blockHeight: "5000000"
+    first: 10
+  ) {
+    totalCount
+    nodes {
+      id
+      balance
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "accounts": {
+      "totalCount": 35,
+      "nodes": [
+        { "id": "0xAlice", "balance": "25000000000000" },
+        { "id": "0xBob", "balance": "18000000000000" }
+      ]
+    }
+  }
+}
+```
+
+### Historical Queries with Relations
+
+Block height propagates to nested relation queries automatically. When you query transfers at a specific block height, forward and backward relations also respect that block height.
+
+```graphql
+query {
+  transfers(blockHeight: "5000000", first: 5) {
+    nodes {
+      id
+      amount
+      from {
+        id
+        balance
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfers": {
+      "nodes": [
+        {
+          "id": "0x050",
+          "amount": "500000000",
+          "from": {
+            "id": "0xAlice",
+            "balance": "25000000000000"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+> **Note:** Some schemas use `timestamp` instead of `blockHeight` for historical queries. The argument name is determined by the `historicalStateEnabled` metadata key. Pass a stringified integer in either case.
+
+---
+
+## Full-Text Search
+
+If your SubQuery project defines full-text search functions, they are exposed as root query fields. Each search function returns a connection of the target entity type.
+
+### Search Query
+
+```graphql
+query {
+  searchTransfers(search: "Alice Bob", first: 10) {
+    totalCount
+    nodes {
+      id
+      fromId
+      toId
+      amount
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "searchTransfers": {
+      "totalCount": 15,
+      "nodes": [
+        {
+          "id": "0x001",
+          "fromId": "0xAlice",
+          "toId": "0xBob",
+          "amount": "1000000000"
+        },
+        {
+          "id": "0x045",
+          "fromId": "0xBob",
+          "toId": "0xAlice",
+          "amount": "200000000"
+        }
+      ]
+    }
+  }
+}
+```
+
+**Arguments:**
+
+| Argument | Type | Description |
+|---|---|---|
+| `search` | `String!` | The search query string. Internally sanitized and converted to a PostgreSQL `tsquery`. |
+| `first` | `Int` | Maximum number of results to return. |
+| `offset` | `Int` | Number of results to skip. |
+
+---
+
+## Subscriptions
+
+When the server is started with `--subscription`, entities expose real-time subscription fields over WebSocket (GraphQL over WebSocket protocol).
+
+Each entity generates a subscription field named after the plural entity (e.g., `transfers`). The subscription streams `{Entity}SubscriptionPayload` events containing the affected record's `id`, the `mutation_type`, and the full `_entity` object.
+
+### Subscribe to All Changes
+
+```graphql
+subscription {
+  transfers {
+    id
+    mutation_type
+    _entity {
+      id
+      fromId
+      toId
+      amount
+      blockNumber
+    }
+  }
+}
+```
+
+Example event pushed to the client:
+
+```json
+{
+  "data": {
+    "transfers": {
+      "id": "0x300",
+      "mutation_type": "INSERT",
+      "_entity": {
+        "id": "0x300",
+        "fromId": "0xAlice",
+        "toId": "0xEve",
+        "amount": "750000000",
+        "blockNumber": 10050
+      }
+    }
+  }
+}
+```
+
+### Subscribe with Filters
+
+Filter subscriptions by `id` (list of IDs) and/or `mutation` (list of mutation types: `INSERT`, `UPDATE`, `DELETE`).
+
+```graphql
+subscription {
+  transfers(
+    id: ["0x001", "0x002"]
+    mutation: [INSERT, UPDATE]
+  ) {
+    id
+    mutation_type
+    _entity {
+      id
+      amount
+    }
+  }
+}
+```
+
+### WebSocket Connection
+
+Connect using the `graphql-ws` protocol:
+
+```
+ws://localhost:3000/graphql
+```
+
+Example connection init message:
+
+```json
+{
+  "type": "connection_init",
+  "payload": {}
+}
+```
+
+Example subscribe message:
+
+```json
+{
+  "id": "1",
+  "type": "subscribe",
+  "payload": {
+    "query": "subscription { transfers { id mutation_type } }"
+  }
+}
+```
+
+---
+
+## Batch Queries
+
+Send multiple GraphQL operations in a single HTTP request by POSTing a JSON array. Each operation in the array is executed independently and returns its own result.
+
+### Request
+
+```bash
+curl -X POST http://localhost:3000/graphql \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "query": "{ transfers(first: 2) { nodes { id amount } } }"
+    },
+    {
+      "query": "{ accounts(first: 2) { nodes { id balance } } }"
+    }
+  ]'
+```
+
+### Response
+
+```json
+[
+  {
+    "data": {
+      "transfers": {
+        "nodes": [
+          { "id": "0x001", "amount": "1000000000" },
+          { "id": "0x002", "amount": "500000000" }
+        ]
+      }
+    }
+  },
+  {
+    "data": {
+      "accounts": {
+        "nodes": [
+          { "id": "0xAlice", "balance": "50000000000000" },
+          { "id": "0xBob", "balance": "30000000000000" }
+        ]
+      }
+    }
+  }
+]
+```
+
+### Batch with Variables
+
+```bash
+curl -X POST http://localhost:3000/graphql \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "query": "query GetTransfers($count: Int!) { transfers(first: $count) { nodes { id } } }",
+      "variables": { "count": 5 }
+    },
+    {
+      "query": "query GetAccount($id: ID!) { account(id: $id) { id balance } }",
+      "variables": { "id": "0xAlice" }
+    }
+  ]'
+```
+
+---
+
+## Node Interface
+
+Every entity type implements the `Node` interface, which exposes a globally unique `nodeId` field. The root `node` query allows looking up any entity by its `nodeId`, regardless of type.
+
+### Fetching nodeId
+
+The `nodeId` field is available on every entity. It is a base64-encoded JSON array: `["table_name", "_id_uuid"]`.
+
+```graphql
+query {
+  transfer(id: "0x001") {
+    nodeId
+    id
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "transfer": {
+      "nodeId": "WyJ0cmFuc2ZlcnMiLCJhM2YyYzFkOC0xMjM0LTU2NzgtOWFiYy1kZWYwMTIzNDU2NzgiXQ==",
+      "id": "0x001"
+    }
+  }
+}
+```
+
+### Global Node Lookup
+
+Use `node(nodeId: ID!)` with inline fragments to resolve any entity type.
+
+```graphql
+query {
+  node(nodeId: "WyJ0cmFuc2ZlcnMiLCJhM2YyYzFkOC0xMjM0LTU2NzgtOWFiYy1kZWYwMTIzNDU2NzgiXQ==") {
+    ... on Transfer {
+      id
+      fromId
+      toId
+      amount
+      blockNumber
+    }
+    ... on Account {
+      id
+      balance
+    }
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "node": {
+      "id": "0x001",
+      "fromId": "0xAlice",
+      "toId": "0xBob",
+      "amount": "1000000000",
+      "blockNumber": 100
+    }
+  }
+}
+```
+
+The `node` query decodes the `nodeId` to determine the table and internal UUID, then fetches the record and returns it with the correct GraphQL type so that inline fragments resolve properly.
+
+---
+
+## Scalar Types
+
+| GraphQL Type | JSON Serialization | Notes |
+|---|---|---|
+| `String` | `"text"` | |
+| `Int` | `123` | 32-bit integer |
+| `Float` | `1.23` | 64-bit floating point |
+| `Boolean` | `true` / `false` | |
+| `BigInt` | `"9950040000"` | Serialized as a **string** to preserve precision |
+| `BigFloat` | `"1234.5678"` | Serialized as a **string** to preserve precision |
+| `Date` | `"2025-01-15"` | ISO 8601 date |
+| `Datetime` | `"2025-01-15T10:30:00Z"` | RFC 3339 timestamp |
+| `JSON` | `{...}` / `[...]` | Arbitrary JSON |
+| `Cursor` | `"eyJpZCI6IjB4MDAxIn0="` | Base64-encoded JSON |
+| `ID` | `"0x001"` | String identifier |

@@ -1,0 +1,67 @@
+---
+title: Installation
+description: How to build and run omnihedron locally
+---
+
+## Prerequisites
+
+- Rust toolchain (stable + nightly for formatting)
+- PostgreSQL 17
+- A SubQuery-indexed database
+
+## First-time setup
+
+Clone the repository and load the test fixture data:
+
+```bash
+git clone https://github.com/polytope-labs/omnihedron.git
+cd omnihedron
+bash scripts/setup_db.sh
+```
+
+This starts a PostgreSQL container on port `5433` and loads the test fixture into the `indexer` database.
+
+## Running the services
+
+```bash
+bash scripts/start_services.sh
+```
+
+This builds the Rust binary and starts:
+
+- **Omnihedron** (Rust) on `http://localhost:3000`
+- **@subql/query** (TypeScript) on `http://localhost:3001`
+
+Both services point at the same database so you can compare responses.
+
+## Running tests
+
+```bash
+# Unit tests only
+cargo test --lib
+
+# Full integration tests (requires both services running)
+cargo test
+```
+
+The integration test suite (62 tests) compares Rust and TypeScript responses for correctness.
+
+## Formatting
+
+The project enforces nightly `rustfmt`:
+
+```bash
+cargo +nightly fmt --all
+```
+
+CI will reject PRs that aren't formatted with nightly.
+
+## Stopping services
+
+```bash
+# Stop Rust + TypeScript services
+bash scripts/stop_services.sh
+
+# Also stop PostgreSQL
+bash scripts/stop_services.sh --with-db
+```

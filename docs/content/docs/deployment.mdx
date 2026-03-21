@@ -1,0 +1,251 @@
+---
+title: Deployment Guide
+description: Deploying omnihedron in production — Docker and operational best practices
+---
+
+
+## 1. Overview
+
+Omnihedron is a high-performance Rust GraphQL query service for SubQuery Network indexers. It replaces the TypeScript `@subql/query` service with a multi-threaded Rust binary that handles tens of thousands of concurrent connections.
+
+### Requirements
+
+| Component | Minimum |
+|---|---|
+| **Runtime** | Pre-built binary *or* Docker image (`polytopelabs/omnihedron`) |
+| **PostgreSQL** | 14+ with a populated SubQuery indexer schema |
+| **Default port** | 3000 (configurable via `--port` / `OMNIHEDRON_PORT`) |
+| **Memory** | ~21 MB idle, ~47 MB peak (8 worker threads) |
+
+### Endpoints
+
+| Path | Method | Purpose |
+|---|---|---|
+| `/` | `POST` | GraphQL queries (single and batch) |
+| `/` | `GET` | GraphiQL playground (when `--playground` enabled) |
+| `/ws` | `GET` | WebSocket subscriptions (when `--subscription` enabled) |
+| `/health` | `GET` | Liveness probe (checks DB connectivity, returns pool stats) |
+| `/metrics` | `GET` | Prometheus metrics (when `--metrics` enabled) |
+
+### Environment variables (database)
+
+```bash
+DB_HOST=localhost        # PostgreSQL host
+DB_HOST_READ=            # Optional read-replica host
+DB_PORT=5432             # PostgreSQL port
+DB_USER=postgres         # PostgreSQL user
+DB_PASS=postgres         # PostgreSQL password
+DB_DATABASE=indexer      # PostgreSQL database name
+```
+
+---
+
+## 2. Docker
+
+### Dockerfile
+
+The project ships a Dockerfile at `docker/Dockerfile`. It uses a minimal Debian Bookworm slim base with only `ca-certificates` and `libssl3` installed. The binary must be built on the host first:
+
+```bash
+cargo build --release --bin omnihedron
+```
+
+The Dockerfile copies the pre-built binary:
+
+```dockerfile
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/omnihedron /usr/local/bin/omnihedron
+
+EXPOSE 3000
+ENTRYPOINT ["omnihedron"]
+```
+
+### Multi-stage build (recommended for CI)
+
+For a fully self-contained build that does not require the host to have Rust installed:
+
+```dockerfile
+# Stage 1: Build
+FROM rust:1.85-bookworm AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release --bin omnihedron
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/omnihedron /usr/local/bin/omnihedron
+EXPOSE 3000
+ENTRYPOINT ["omnihedron"]
+```
+
+### Production docker-compose
+
+```yaml
+services:
+  omnihedron:
+    image: polytopelabs/omnihedron:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: "${DB_PASS}"
+      DB_DATABASE: indexer
+      DB_HOST_READ: postgres-replica          # optional read replica
+      OMNIHEDRON_NAME: "${SCHEMA_NAME}"
+      OMNIHEDRON_PORT: "3000"
+      OMNIHEDRON_LOG_LEVEL: info
+      OMNIHEDRON_OUTPUT_FMT: json
+      OMNIHEDRON_METRICS: "true"
+      OMNIHEDRON_MAX_CONNECTION: "20"
+      OMNIHEDRON_QUERY_LIMIT: "100"
+      OMNIHEDRON_QUERY_DEPTH_LIMIT: "10"
+      OMNIHEDRON_QUERY_COMPLEXITY: "500"
+      OMNIHEDRON_QUERY_BATCH_LIMIT: "5"
+      OMNIHEDRON_QUERY_TIMEOUT: "10000"
+      TOKIO_WORKER_THREADS: "8"
+    command: ["--name", "${SCHEMA_NAME}"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "2"
+        reservations:
+          memory: 64M
+          cpus: "0.5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: indexer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${DB_PASS}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## 3. Production Checklist
+
+### Connection pool sizing
+
+The default pool size is 10 (`--max-connection` / `OMNIHEDRON_MAX_CONNECTION`). Tune based on your PostgreSQL `max_connections` and the number of omnihedron replicas:
+
+```
+pool_size_per_replica = floor(pg_max_connections / (num_replicas + headroom))
+```
+
+For example, with `max_connections = 200`, 4 replicas, and 40 connections reserved for other services:
+
+```
+pool_size = floor((200 - 40) / 4) = 40
+```
+
+Set `OMNIHEDRON_MAX_CONNECTION=40` on each replica.
+
+If using `DB_HOST_READ` for a read replica, the pool is split across primary (writes/subscriptions) and replica (reads). The same `max_connection` value applies to each.
+
+### Query limits
+
+Enable all query protections in production. Do **not** use `--unsafe-mode`:
+
+| Setting | Recommended | Purpose |
+|---|---|---|
+| `OMNIHEDRON_QUERY_LIMIT` | `100` (default) | Max rows returned per entity query |
+| `OMNIHEDRON_QUERY_DEPTH_LIMIT` | `10` | Prevents deeply nested relation traversals |
+| `OMNIHEDRON_QUERY_COMPLEXITY` | `500` | Blocks expensive queries before execution |
+| `OMNIHEDRON_QUERY_ALIAS_LIMIT` | `30` | Prevents alias-based DoS amplification |
+| `OMNIHEDRON_QUERY_BATCH_LIMIT` | `5` | Limits queries per batch request |
+| `OMNIHEDRON_QUERY_TIMEOUT` | `10000` | Query timeout in ms (enforced via PostgreSQL `statement_timeout`) |
+
+### Timeouts
+
+- **Query timeout** (`OMNIHEDRON_QUERY_TIMEOUT`): Enforced at the PostgreSQL level via `statement_timeout` set on every pool connection. The database kills any query exceeding this limit. Default: 10,000 ms.
+
+### Logging
+
+For production, use structured JSON output:
+
+```bash
+OMNIHEDRON_OUTPUT_FMT=json
+OMNIHEDRON_LOG_LEVEL=info
+```
+
+Every HTTP request logs: `request_id`, `method`, `path`, `status`, and `duration_ms`. GraphQL queries at debug level log: `operation`, `duration_ms`, `has_errors`, and a compact `query` preview.
+
+Optional file logging with rotation:
+
+```bash
+OMNIHEDRON_LOG_PATH=/var/log/omnihedron/query.log
+OMNIHEDRON_LOG_ROTATE=true
+```
+
+### Metrics
+
+Enable Prometheus metrics with `OMNIHEDRON_METRICS=true` (enabled by default). The `/metrics` endpoint exposes:
+
+| Metric | Type | Description |
+|---|---|---|
+| `omnihedron_http_requests_total` | Counter | HTTP requests by method, path, status |
+| `omnihedron_http_request_duration_seconds` | Histogram | Request latency by method, path |
+| `omnihedron_process_resident_memory_bytes` | Gauge | Process RSS memory |
+| `omnihedron_tokio_alive_tasks` | Gauge | Active async tasks |
+| `omnihedron_tokio_num_workers` | Gauge | Tokio worker threads |
+
+### Tokio worker threads
+
+On machines with many cores, set `TOKIO_WORKER_THREADS` to avoid excessive memory from idle thread stacks:
+
+| Cores | Recommended threads | Idle RSS |
+|---|---|---|
+| 2-8 | Leave default | ~21 MB |
+| 16-32 | 8-16 | ~21-30 MB |
+| 64+ | 8-16 | ~21-30 MB |
+
+For a PostgreSQL-bound service with a pool of 10-40 connections, 8-16 worker threads is optimal regardless of core count.
+
+### Schema hot reload
+
+By default, omnihedron listens for PostgreSQL `LISTEN/NOTIFY` events on the SubQuery schema channel. When the indexer updates the schema, the service re-introspects and atomically swaps the GraphQL schema. In-flight requests are unaffected.
+
+- Keep-alive interval: `OMNIHEDRON_SL_KEEP_ALIVE_INTERVAL` (default: 180,000 ms / 3 minutes).
+- To disable: `OMNIHEDRON_DISABLE_HOT_SCHEMA=true`.
+
+### Security
+
+- Never run with `--unsafe-mode` in production.
+- Disable `--playground` in production (it is off by default).
+- Use PostgreSQL TLS (`--pg-ca`, `--pg-key`, `--pg-cert`) for encrypted database connections.
+- Run as a non-root user.
+- Restrict `/metrics` endpoint to internal networks.
+- All user-supplied values in SQL use parameterized `$N` placeholders. Column and table names come from introspection and are never interpolated from user input.
