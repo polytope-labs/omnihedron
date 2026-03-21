@@ -30,9 +30,6 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          # Cache key includes OS and Cargo.lock so a lockfile change busts it
-          key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
 
       - name: Read version from Cargo.toml
         id: cargo_version
@@ -53,9 +50,6 @@ jobs:
             echo "::error::Git tag v${TAG} does not match Cargo.toml version ${CARGO}. Bump Cargo.toml before tagging."
             exit 1
           fi
-
-      - name: Build release binary
-        run: cargo build --release --bin omnihedron
 
       - name: Extract Docker metadata
         id: meta
@@ -79,7 +73,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: docker/Dockerfile.ci
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
