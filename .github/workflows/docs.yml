@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -47,6 +51,7 @@ jobs:
           path: docs/out
 
   deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     environment:
