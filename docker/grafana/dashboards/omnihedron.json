@@ -224,7 +224,7 @@
       "targets": [
         { "expr": "omnihedron_db_pool_size - omnihedron_db_pool_available", "legendFormat": "busy", "refId": "A" },
         { "expr": "omnihedron_db_pool_available", "legendFormat": "available", "refId": "B" },
-        { "expr": "omnihedron_db_pool_max_size", "legendFormat": "Max", "refId": "C" }
+        { "expr": "omnihedron_db_pool_max_size - omnihedron_db_pool_size", "legendFormat": "unallocated", "refId": "C" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -242,20 +242,11 @@
             "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
           },
           {
-            "matcher": { "id": "byName", "options": "Max" },
-            "properties": [{ "id": "custom.hidden", "value": true }]
+            "matcher": { "id": "byName", "options": "unallocated" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
           }
         ]
-      },
-      "transformations": [
-        {
-          "id": "configFromData",
-          "options": {
-            "configRefId": "C",
-            "mappings": [{ "fieldName": "Max", "handlerKey": "max" }]
-          }
-        }
-      ]
+      }
     },
     {
       "title": "Pool Checkout Wait (p50 / p99)",
