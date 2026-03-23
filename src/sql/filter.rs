@@ -228,6 +228,14 @@ fn build_op_condition(
 	value: &serde_json::Value,
 	param_offset: &mut usize,
 ) -> Option<(String, Option<serde_json::Value>)> {
+	// Null-valued operators mean "no constraint" — skip them.
+	// Without this, a null value is sent as `Option::<String>::None` (PG text NULL)
+	// and PostgreSQL fails to resolve the operator (e.g., `>(timestamptz, text)`).
+	// The `isNull` operator is the only one where a non-bool null is ignored anyway.
+	if value.is_null() && op != "isNull" {
+		return None;
+	}
+
 	let qualified = format!("{alias}.{col}");
 
 	match op {
@@ -520,5 +528,37 @@ mod tests {
 		assert_eq!(camel_to_snake("blockNumber"), "block_number");
 		assert_eq!(camel_to_snake("id"), "id");
 		assert_eq!(camel_to_snake("createdAt"), "created_at");
+	}
+
+	#[test]
+	fn null_filter_values_skipped() {
+		// Filter with null-valued operators should produce no conditions,
+		// not generate broken SQL with text-typed NULL parameters.
+		let filter = serde_json::json!({
+			"createdAt": { "greaterThan": null, "lessThan": null },
+			"status": { "equalTo": null },
+		});
+		let mut offset = 0;
+		let (conditions, params) = build_filter_sql(&filter, "t", &mut offset);
+		assert!(
+			conditions.is_empty(),
+			"null operators should produce no conditions: {conditions:?}"
+		);
+		assert!(params.is_empty(), "null operators should produce no params: {params:?}");
+		assert_eq!(offset, 0, "null operators should not advance param_offset");
+	}
+
+	#[test]
+	fn null_filter_mixed_with_real_values() {
+		// Mix of null and real values — only real values should generate conditions.
+		let filter = serde_json::json!({
+			"blockNumber": { "greaterThan": 100, "lessThan": null },
+		});
+		let mut offset = 0;
+		let (conditions, params) = build_filter_sql(&filter, "t", &mut offset);
+		assert_eq!(conditions.len(), 1, "only non-null operator should produce a condition");
+		assert_eq!(params.len(), 1);
+		assert_eq!(offset, 1);
+		assert!(conditions[0].contains("> $1"), "condition: {}", conditions[0]);
 	}
 }
