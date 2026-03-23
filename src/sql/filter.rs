@@ -474,10 +474,13 @@ fn build_op_condition(
 				// We can't return multiple params from this function directly,
 				// so we encode as a single JSON array and use = ANY($N::jsonb).
 				// The connection resolver wraps JSON arrays via `json_to_pg_params`.
+				// Cast the column to text so the comparison works for all column
+				// types (especially PostgreSQL enums, where `=(enum, text)` fails
+				// in the = ANY() context).
 				*param_offset += 1;
 				Some((
 					format!(
-						"{qualified} = ANY(ARRAY(SELECT jsonb_array_elements_text(${}::jsonb)))",
+						"{qualified}::text = ANY(ARRAY(SELECT jsonb_array_elements_text(${}::jsonb)))",
 						param_offset
 					),
 					Some(value.clone()),
@@ -494,7 +497,7 @@ fn build_op_condition(
 				*param_offset += 1;
 				Some((
 					format!(
-						"{qualified} != ALL(ARRAY(SELECT jsonb_array_elements_text(${}::jsonb)))",
+						"{qualified}::text != ALL(ARRAY(SELECT jsonb_array_elements_text(${}::jsonb)))",
 						param_offset
 					),
 					Some(value.clone()),
