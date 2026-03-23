@@ -65,6 +65,9 @@ fn default_cache() -> &'static tokio::sync::Mutex<Option<String>> {
 ///   1. Plain `_metadata` (single-chain projects)
 ///   2. `_metadata_0x<hash>` matching the requested chainId
 ///   3. First `_metadata_0x<hash>` table found (fallback)
+///
+/// Uses `pg_class`/`pg_namespace` directly instead of `information_schema.tables`
+/// which is a slow multi-join view.
 async fn find_metadata_table(
 	client: &RequestClient,
 	schema: &str,
@@ -78,10 +81,13 @@ async fn find_metadata_table(
 		}
 	}
 
-	let sql = "SELECT table_name FROM information_schema.tables \
-               WHERE table_schema = $1 \
-                 AND (table_name = '_metadata' OR table_name LIKE '_metadata_0x%') \
-               ORDER BY table_name";
+	let sql = "SELECT c.relname::text AS table_name \
+               FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = $1 \
+                 AND c.relkind = 'r' \
+                 AND (c.relname = '_metadata' OR c.relname LIKE '_metadata_0x%') \
+               ORDER BY c.relname";
 	let rows = client.query(sql, &[&schema]).await.ok()?;
 	let tables: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
@@ -151,8 +157,26 @@ pub async fn resolve_metadata(
 
 	debug!(table = %table, "Fetching metadata from table");
 
-	let sql = format!(r#"SELECT key, value FROM "{schema}"."{table}""#);
-	let rows = req_client.query(&sql, &[]).await.map_err(|e| {
+	// Run the key/value scan, row count estimates, and db size concurrently.
+	// Uses pg_class directly instead of information_schema for row estimates.
+	let kv_sql = format!(r#"SELECT key, value FROM "{schema}"."{table}""#);
+	let estimate_sql = "SELECT c.relname AS \"table\", c.reltuples::bigint AS estimate \
+                        FROM pg_class c \
+                        JOIN pg_namespace n ON n.oid = c.relnamespace \
+                        WHERE n.nspname = $1 \
+                          AND c.relkind = 'r' \
+                          AND c.relname NOT LIKE '\\_metadata%'";
+	let size_sql = "SELECT pg_database_size(current_database()) AS db_size";
+
+	let schema_str: &str = schema.as_str();
+	let est_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&schema_str];
+	let (kv_result, est_result, size_result) = tokio::join!(
+		req_client.query(&kv_sql, &[]),
+		req_client.query(estimate_sql, &est_params),
+		req_client.query_one(size_sql, &[]),
+	);
+
+	let rows = kv_result.map_err(|e| {
 		warn!(error = %e, table = %table, "Failed to query metadata table");
 		e
 	})?;
@@ -171,20 +195,11 @@ pub async fn resolve_metadata(
 		}
 	}
 
-	// Row count estimates
-	let estimate_sql = r#"
-        SELECT relname AS "table", reltuples::bigint AS estimate
-        FROM pg_class
-        WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-          AND relname IN (
-            SELECT table_name FROM information_schema.tables WHERE table_schema = $1
-          )
-    "#;
-	let est_rows = req_client.query(estimate_sql, &[&schema.as_str()]).await.unwrap_or_else(|e| {
-		warn!(error = %e, "Failed to query row count estimates");
-		vec![]
-	});
-	let estimates: Vec<Value> = est_rows
+	let estimates: Vec<Value> = est_result
+		.unwrap_or_else(|e| {
+			warn!(error = %e, "Failed to query row count estimates");
+			vec![]
+		})
 		.iter()
 		.map(|r| {
 			let tbl: String = r.get("table");
@@ -193,9 +208,7 @@ pub async fn resolve_metadata(
 		})
 		.collect();
 
-	// DB size
-	let size_sql = "SELECT pg_database_size(current_database()) AS db_size";
-	let db_size: i64 = match req_client.query_one(size_sql, &[]).await {
+	let db_size: i64 = match size_result {
 		Ok(row) => row.try_get("db_size").unwrap_or(0),
 		Err(e) => {
 			warn!(error = %e, "Failed to query database size");
@@ -224,12 +237,15 @@ pub async fn resolve_metadatas(
 		.data::<Arc<RequestClient>>()
 		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 
-	// Find all metadata tables
-	let sql = "SELECT table_name FROM information_schema.tables \
-               WHERE table_schema = $1 \
-                 AND (table_name = '_metadata' OR table_name LIKE '_metadata_0x%' \
-                      OR table_name LIKE '_multi_metadata_%') \
-               ORDER BY table_name";
+	// Find all metadata tables via pg_class (avoids slow information_schema view).
+	let sql = "SELECT c.relname::text AS table_name \
+               FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = $1 \
+                 AND c.relkind = 'r' \
+                 AND (c.relname = '_metadata' OR c.relname LIKE '_metadata_0x%' \
+                      OR c.relname LIKE '_multi_metadata_%') \
+               ORDER BY c.relname";
 	let table_rows = req_client.query(sql, &[&schema.as_str()]).await.map_err(|e| {
 		warn!(error = %e, "Failed to list metadata tables");
 		e
@@ -280,6 +296,7 @@ pub async fn resolve_metadatas(
 
 /// Fetch metadata from the indexer HTTP API and merge into the existing metadata map.
 /// Matches TS `GetMetadataPlugin.ts` behaviour: GET `{indexer_url}/meta` and `/health`.
+/// Both requests run concurrently.
 async fn merge_indexer_metadata(meta: &mut serde_json::Map<String, Value>, indexer_url: &str) {
 	let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()
 	{
@@ -287,9 +304,15 @@ async fn merge_indexer_metadata(meta: &mut serde_json::Map<String, Value>, index
 		Err(_) => return,
 	};
 
-	// Fetch /meta
-	let meta_url = format!("{}/meta", indexer_url.trim_end_matches('/'));
-	if let Ok(resp) = client.get(&meta_url).send().await {
+	let base = indexer_url.trim_end_matches('/');
+	let meta_url = format!("{base}/meta");
+	let health_url = format!("{base}/health");
+
+	let (meta_resp, health_resp) =
+		tokio::join!(client.get(&meta_url).send(), client.get(&health_url).send(),);
+
+	// Merge /meta fields
+	if let Ok(resp) = meta_resp {
 		if let Ok(body) = resp.json::<Value>().await {
 			if let Some(obj) = body.as_object() {
 				for (k, v) in obj {
@@ -302,9 +325,8 @@ async fn merge_indexer_metadata(meta: &mut serde_json::Map<String, Value>, index
 		}
 	}
 
-	// Fetch /health for indexerHealthy
-	let health_url = format!("{}/health", indexer_url.trim_end_matches('/'));
-	match client.get(&health_url).send().await {
+	// Merge /health status
+	match health_resp {
 		Ok(resp) => {
 			meta.insert("indexerHealthy".to_string(), json!(resp.status().is_success()));
 		},
