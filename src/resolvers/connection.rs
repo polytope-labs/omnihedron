@@ -330,8 +330,13 @@ pub async fn resolve_connection_ctx(
 				}
 			}
 		}
-		let cursor_fields: Vec<(&str, Value)> =
-			vec![("id", node.get("id").cloned().unwrap_or(json!(null)))];
+		// Encode the actual ORDER BY columns into the cursor so that
+		// cursor-based pagination works correctly for any orderBy, not
+		// just the default `id ASC`.
+		let cursor_fields: Vec<(&str, Value)> = order_cols
+			.iter()
+			.map(|col| (col.as_str(), node.get(col).cloned().unwrap_or(json!(null))))
+			.collect();
 		let cursor = encode_cursor(&cursor_fields);
 		edges.push(json!({ "cursor": cursor, "node": node }));
 		nodes.push(node);

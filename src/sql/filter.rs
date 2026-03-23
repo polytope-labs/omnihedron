@@ -430,7 +430,7 @@ fn build_op_condition(
 				*param_offset += 1;
 				Some((
 					format!(
-						"lower({qualified}) = ANY(ARRAY(SELECT lower(x) FROM jsonb_array_elements_text(${}::jsonb) AS x))",
+						"lower({qualified}::text) = ANY(ARRAY(SELECT lower(x) FROM jsonb_array_elements_text(${}::jsonb) AS x))",
 						param_offset
 					),
 					Some(value.clone()),
@@ -446,7 +446,7 @@ fn build_op_condition(
 				*param_offset += 1;
 				Some((
 					format!(
-						"lower({qualified}) != ALL(ARRAY(SELECT lower(x) FROM jsonb_array_elements_text(${}::jsonb) AS x))",
+						"lower({qualified}::text) != ALL(ARRAY(SELECT lower(x) FROM jsonb_array_elements_text(${}::jsonb) AS x))",
 						param_offset
 					),
 					Some(value.clone()),
