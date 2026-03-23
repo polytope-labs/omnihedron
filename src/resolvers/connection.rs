@@ -245,7 +245,10 @@ pub async fn resolve_connection_ctx(
 	// `filtered_total` = rows matching the cursor-filtered WHERE, for hasNextPage.
 	let (rows, total, filtered_total) = if !needs_rows {
 		trace!(count_sql = %count_sql, "Executing count-only query");
-		let row = req_client.query_one(&count_sql, &base_pg_refs).await?;
+		let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
+			tracing::error!(sql = %count_sql, error = %e, "Count query failed");
+			async_graphql::Error::new(format!("db error: {e}"))
+		})?;
 		let t: i64 = row.get("total");
 		(vec![], t, t)
 	} else {
@@ -285,7 +288,10 @@ pub async fn resolve_connection_ctx(
 		};
 
 		trace!(sql = %sql, "Executing connection query");
-		let rows = req_client.query(&sql, &pg_refs).await?;
+		let rows = req_client.query(&sql, &pg_refs).await.map_err(|e| {
+			tracing::error!(sql = %sql, error = %e, "Connection query failed");
+			async_graphql::Error::new(format!("db error: {e}"))
+		})?;
 		let filtered = if use_window_count {
 			rows.first()
 				.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
@@ -324,8 +330,13 @@ pub async fn resolve_connection_ctx(
 				}
 			}
 		}
-		let cursor_fields: Vec<(&str, Value)> =
-			vec![("id", node.get("id").cloned().unwrap_or(json!(null)))];
+		// Encode the actual ORDER BY columns into the cursor so that
+		// cursor-based pagination works correctly for any orderBy, not
+		// just the default `id ASC`.
+		let cursor_fields: Vec<(&str, Value)> = order_cols
+			.iter()
+			.map(|col| (col.as_str(), node.get(col).cloned().unwrap_or(json!(null))))
+			.collect();
 		let cursor = encode_cursor(&cursor_fields);
 		edges.push(json!({ "cursor": cursor, "node": node }));
 		nodes.push(node);
