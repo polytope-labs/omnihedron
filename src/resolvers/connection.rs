@@ -131,7 +131,12 @@ pub async fn resolve_connection_ctx(
 	// ── ORDER BY ──────────────────────────────────────────────────────────────
 	let order_clauses =
 		parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema), Some(filter_ctx));
-	let order_cols: Vec<String> = extract_order_cols(&order_clauses);
+	let mut order_cols: Vec<String> = extract_order_cols(&order_clauses);
+	// When no explicit orderBy is given the default ORDER BY is `t.id ASC`,
+	// so the cursor must compare against the `id` column to work correctly.
+	if order_cols.is_empty() {
+		order_cols.push("id".to_string());
+	}
 
 	// ── PAGINATION ────────────────────────────────────────────────────────────
 	let pagination = resolve_pagination(
@@ -140,6 +145,15 @@ pub async fn resolve_connection_ctx(
 		&mut param_offset,
 		cfg.query_limit,
 	)?;
+
+	// Build the base WHERE clause (without cursor condition) for totalCount.
+	// totalCount must reflect ALL matching rows regardless of cursor position.
+	let base_where_clause = if conditions.is_empty() {
+		String::new()
+	} else {
+		format!("WHERE {}", conditions.join(" AND "))
+	};
+	let base_params = params.clone();
 
 	if let Some((cursor_cond, cursor_params)) = &pagination.cursor_condition {
 		conditions.push(cursor_cond.clone());
@@ -203,8 +217,12 @@ pub async fn resolve_connection_ctx(
 		forward_order_clause
 	};
 
+	// totalCount must reflect ALL matching rows regardless of cursor position,
+	// so its count query uses base_where_clause (without cursor condition).
 	let count_sql =
-		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{table}" AS t {where_clause}"#);
+		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{table}" AS t {base_where_clause}"#);
+
+	let has_cursor = pagination.cursor_condition.is_some();
 
 	// ── Execute ───────────────────────────────────────────────────────────────
 	let req_client = ctx
@@ -215,15 +233,21 @@ pub async fn resolve_connection_ctx(
 	let pg_params = json_to_pg_params(&params);
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
+	let base_pg_params = json_to_pg_params(&base_params);
+	let base_pg_refs: Vec<&(dyn ToSql + Sync)> =
+		base_pg_params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
 	// If the client only requested totalCount/pageInfo with no node fields,
 	// skip fetching rows entirely and run only the count query.
 	let needs_rows = has_node_selection(ctx);
 
-	let (rows, total) = if !needs_rows {
+	// `total` = true total count (no cursor filter) for the totalCount field.
+	// `filtered_total` = rows matching the cursor-filtered WHERE, for hasNextPage.
+	let (rows, total, filtered_total) = if !needs_rows {
 		trace!(count_sql = %count_sql, "Executing count-only query");
-		let row = req_client.query_one(&count_sql, &pg_refs).await?;
-		(vec![], row.get::<_, i64>("total"))
+		let row = req_client.query_one(&count_sql, &base_pg_refs).await?;
+		let t: i64 = row.get("total");
+		(vec![], t, t)
 	} else {
 		// Build a selective column list from the GraphQL lookahead.
 		let select_cols = build_select_cols(
@@ -235,9 +259,9 @@ pub async fn resolve_connection_ctx(
 			fk_field_to_col,
 		);
 
-		// For non-DISTINCT queries embed COUNT(*) OVER() to get the total in a
-		// single round-trip. For DISTINCT queries the window function fires before
-		// deduplication and would overcount, so use the separate count query.
+		// For non-DISTINCT queries embed COUNT(*) OVER() to get the cursor-filtered
+		// total in a single round-trip. For DISTINCT queries the window function
+		// fires before deduplication and would overcount, so use a separate query.
 		let limit_clause = match limit {
 			Some(n) => format!("LIMIT {n}"),
 			None => String::new(),
@@ -262,15 +286,26 @@ pub async fn resolve_connection_ctx(
 
 		trace!(sql = %sql, "Executing connection query");
 		let rows = req_client.query(&sql, &pg_refs).await?;
-		let total = if use_window_count {
+		let filtered = if use_window_count {
 			rows.first()
 				.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
 				.unwrap_or(0)
 		} else {
-			let total_row = req_client.query_one(&count_sql, &pg_refs).await?;
+			let total_row = req_client.query_one(&count_sql, &base_pg_refs).await?;
 			total_row.get("total")
 		};
-		(rows, total)
+
+		// When cursor pagination is active, totalCount needs a separate count
+		// query without the cursor condition; otherwise the window count is the
+		// true total (no cursor → base_where == where_clause).
+		let total = if has_cursor {
+			let row = req_client.query_one(&count_sql, &base_pg_refs).await?;
+			row.get::<_, i64>("total")
+		} else {
+			filtered
+		};
+
+		(rows, total, filtered)
 	};
 
 	// ── Build response ────────────────────────────────────────────────────────
@@ -303,16 +338,18 @@ pub async fn resolve_connection_ctx(
 	}
 
 	let _row_count = nodes.len();
+	// Use `filtered_total` (cursor-filtered count) for hasNextPage/hasPreviousPage
+	// so page boundary detection works correctly with cursor pagination.
 	let (has_next, has_prev) = if pagination.is_backwards {
 		let has_prev = match limit {
-			Some(l) => total as usize > l || before.is_some(),
+			Some(l) => filtered_total as usize > l || before.is_some(),
 			None => before.is_some(),
 		};
 		let has_next = before.is_some();
 		(has_next, has_prev)
 	} else {
 		let has_next = match limit {
-			Some(l) => (pagination.offset + l) < total as usize,
+			Some(l) => (pagination.offset + l) < filtered_total as usize,
 			None => false, // no limit → all rows fetched
 		};
 		let has_prev = pagination.offset > 0 || after.is_some();

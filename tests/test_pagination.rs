@@ -484,3 +484,229 @@ async fn test_first_and_last_rejected() {
 	);
 	println!("first+last rejected ✓");
 }
+
+/// Test that cursor pagination works without an explicit `orderBy`.
+/// The default ORDER BY is `t.id ASC`, so `after: <endCursor>` must still
+/// advance to the next page (regression: order_cols was empty → cursor ignored).
+#[tokio::test]
+async fn test_cursor_pagination_default_order() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+
+	// Page 1 — no explicit orderBy
+	let page1_query = r#"
+		{
+			assetTeleporteds(first: 3) {
+				nodes { id }
+				pageInfo { hasNextPage endCursor }
+			}
+		}
+	"#;
+	let page1 = rust_client.query(page1_query).await;
+
+	let page1_ids: HashSet<String> = page1
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|nodes| nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect())
+		.unwrap_or_default();
+	assert!(!page1_ids.is_empty(), "page1 returned 0 rows");
+
+	let has_next = page1
+		.pointer("/data/assetTeleporteds/pageInfo/hasNextPage")
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false);
+	assert!(has_next, "hasNextPage should be true for first:3 of 20 rows (no orderBy)");
+
+	let end_cursor = page1
+		.pointer("/data/assetTeleporteds/pageInfo/endCursor")
+		.and_then(|v| v.as_str())
+		.expect("endCursor missing from page1");
+
+	// Page 2 — feed endCursor into after, still no explicit orderBy
+	let page2_query = format!(
+		r#"{{ assetTeleporteds(first: 3, after: "{end_cursor}") {{ nodes {{ id }} pageInfo {{ hasNextPage endCursor }} }} }}"#
+	);
+	let page2 = rust_client.query(&page2_query).await;
+
+	assert!(
+		page2
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"page2 returned errors: {page2}"
+	);
+
+	let page2_ids: HashSet<String> = page2
+		.pointer("/data/assetTeleporteds/nodes")
+		.and_then(|v| v.as_array())
+		.map(|nodes| nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect())
+		.unwrap_or_default();
+	assert!(!page2_ids.is_empty(), "page2 returned 0 rows — cursor was likely ignored");
+
+	let overlap: HashSet<&String> = page1_ids.intersection(&page2_ids).collect();
+	assert!(
+		overlap.is_empty(),
+		"page1 and page2 overlap without explicit orderBy! Common IDs: {:?}",
+		overlap
+	);
+	println!(
+		"cursor pagination (default order): page1={}, page2={}, no overlap ✓",
+		page1_ids.len(),
+		page2_ids.len()
+	);
+}
+
+/// Test that `totalCount` remains the true total across all pages and is not
+/// reduced by cursor filtering (regression: COUNT(*) OVER() included the cursor
+/// condition, so page 2's totalCount was lower than page 1's).
+#[tokio::test]
+async fn test_total_count_stable_across_pages() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+
+	// Page 1
+	let page1_query = r#"
+		{
+			assetTeleporteds(first: 3, orderBy: ID_ASC) {
+				totalCount
+				nodes { id }
+				pageInfo { endCursor hasNextPage }
+			}
+		}
+	"#;
+	let page1 = rust_client.query(page1_query).await;
+
+	let total_page1 = page1
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from page1");
+	assert!(total_page1 > 3, "totalCount should be > 3 to test pagination, got {total_page1}");
+
+	let end_cursor = page1
+		.pointer("/data/assetTeleporteds/pageInfo/endCursor")
+		.and_then(|v| v.as_str())
+		.expect("endCursor missing from page1");
+
+	// Page 2
+	let page2_query = format!(
+		r#"{{ assetTeleporteds(first: 3, orderBy: ID_ASC, after: "{end_cursor}") {{ totalCount nodes {{ id }} pageInfo {{ hasNextPage }} }} }}"#
+	);
+	let page2 = rust_client.query(&page2_query).await;
+
+	let total_page2 = page2
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing from page2");
+
+	assert_eq!(
+		total_page1, total_page2,
+		"totalCount must be stable across pages: page1={total_page1}, page2={total_page2}"
+	);
+	println!("totalCount stable across pages: {total_page1} == {total_page2} ✓");
+}
+
+/// Test that `hasNextPage` is correct on the last page of cursor-paginated results.
+#[tokio::test]
+async fn test_has_next_page_last_page() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+
+	// Fetch all IDs to know the total count.
+	let all_query = r#"{ assetTeleporteds(orderBy: ID_ASC) { totalCount } }"#;
+	let all_resp = rust_client.query(all_query).await;
+	let total = all_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount missing") as usize;
+
+	// Walk through all pages using cursor pagination.
+	let page_size = 5;
+	let mut cursor: Option<String> = None;
+	let mut all_ids: Vec<String> = vec![];
+	let mut pages = 0;
+
+	loop {
+		let query = if let Some(ref c) = cursor {
+			format!(
+				r#"{{ assetTeleporteds(first: {page_size}, orderBy: ID_ASC, after: "{c}") {{ nodes {{ id }} pageInfo {{ hasNextPage endCursor }} }} }}"#
+			)
+		} else {
+			format!(
+				r#"{{ assetTeleporteds(first: {page_size}, orderBy: ID_ASC) {{ nodes {{ id }} pageInfo {{ hasNextPage endCursor }} }} }}"#
+			)
+		};
+
+		let resp = rust_client.query(&query).await;
+		assert!(
+			resp.get("errors")
+				.and_then(|e| e.as_array())
+				.map(|a| a.is_empty())
+				.unwrap_or(true),
+			"page {} returned errors: {resp}",
+			pages + 1
+		);
+
+		let nodes = resp
+			.pointer("/data/assetTeleporteds/nodes")
+			.and_then(|v| v.as_array())
+			.expect("nodes missing");
+
+		let ids: Vec<String> =
+			nodes.iter().filter_map(|n| n["id"].as_str().map(String::from)).collect();
+		all_ids.extend(ids);
+
+		let has_next = resp
+			.pointer("/data/assetTeleporteds/pageInfo/hasNextPage")
+			.and_then(|v| v.as_bool())
+			.unwrap_or(false);
+
+		pages += 1;
+
+		if has_next {
+			cursor = resp
+				.pointer("/data/assetTeleporteds/pageInfo/endCursor")
+				.and_then(|v| v.as_str())
+				.map(String::from);
+			assert!(cursor.is_some(), "hasNextPage=true but endCursor is null");
+		} else {
+			break;
+		}
+
+		// Safety: prevent infinite loops in case of bugs.
+		assert!(pages < 100, "pagination did not terminate after 100 pages");
+	}
+
+	// Verify we collected all rows with no duplicates.
+	let unique: HashSet<&String> = all_ids.iter().collect();
+	assert_eq!(
+		unique.len(),
+		total,
+		"cursor walk collected {} unique IDs but totalCount is {}",
+		unique.len(),
+		total
+	);
+	assert_eq!(
+		all_ids.len(),
+		total,
+		"cursor walk collected {} IDs (with duplicates) but totalCount is {}",
+		all_ids.len(),
+		total
+	);
+	println!(
+		"full cursor walk: {pages} pages, {} rows, hasNextPage=false on last page ✓",
+		all_ids.len()
+	);
+}
