@@ -29,8 +29,10 @@ use std::sync::{
 };
 
 use async_graphql::{
-	Request as GqlRequest, Response as GqlResponse, ServerError, dynamic::Schema,
-	http::GraphiQLSource, parser::parse_query,
+	Request as GqlRequest, Response as GqlResponse, ServerError,
+	dynamic::Schema,
+	http::{GraphiQLSource, graphiql_plugin_explorer},
+	parser::parse_query,
 };
 use async_graphql_axum::{GraphQLProtocol, GraphQLResponse, GraphQLWebSocket};
 use axum::{
@@ -398,7 +400,13 @@ async fn graphql_ws_handler(
 }
 
 async fn graphiql_handler() -> impl IntoResponse {
-	Html(GraphiQLSource::build().endpoint("/").subscription_endpoint("/ws").finish())
+	Html(
+		GraphiQLSource::build()
+			.endpoint("/")
+			.subscription_endpoint("/ws")
+			.plugins(&[graphiql_plugin_explorer()])
+			.finish(),
+	)
 }
 
 async fn health_handler(State(state): State<AppState>) -> Response {
