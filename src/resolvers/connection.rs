@@ -246,21 +246,15 @@ pub async fn resolve_connection_ctx(
 	let (rows, total, filtered_total) = if !needs_rows {
 		trace!(count_sql = %count_sql, "Executing count-only query");
 		let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
-			tracing::error!(sql = %count_sql, error = %e, "Count query failed");
+			tracing::error!(sql = %count_sql, error = ?e, "Count query failed");
 			async_graphql::Error::new(format!("db error: {e}"))
 		})?;
 		let t: i64 = row.get("total");
 		(vec![], t, t)
 	} else {
 		// Build a selective column list from the GraphQL lookahead.
-		let select_cols = build_select_cols(
-			ctx,
-			columns,
-			&order_cols,
-			&distinct_cols,
-			is_historical,
-			fk_field_to_col,
-		);
+		let select_cols =
+			build_select_cols(ctx, columns, &order_cols, &distinct_cols, fk_field_to_col);
 
 		// For non-DISTINCT queries embed COUNT(*) OVER() to get the cursor-filtered
 		// total in a single round-trip. For DISTINCT queries the window function
@@ -289,7 +283,7 @@ pub async fn resolve_connection_ctx(
 
 		trace!(sql = %sql, "Executing connection query");
 		let rows = req_client.query(&sql, &pg_refs).await.map_err(|e| {
-			tracing::error!(sql = %sql, error = %e, "Connection query failed");
+			tracing::error!(sql = %sql, error = ?e, "Connection query failed");
 			async_graphql::Error::new(format!("db error: {e}"))
 		})?;
 		let filtered = if use_window_count {
@@ -415,14 +409,12 @@ fn has_node_selection(ctx: &ResolverContext<'_>) -> bool {
 /// into `nodes { ... }` and `edges { node { ... } }` to collect the entity
 /// field names actually requested by the client.
 ///
-/// Always includes `id` (cursor generation), any orderBy/distinct columns, and
-/// `_block_range` for historical tables.
+/// Always includes `id` (cursor generation) and any orderBy/distinct columns.
 fn build_select_cols(
 	ctx: &ResolverContext<'_>,
 	columns: &[String],
 	order_cols: &[String],
 	distinct_cols: &[String],
-	is_historical: bool,
 	fk_field_to_col: &HashMap<String, String>,
 ) -> String {
 	let mut requested: HashSet<String> = HashSet::new();
@@ -458,7 +450,7 @@ fn build_select_cols(
 		}
 	}
 
-	filter_columns_by_request(&requested, columns, order_cols, distinct_cols, is_historical)
+	filter_columns_by_request(&requested, columns, order_cols, distinct_cols)
 }
 
 /// Pure column-selection logic: given a set of requested camelCase GraphQL field
@@ -469,7 +461,6 @@ fn build_select_cols(
 /// 2. `_id` is always included when present — needed to encode PostGraphile-compatible nodeIds.
 /// 3. Any column whose camelCase name (or raw name) appears in `requested`.
 /// 4. All `order_cols` and `distinct_cols` (needed for ORDER BY / DISTINCT ON).
-/// 5. `_block_range` for historical tables (needed in WHERE clause).
 ///
 /// If `requested` is empty (shouldn't happen in practice) only `t."id"` is returned.
 pub fn filter_columns_by_request(
@@ -477,7 +468,6 @@ pub fn filter_columns_by_request(
 	columns: &[String],
 	order_cols: &[String],
 	distinct_cols: &[String],
-	is_historical: bool,
 ) -> String {
 	let has_internal_id = columns.iter().any(|c| c == "_id");
 
@@ -516,10 +506,6 @@ pub fn filter_columns_by_request(
 		add(col);
 	}
 
-	if is_historical {
-		add("_block_range");
-	}
-
 	selected.join(", ")
 }
 
@@ -539,8 +525,7 @@ mod tests {
 
 	#[test]
 	fn always_includes_id() {
-		let result =
-			filter_columns_by_request(&set(&["id"]), &cols(&["id", "name"]), &[], &[], false);
+		let result = filter_columns_by_request(&set(&["id"]), &cols(&["id", "name"]), &[], &[]);
 		assert!(result.contains("t.\"id\""), "id should always be first: {result}");
 	}
 
@@ -552,7 +537,6 @@ mod tests {
 			&cols(&["id", "block_number", "amount"]),
 			&[],
 			&[],
-			false,
 		);
 		assert!(result.contains("t.\"block_number\""), "block_number not in: {result}");
 		assert!(!result.contains("t.\"amount\""), "amount should not be in: {result}");
@@ -561,13 +545,8 @@ mod tests {
 	#[test]
 	fn does_not_duplicate_id() {
 		// id is in both required-always and requested set
-		let result = filter_columns_by_request(
-			&set(&["id", "amount"]),
-			&cols(&["id", "amount"]),
-			&[],
-			&[],
-			false,
-		);
+		let result =
+			filter_columns_by_request(&set(&["id", "amount"]), &cols(&["id", "amount"]), &[], &[]);
 		let id_count = result.matches("t.\"id\"").count();
 		assert_eq!(id_count, 1, "id should appear exactly once: {result}");
 	}
@@ -579,7 +558,6 @@ mod tests {
 			&cols(&["id", "created_at", "amount"]),
 			&cols(&["created_at"]),
 			&[],
-			false,
 		);
 		assert!(result.contains("t.\"created_at\""), "order col should be included: {result}");
 		assert!(!result.contains("t.\"amount\""), "unrequested col should be absent: {result}");
@@ -592,35 +570,22 @@ mod tests {
 			&cols(&["id", "category", "value"]),
 			&[],
 			&cols(&["category"]),
-			false,
 		);
 		assert!(result.contains("t.\"category\""), "distinct col should be included: {result}");
 		assert!(!result.contains("t.\"value\""), "unrequested col should be absent: {result}");
 	}
 
 	#[test]
-	fn historical_table_includes_block_range() {
-		let result = filter_columns_by_request(
-			&set(&["id"]),
-			&cols(&["id", "amount"]),
-			&[],
-			&[],
-			true, // is_historical
-		);
-		assert!(result.contains("t.\"_block_range\""), "_block_range missing: {result}");
-	}
-
-	#[test]
-	fn non_historical_table_excludes_block_range() {
-		let result =
-			filter_columns_by_request(&set(&["id"]), &cols(&["id", "amount"]), &[], &[], false);
-		assert!(!result.contains("_block_range"), "_block_range should be absent: {result}");
+	fn block_range_not_selected() {
+		// _block_range is only used in WHERE, never in SELECT.
+		let result = filter_columns_by_request(&set(&["id"]), &cols(&["id", "amount"]), &[], &[]);
+		assert!(!result.contains("_block_range"), "_block_range should not be selected: {result}");
 	}
 
 	#[test]
 	fn empty_requested_returns_id_only() {
 		let result =
-			filter_columns_by_request(&set(&[]), &cols(&["id", "name", "amount"]), &[], &[], false);
+			filter_columns_by_request(&set(&[]), &cols(&["id", "name", "amount"]), &[], &[]);
 		assert_eq!(result, "t.\"id\"");
 	}
 
@@ -632,7 +597,6 @@ mod tests {
 			&cols(&["id", "block_number"]),
 			&[],
 			&[],
-			false,
 		);
 		assert!(result.contains("t.\"block_number\""), "snake_case match failed: {result}");
 	}

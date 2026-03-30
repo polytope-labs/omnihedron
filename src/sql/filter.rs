@@ -176,6 +176,20 @@ pub fn build_filter_sql_ctx(
 							if sub_conds.is_empty() {
 								continue;
 							}
+							// An empty `in: []` produces a bare `FALSE` with no bound
+							// params.  For `none`/`every` that yields a vacuously-true
+							// NOT EXISTS(... AND FALSE) - skip it.  For `some` it is
+							// always false, so push FALSE directly.
+							if sub_conds.iter().all(|c| c == "FALSE") && sub_params.is_empty() {
+								match quantifier.as_str() {
+									"none" | "every" => continue,
+									"some" => {
+										conditions.push("FALSE".to_string());
+										continue;
+									},
+									_ => {},
+								}
+							}
 							let joined = sub_conds.join(" AND ");
 							let hc = hist_cond.replace("{alias}", &sub_alias);
 							let sql = match quantifier.as_str() {
