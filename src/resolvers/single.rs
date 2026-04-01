@@ -53,7 +53,7 @@ pub async fn resolve_single(
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = req_client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
 	if rows.is_empty() {
 		return Ok(None);
 	}
@@ -100,7 +100,7 @@ pub async fn resolve_by_node_id(
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = req_client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
 	if rows.is_empty() {
 		return Ok(None);
 	}

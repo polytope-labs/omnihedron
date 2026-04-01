@@ -29,6 +29,8 @@ use serde_json::{Value, json};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type};
 use tracing::trace;
 
+use super::pg_error_detail;
+
 use crate::{
 	config::Config,
 	schema::{cursor::encode_cursor, inflector::to_camel_case},
@@ -246,8 +248,9 @@ pub async fn resolve_connection_ctx(
 	let (rows, total, filtered_total) = if !needs_rows {
 		trace!(count_sql = %count_sql, "Executing count-only query");
 		let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
-			tracing::error!(sql = %count_sql, error = ?e, "Count query failed");
-			async_graphql::Error::new(format!("db error: {e}"))
+			let detail = pg_error_detail(&e);
+			tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
+			async_graphql::Error::new(format!("db error: {detail}"))
 		})?;
 		let t: i64 = row.get("total");
 		(vec![], t, t)
@@ -283,15 +286,20 @@ pub async fn resolve_connection_ctx(
 
 		trace!(sql = %sql, "Executing connection query");
 		let rows = req_client.query(&sql, &pg_refs).await.map_err(|e| {
-			tracing::error!(sql = %sql, error = ?e, "Connection query failed");
-			async_graphql::Error::new(format!("db error: {e}"))
+			let detail = pg_error_detail(&e);
+			tracing::error!(sql = %sql, error = %detail, "Connection query failed");
+			async_graphql::Error::new(format!("db error: {detail}"))
 		})?;
 		let filtered = if use_window_count {
 			rows.first()
 				.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
 				.unwrap_or(0)
 		} else {
-			let total_row = req_client.query_one(&count_sql, &base_pg_refs).await?;
+			let total_row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
+				let detail = pg_error_detail(&e);
+				tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
+				async_graphql::Error::new(format!("db error: {detail}"))
+			})?;
 			total_row.get("total")
 		};
 
@@ -299,7 +307,11 @@ pub async fn resolve_connection_ctx(
 		// query without the cursor condition; otherwise the window count is the
 		// true total (no cursor → base_where == where_clause).
 		let total = if has_cursor {
-			let row = req_client.query_one(&count_sql, &base_pg_refs).await?;
+			let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
+				let detail = pg_error_detail(&e);
+				tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
+				async_graphql::Error::new(format!("db error: {detail}"))
+			})?;
 			row.get::<_, i64>("total")
 		} else {
 			filtered
