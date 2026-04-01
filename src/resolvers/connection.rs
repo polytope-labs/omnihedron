@@ -274,7 +274,59 @@ pub async fn resolve_connection_ctx(
 				),
 				true,
 			)
+		} else if !has_cursor {
+			// Lateral-join strategy: instead of sorting the entire matched set
+			// for DISTINCT ON deduplication, first collect the distinct key
+			// values and then fetch the top-1 row per key.  This turns an
+			// O(N log N) sort into O(K × index-lookup) where K = distinct keys.
+			let distinct_select = distinct_cols
+				.iter()
+				.map(|dc| format!(r#"t."{dc}""#))
+				.collect::<Vec<_>>()
+				.join(", ");
+			let distinct_equalities = distinct_cols
+				.iter()
+				.map(|dc| format!(r#"t."{dc}" = _keys."{dc}""#))
+				.collect::<Vec<_>>()
+				.join(" AND ");
+			let lateral_where = if where_clause.is_empty() {
+				format!("WHERE {distinct_equalities}")
+			} else {
+				format!("{where_clause} AND {distinct_equalities}")
+			};
+			// Inner ORDER BY: user's order + historical tiebreaker, without
+			// the prepended distinct columns (not needed inside a per-key lookup).
+			let inner_order = {
+				let mut clauses: Vec<String> = if order_clauses.is_empty() {
+					vec![format!("t.id ASC{nulls_suffix}")]
+				} else {
+					order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect()
+				};
+				if is_historical && !clauses.iter().any(|c| c.contains("t._id ")) {
+					clauses.push("t._id ASC".to_string());
+				}
+				format!("ORDER BY {}", clauses.join(", "))
+			};
+			// Outer ORDER BY: deterministic ordering by distinct columns.
+			let outer_order = {
+				let dir = if pagination.is_backwards { "DESC" } else { "ASC" };
+				let cols = distinct_cols
+					.iter()
+					.map(|dc| format!(r#"_row."{dc}" {dir}"#))
+					.collect::<Vec<_>>()
+					.join(", ");
+				format!("ORDER BY {cols}")
+			};
+			(
+				format!(
+					r#"SELECT _row.* FROM (SELECT DISTINCT {distinct_select} FROM "{schema}"."{table}" AS t {where_clause}) AS _keys CROSS JOIN LATERAL (SELECT {select_cols} FROM "{schema}"."{table}" AS t {lateral_where} {inner_order} LIMIT 1) AS _row {outer_order} {limit_clause} OFFSET {}"#,
+					pagination.offset
+				),
+				false,
+			)
 		} else {
+			// Cursor pagination with DISTINCT: fall back to DISTINCT ON since
+			// the cursor condition filters the sorted+deduplicated result set.
 			(
 				format!(
 					r#"SELECT {distinct_clause}{select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
