@@ -145,7 +145,7 @@ pub async fn resolve_aggregates(
 	let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as _).collect();
 
-	let row = req_client.query_one(&sql, &pg_refs).await?;
+	let row = req_client.query_one(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
 
 	let count: i64 = row.try_get("_count").unwrap_or(0);
 
@@ -401,7 +401,7 @@ pub async fn resolve_grouped_aggregates(
 	let pg_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as _).collect();
 
-	let rows = req_client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
 
 	let mut groups: Vec<Value> = Vec::with_capacity(rows.len());
 

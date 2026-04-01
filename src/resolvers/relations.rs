@@ -160,7 +160,7 @@ pub async fn resolve_backward_single(
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = req_client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
 	match rows.first() {
 		Some(row) => {
 			let mut node = row_to_json(row);
@@ -337,7 +337,7 @@ pub async fn resolve_backward_relation(
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = req_client.query(&sql, &pg_refs).await?;
+	let rows = req_client.query(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
 
 	let total: i64 = if use_window_count {
 		// Extract total from the window function in the first row
@@ -349,7 +349,10 @@ pub async fn resolve_backward_relation(
 		let count_sql = format!(
 			r#"SELECT COUNT(*) AS total FROM "{schema}"."{child_table}" AS t {where_clause}"#
 		);
-		let count_row = req_client.query_one(&count_sql, &pg_refs).await?;
+		let count_row = req_client
+			.query_one(&count_sql, &pg_refs)
+			.await
+			.map_err(super::pg_to_gql_error)?;
 		count_row.get("total")
 	};
 
@@ -458,7 +461,7 @@ pub async fn resolve_many_to_many(
 		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
 	let params: Vec<&(dyn ToSql + Sync)> = vec![&id_str];
 
-	let rows = req_client.query(&sql, &params).await?;
+	let rows = req_client.query(&sql, &params).await.map_err(super::pg_to_gql_error)?;
 	let total: i64 = rows
 		.first()
 		.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
