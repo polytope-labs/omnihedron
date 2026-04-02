@@ -224,6 +224,10 @@ pub async fn resolve_connection_ctx(
 	let count_sql =
 		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{table}" AS t {base_where_clause}"#);
 
+	// Cursor-filtered count: includes the cursor condition for hasNextPage detection.
+	let filtered_count_sql =
+		format!(r#"SELECT COUNT(*) AS total FROM "{schema}"."{table}" AS t {where_clause}"#);
+
 	let has_cursor = pagination.cursor_condition.is_some();
 
 	// ── Execute ───────────────────────────────────────────────────────────────
@@ -242,37 +246,42 @@ pub async fn resolve_connection_ctx(
 	// If the client only requested totalCount/pageInfo with no node fields,
 	// skip fetching rows entirely and run only the count query.
 	let needs_rows = has_node_selection(ctx);
+	let needs_total = has_total_count_selection(ctx);
 
 	// `total` = true total count (no cursor filter) for the totalCount field.
 	// `filtered_total` = rows matching the cursor-filtered WHERE, for hasNextPage.
 	let (rows, total, filtered_total) = if !needs_rows {
-		trace!(count_sql = %count_sql, "Executing count-only query");
-		let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
-			let detail = pg_error_detail(&e);
-			tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
-			async_graphql::Error::new(format!("db error: {detail}"))
-		})?;
-		let t: i64 = row.get("total");
-		(vec![], t, t)
+		if !needs_total {
+			// Neither rows nor totalCount requested — nothing to fetch.
+			(vec![], 0i64, 0i64)
+		} else {
+			trace!(count_sql = %count_sql, "Executing count-only query");
+			let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
+				let detail = pg_error_detail(&e);
+				tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
+				async_graphql::Error::new(format!("db error: {detail}"))
+			})?;
+			let t: i64 = row.get("total");
+			(vec![], t, t)
+		}
 	} else {
 		// Build a selective column list from the GraphQL lookahead.
 		let select_cols =
 			build_select_cols(ctx, columns, &order_cols, &distinct_cols, fk_field_to_col);
 
-		// For non-DISTINCT queries embed COUNT(*) OVER() to get the cursor-filtered
-		// total in a single round-trip. For DISTINCT queries the window function
-		// fires before deduplication and would overcount, so use a separate query.
 		let limit_clause = match limit {
 			Some(n) => format!("LIMIT {n}"),
 			None => String::new(),
 		};
-		let (sql, use_window_count) = if distinct_cols.is_empty() {
-			(
-				format!(
-					r#"SELECT {select_cols}, COUNT(*) OVER() AS __total_count FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
-					pagination.offset
-				),
-				true,
+
+		// Never embed COUNT(*) OVER() in the row-fetch query — it forces
+		// PostgreSQL to scan ALL matching rows before applying LIMIT, defeating
+		// index-driven early exit.  Instead, run the count as a separate query
+		// in parallel (only when totalCount is actually requested).
+		let sql = if distinct_cols.is_empty() {
+			format!(
+				r#"SELECT {select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
+				pagination.offset
 			)
 		} else if !has_cursor {
 			// Lateral-join strategy: instead of sorting the entire matched set
@@ -317,59 +326,104 @@ pub async fn resolve_connection_ctx(
 					.join(", ");
 				format!("ORDER BY {cols}")
 			};
-			(
-				format!(
-					r#"SELECT _row.* FROM (SELECT DISTINCT {distinct_select} FROM "{schema}"."{table}" AS t {where_clause}) AS _keys CROSS JOIN LATERAL (SELECT {select_cols} FROM "{schema}"."{table}" AS t {lateral_where} {inner_order} LIMIT 1) AS _row {outer_order} {limit_clause} OFFSET {}"#,
-					pagination.offset
-				),
-				false,
+			format!(
+				r#"SELECT _row.* FROM (SELECT DISTINCT {distinct_select} FROM "{schema}"."{table}" AS t {where_clause}) AS _keys CROSS JOIN LATERAL (SELECT {select_cols} FROM "{schema}"."{table}" AS t {lateral_where} {inner_order} LIMIT 1) AS _row {outer_order} {limit_clause} OFFSET {}"#,
+				pagination.offset
 			)
 		} else {
 			// Cursor pagination with DISTINCT: fall back to DISTINCT ON since
 			// the cursor condition filters the sorted+deduplicated result set.
-			(
-				format!(
-					r#"SELECT {distinct_clause}{select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
-					pagination.offset
-				),
-				false,
+			format!(
+				r#"SELECT {distinct_clause}{select_cols} FROM "{schema}"."{table}" AS t {where_clause} {order_clause} {limit_clause} OFFSET {}"#,
+				pagination.offset
 			)
 		};
 
-		trace!(sql = %sql, "Executing connection query");
-		let rows = req_client.query(&sql, &pg_refs).await.map_err(|e| {
-			let detail = pg_error_detail(&e);
-			tracing::error!(sql = %sql, error = %detail, "Connection query failed");
-			async_graphql::Error::new(format!("db error: {detail}"))
-		})?;
-		let filtered = if use_window_count {
-			rows.first()
-				.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
-				.unwrap_or(0)
+		if needs_total {
+			// Run row fetch and count query in parallel so neither blocks the other.
+			// The row fetch benefits from LIMIT early-exit while the count runs
+			// concurrently on its own.
+			trace!(sql = %sql, "Executing connection query");
+			trace!(count_sql = %count_sql, "Executing parallel count query");
+
+			if has_cursor {
+				// Cursor pagination: need both a cursor-filtered count (for
+				// hasNextPage) and a base count (for totalCount).
+				let (rows_res, filtered_count_res, base_count_res) = tokio::join!(
+					req_client.query(&sql, &pg_refs),
+					req_client.query_one(&filtered_count_sql, &pg_refs),
+					req_client.query_one(&count_sql, &base_pg_refs),
+				);
+				let rows = rows_res.map_err(|e| {
+					let detail = pg_error_detail(&e);
+					tracing::error!(sql = %sql, error = %detail, "Connection query failed");
+					async_graphql::Error::new(format!("db error: {detail}"))
+				})?;
+				let filtered: i64 = filtered_count_res
+					.map_err(|e| {
+						let detail = pg_error_detail(&e);
+						tracing::error!(sql = %filtered_count_sql, error = %detail, "Filtered count query failed");
+						async_graphql::Error::new(format!("db error: {detail}"))
+					})?
+					.get("total");
+				let total: i64 = base_count_res
+					.map_err(|e| {
+						let detail = pg_error_detail(&e);
+						tracing::error!(sql = %count_sql, error = %detail, "Base count query failed");
+						async_graphql::Error::new(format!("db error: {detail}"))
+					})?
+					.get("total");
+				(rows, total, filtered)
+			} else {
+				let (rows_res, count_res) = tokio::join!(
+					req_client.query(&sql, &pg_refs),
+					req_client.query_one(&count_sql, &base_pg_refs),
+				);
+				let rows = rows_res.map_err(|e| {
+					let detail = pg_error_detail(&e);
+					tracing::error!(sql = %sql, error = %detail, "Connection query failed");
+					async_graphql::Error::new(format!("db error: {detail}"))
+				})?;
+				let total: i64 = count_res
+					.map_err(|e| {
+						let detail = pg_error_detail(&e);
+						tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
+						async_graphql::Error::new(format!("db error: {detail}"))
+					})?
+					.get("total");
+				(rows, total, total)
+			}
 		} else {
-			let total_row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
+			// totalCount not requested — skip the count query entirely.
+			// PostgreSQL can now use LIMIT early-exit with index scans.
+			//
+			// To detect hasNextPage without COUNT, fetch one extra row beyond
+			// the limit.  If we get limit+1 rows, there are more pages.
+			let overfetch_sql = if let Some(l) = limit {
+				sql.replace(&format!("LIMIT {l}"), &format!("LIMIT {}", l + 1))
+			} else {
+				sql.clone()
+			};
+			trace!(sql = %overfetch_sql, "Executing connection query (no totalCount)");
+			let mut rows = req_client.query(&overfetch_sql, &pg_refs).await.map_err(|e| {
 				let detail = pg_error_detail(&e);
-				tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
+				tracing::error!(sql = %overfetch_sql, error = %detail, "Connection query failed");
 				async_graphql::Error::new(format!("db error: {detail}"))
 			})?;
-			total_row.get("total")
-		};
-
-		// When cursor pagination is active, totalCount needs a separate count
-		// query without the cursor condition; otherwise the window count is the
-		// true total (no cursor → base_where == where_clause).
-		let total = if has_cursor {
-			let row = req_client.query_one(&count_sql, &base_pg_refs).await.map_err(|e| {
-				let detail = pg_error_detail(&e);
-				tracing::error!(sql = %count_sql, error = %detail, "Count query failed");
-				async_graphql::Error::new(format!("db error: {detail}"))
-			})?;
-			row.get::<_, i64>("total")
-		} else {
-			filtered
-		};
-
-		(rows, total, filtered)
+			let has_extra = limit.is_some_and(|l| rows.len() > l);
+			if has_extra {
+				rows.pop(); // Remove the extra probe row
+			}
+			let row_count = rows.len() as i64;
+			// Synthesise a pseudo-total that makes hasNextPage work correctly:
+			// if we got the extra row, pretend there's at least one more page.
+			let pseudo_total = if has_extra {
+				pagination.offset as i64 + row_count + 1
+			} else {
+				pagination.offset as i64 + row_count
+			};
+			(rows, pseudo_total, pseudo_total)
+		}
 	};
 
 	// ── Build response ────────────────────────────────────────────────────────
@@ -378,9 +432,7 @@ pub async fn resolve_connection_ctx(
 
 	for row in &rows {
 		let mut node = row_to_json(row);
-		// Strip the synthetic window-count column — it must not appear in GraphQL output.
 		if let Value::Object(ref mut map) = node {
-			map.remove("__total_count");
 			// Embed blockHeight so nested relation resolvers can inherit historical filtering.
 			if is_historical {
 				if let Some(ref bh) = block_height {
@@ -464,6 +516,13 @@ pub async fn resolve_connection_ctx(
 /// `ctx.field().selection_set()` to iterate children.
 fn has_node_selection(ctx: &ResolverContext<'_>) -> bool {
 	ctx.look_ahead().field("nodes").exists() || ctx.look_ahead().field("edges").exists()
+}
+
+/// Returns true if the query requests the `totalCount` field on this connection.
+/// When false, we can skip the expensive COUNT(*) computation entirely, allowing
+/// PostgreSQL to benefit from LIMIT early-exit optimisation.
+fn has_total_count_selection(ctx: &ResolverContext<'_>) -> bool {
+	ctx.look_ahead().field("totalCount").exists()
 }
 
 /// Build a selective `SELECT` column list from the GraphQL selection.

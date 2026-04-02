@@ -79,6 +79,12 @@ pub struct Config {
 	#[arg(long, env = "OMNIHEDRON_DICTIONARY_OPTIMISATION", default_value_t = false)]
 	pub dictionary_optimisation: bool,
 
+	/// Disable historical block-range filtering (_block_range @> N).
+	/// Use this when all tables are append-only and never updated, which
+	/// avoids a redundant per-row range check on every query.
+	#[arg(long, env = "OMNIHEDRON_NO_HISTORICAL", default_value_t = false)]
+	pub no_historical: bool,
+
 	/// Log SQL EXPLAIN output for each query
 	#[arg(long, env = "OMNIHEDRON_QUERY_EXPLAIN", default_value_t = false)]
 	pub query_explain: bool,

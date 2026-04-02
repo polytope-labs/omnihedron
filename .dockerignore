@@ -1,4 +1,7 @@
-target
+target/debug
+target/doc
+target/.rustc_info.json
+!target/release/omnihedron
 .git
 .github
 docs

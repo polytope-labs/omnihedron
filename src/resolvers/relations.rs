@@ -320,11 +320,10 @@ pub async fn resolve_backward_relation(
 		forward_order_clause
 	};
 
-	let use_window_count = distinct_cols.is_empty();
+	let needs_total = ctx.look_ahead().field("totalCount").exists();
 
-	let count_col = if use_window_count { ", COUNT(*) OVER() AS __total_count" } else { "" };
 	let sql = format!(
-		r#"SELECT {distinct_clause}t.*{count_col} FROM "{schema}"."{child_table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
+		r#"SELECT {distinct_clause}t.* FROM "{schema}"."{child_table}" AS t {where_clause} {order_clause} LIMIT {limit} OFFSET {}"#,
 		pagination.offset
 	);
 
@@ -337,23 +336,35 @@ pub async fn resolve_backward_relation(
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		pg_params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
-	let rows = req_client.query(&sql, &pg_refs).await.map_err(super::pg_to_gql_error)?;
-
-	let total: i64 = if use_window_count {
-		// Extract total from the window function in the first row
-		rows.first()
-			.and_then(|r| r.try_get::<_, i64>("__total_count").ok())
-			.unwrap_or(0)
-	} else {
-		// DISTINCT queries need a separate count query (window fires before dedup)
+	let (rows, total) = if needs_total {
 		let count_sql = format!(
 			r#"SELECT COUNT(*) AS total FROM "{schema}"."{child_table}" AS t {where_clause}"#
 		);
-		let count_row = req_client
-			.query_one(&count_sql, &pg_refs)
+		let (rows_res, count_res) = tokio::join!(
+			req_client.query(&sql, &pg_refs),
+			req_client.query_one(&count_sql, &pg_refs),
+		);
+		let rows = rows_res.map_err(super::pg_to_gql_error)?;
+		let total: i64 = count_res.map_err(super::pg_to_gql_error)?.get("total");
+		(rows, total)
+	} else {
+		// Overfetch by 1 to detect hasNextPage without a count query.
+		let overfetch_sql = sql.replace(&format!("LIMIT {limit}"), &format!("LIMIT {}", limit + 1));
+		let mut rows = req_client
+			.query(&overfetch_sql, &pg_refs)
 			.await
 			.map_err(super::pg_to_gql_error)?;
-		count_row.get("total")
+		let has_extra = rows.len() > limit;
+		if has_extra {
+			rows.pop();
+		}
+		let row_count = rows.len() as i64;
+		let pseudo_total = if has_extra {
+			pagination.offset as i64 + row_count + 1
+		} else {
+			pagination.offset as i64 + row_count
+		};
+		(rows, pseudo_total)
 	};
 
 	let mut nodes = vec![];

@@ -103,11 +103,11 @@ pub fn build_schema(
 		let orderby_enum = format!("{plural_type_name}OrderBy");
 		let distinct_enum = format!("{}_distinct_enum", &table.name);
 		let cfg_clone = cfg.clone();
-		let is_historical = table.is_historical;
+		let is_historical = table.is_historical && !cfg.no_historical;
 		let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
 
 		// Build filter context for relation-aware filtering
-		let filter_ctx = build_filter_context(table, tables, &cfg.name);
+		let filter_ctx = build_filter_context(table, tables, &cfg.name, cfg.no_historical);
 		let filter_ctx = Arc::new(filter_ctx);
 
 		// Build FK field → column map for selective SELECT (forward relations)
@@ -156,7 +156,7 @@ pub fn build_schema(
 		.argument(InputValue::new("distinct", TypeRef::named_nn_list(&distinct_enum)))
 		.argument(InputValue::new("orderByNull", TypeRef::named("NullOrder")));
 
-		if table.is_historical {
+		if is_historical {
 			conn_field = conn_field
 				.argument(InputValue::new(historical_arg_name, TypeRef::named(TypeRef::STRING)));
 		}
@@ -518,7 +518,8 @@ fn register_table_types(
 		// Determine whether the related table is historical so the resolver can
 		// apply `_block_range` filtering when a blockHeight is inherited.
 		let foreign_info = all_tables.iter().find(|t| t.name == fk.foreign_table);
-		let foreign_is_historical = foreign_info.map(|t| t.is_historical).unwrap_or(false);
+		let foreign_is_historical =
+			foreign_info.map(|t| t.is_historical).unwrap_or(false) && !cfg.no_historical;
 		let foreign_columns: Vec<String> = foreign_info
 			.map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
 			.unwrap_or_default();
@@ -552,7 +553,7 @@ fn register_table_types(
 				let child_table = other_table.name.clone();
 				let fk_col = fk.column.clone();
 				let cfg_clone = cfg.clone();
-				let child_is_historical = other_table.is_historical;
+				let child_is_historical = other_table.is_historical && !cfg.no_historical;
 
 				// One-to-one: FK column has a unique constraint → single record field
 				let is_unique = other_table.is_column_unique(&fk.column);
@@ -926,6 +927,7 @@ fn build_filter_context(
 	table: &TableInfo,
 	all_tables: &[TableInfo],
 	schema: &str,
+	no_historical: bool,
 ) -> crate::sql::filter::FilterContext {
 	use crate::sql::filter::{BackwardRelInfo, FilterContext, ForwardRelInfo};
 
@@ -938,7 +940,8 @@ fn build_filter_context(
 			.iter()
 			.find(|t| t.name == fk.foreign_table)
 			.map(|t| t.is_historical)
-			.unwrap_or(false);
+			.unwrap_or(false) &&
+			!no_historical;
 		ctx.forward_relations.insert(
 			field_name.clone(),
 			ForwardRelInfo {
@@ -964,7 +967,7 @@ fn build_filter_context(
 						schema: schema.to_string(),
 						child_table: other.name.clone(),
 						fk_column: fk.column.clone(),
-						is_historical: other.is_historical,
+						is_historical: other.is_historical && !no_historical,
 					},
 				);
 			}
