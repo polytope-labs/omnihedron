@@ -940,8 +940,8 @@ fn build_filter_context(
 			.iter()
 			.find(|t| t.name == fk.foreign_table)
 			.map(|t| t.is_historical)
-			.unwrap_or(false)
-			&& !no_historical;
+			.unwrap_or(false) &&
+			!no_historical;
 		ctx.forward_relations.insert(
 			field_name.clone(),
 			ForwardRelInfo {

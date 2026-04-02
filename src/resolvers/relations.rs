@@ -349,10 +349,7 @@ pub async fn resolve_backward_relation(
 		(rows, total)
 	} else {
 		// Overfetch by 1 to detect hasNextPage without a count query.
-		let overfetch_sql = sql.replace(
-			&format!("LIMIT {limit}"),
-			&format!("LIMIT {}", limit + 1),
-		);
+		let overfetch_sql = sql.replace(&format!("LIMIT {limit}"), &format!("LIMIT {}", limit + 1));
 		let mut rows = req_client
 			.query(&overfetch_sql, &pg_refs)
 			.await
