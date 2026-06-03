@@ -289,21 +289,23 @@ pub async fn resolve_grouped_aggregates(
 	let params: Vec<Value> =
 		agg_ctx.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
-	// Parse `groupBy` argument: list of enum values → GroupByParsed items.
-	let parsed_items: Vec<GroupByParsed> =
+	// Parse `groupBy` argument. Accept both List and bare Enum/String — async-graphql
+	// dynamic schema does not auto-coerce a single enum value into a singleton list.
+	let items: Vec<async_graphql::Value> =
 		match ctx.args.get("groupBy").map(|v| v.as_value().clone()) {
-			Some(async_graphql::Value::List(items)) => items
-				.iter()
-				.filter_map(|item| match item {
-					async_graphql::Value::Enum(name) =>
-						Some(GroupByParsed::from_raw(&name.as_str().to_lowercase())),
-					async_graphql::Value::String(s) =>
-						Some(GroupByParsed::from_raw(&s.to_lowercase())),
-					_ => None,
-				})
-				.collect(),
+			Some(async_graphql::Value::List(list)) => list,
+			Some(v @ (async_graphql::Value::Enum(_) | async_graphql::Value::String(_))) => vec![v],
 			_ => vec![],
 		};
+	let parsed_items: Vec<GroupByParsed> = items
+		.iter()
+		.filter_map(|item| match item {
+			async_graphql::Value::Enum(name) =>
+				Some(GroupByParsed::from_raw(&name.as_str().to_lowercase())),
+			async_graphql::Value::String(s) => Some(GroupByParsed::from_raw(&s.to_lowercase())),
+			_ => None,
+		})
+		.collect();
 
 	// Build SELECT list.
 	let mut select_parts: Vec<String> = Vec::new();

@@ -551,6 +551,83 @@ async fn test_grouped_aggregates() {
 	);
 }
 
+/// Regression test: `groupedAggregates(groupBy: CHAIN)` (bare enum, not wrapped in a list)
+/// must behave identically to `groupBy: [CHAIN]`. async-graphql's dynamic schema does not
+/// auto-coerce a single enum value into a singleton list before invoking the resolver, so
+/// without explicit handling the GROUP BY clause is silently dropped and the response
+/// collapses to a single global aggregate with `keys: []`.
+#[tokio::test]
+async fn test_grouped_aggregates_bare_enum() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let rust_client = TestClient::new(&rust_url());
+
+	let query_bare = r#"
+        {
+            assetTeleporteds(first: 100) {
+                groupedAggregates(groupBy: CHAIN) {
+                    keys
+                    sum { blockNumber }
+                    distinctCount { id }
+                }
+            }
+        }
+    "#;
+	let query_list = r#"
+        {
+            assetTeleporteds(first: 100) {
+                groupedAggregates(groupBy: [CHAIN]) {
+                    keys
+                    sum { blockNumber }
+                    distinctCount { id }
+                }
+            }
+        }
+    "#;
+
+	let rust_bare = rust_client.query(query_bare).await;
+	let rust_list = rust_client.query(query_list).await;
+
+	println!("Rust groupBy: CHAIN: {}", serde_json::to_string_pretty(&rust_bare).unwrap());
+	println!("Rust groupBy: [CHAIN]: {}", serde_json::to_string_pretty(&rust_list).unwrap());
+
+	assert!(
+		rust_bare
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"groupBy: CHAIN returned errors: {rust_bare}"
+	);
+
+	let bare_groups = rust_bare
+		.pointer("/data/assetTeleporteds/groupedAggregates")
+		.and_then(|v| v.as_array())
+		.expect("groupedAggregates array missing from bare-enum response");
+
+	// Bug symptom was a single row with empty `keys` and the global sum.
+	let first_keys = bare_groups[0]
+		.pointer("/keys")
+		.and_then(|v| v.as_array())
+		.expect("keys array missing on bare-enum response");
+	assert!(
+		!first_keys.is_empty(),
+		"groupBy: CHAIN returned empty `keys` — GROUP BY clause was not applied"
+	);
+
+	// Bare form must produce the same payload as the list form.
+	assert_eq!(
+		rust_bare.pointer("/data/assetTeleporteds/groupedAggregates"),
+		rust_list.pointer("/data/assetTeleporteds/groupedAggregates"),
+		"bare-enum groupBy must return the same groups as list-wrapped groupBy"
+	);
+
+	println!("groupedAggregates bare-enum groupBy: parity with list form ✓");
+}
+
 /// Test that enum fields on `orders` return valid enum values.
 /// The `status` column is a PostgreSQL enum with values: PLACED, FILLED, REDEEMED, REFUNDED.
 #[tokio::test]
