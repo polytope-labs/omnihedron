@@ -123,12 +123,14 @@ pub fn build_schema(
 			let table_name = table.name.clone();
 			let cfg = cfg_clone.clone();
 			let col_names = col_names.clone();
+			let primary_keys = table.primary_keys.clone();
 			let filter_ctx = filter_ctx.clone();
 			let fk_map = fk_field_to_col.clone();
 			move |ctx| {
 				let table_name = table_name.clone();
 				let cfg = cfg.clone();
 				let col_names = col_names.clone();
+				let primary_keys = primary_keys.clone();
 				let filter_ctx = filter_ctx.clone();
 				let fk_map = fk_map.clone();
 				FieldFuture::new(async move {
@@ -138,6 +140,7 @@ pub fn build_schema(
 						&cfg,
 						is_historical,
 						&col_names,
+						&primary_keys,
 						&filter_ctx,
 						&fk_map,
 					)
@@ -595,18 +598,21 @@ fn register_table_types(
 					let child_filter_type = format!("{child_type_name}Filter");
 					let child_orderby_enum = format!("{child_plural_type_name}OrderBy");
 					let child_distinct_enum = format!("{}_distinct_enum", &other_table.name);
+					let child_primary_keys = other_table.primary_keys.clone();
 
 					entity_obj = entity_obj.field(
 						Field::new(field_name, TypeRef::named_nn(&child_conn_type), move |ctx| {
 							let child_table = child_table.clone();
 							let fk_col = fk_col.clone();
 							let cfg = cfg_clone.clone();
+							let child_primary_keys = child_primary_keys.clone();
 							FieldFuture::new(async move {
 								let maybe = resolvers::relations::resolve_backward_relation(
 									&ctx,
 									&child_table,
 									&fk_col,
 									child_is_historical,
+									&child_primary_keys,
 									&cfg,
 								)
 								.await?;

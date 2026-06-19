@@ -710,3 +710,116 @@ async fn test_has_next_page_last_page() {
 		all_ids.len()
 	);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bug A regression: a non-unique ORDER BY must still produce a *total* order.
+//
+// All 20 `assetTeleporteds` fixture rows share chain="KUSAMA-4009" (see
+// test_filter_equalto / test_distinct), so `orderBy: CHAIN_ASC` is a fully
+// non-unique ordering. Without a unique primary-key tiebreaker the database may
+// return tied rows in an unstable order, which duplicates rows under offset
+// pagination and skips rows under cursor pagination. Both tests probe only the
+// Rust service.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_offset_no_duplicates_nonunique_order() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+	let rust_client = TestClient::new(&rust_url());
+
+	let mut ids: Vec<String> = vec![];
+	let mut offset = 0;
+	loop {
+		let query = format!(
+			r#"{{ assetTeleporteds(first: 5, offset: {offset}, orderBy: CHAIN_ASC) {{ nodes {{ id }} }} }}"#
+		);
+		let resp = rust_client.query(&query).await;
+		let page: Vec<String> = resp
+			.pointer("/data/assetTeleporteds/nodes")
+			.and_then(|v| v.as_array())
+			.map(|n| n.iter().filter_map(|x| x["id"].as_str().map(String::from)).collect())
+			.unwrap_or_default();
+		if page.is_empty() {
+			break;
+		}
+		ids.extend(page);
+		offset += 5;
+		if offset > 100 {
+			break; // safety bound
+		}
+	}
+
+	let distinct: HashSet<&String> = ids.iter().collect();
+	assert_eq!(
+		distinct.len(),
+		ids.len(),
+		"offset pagination over a non-unique order returned duplicates: {} fetched, {} distinct",
+		ids.len(),
+		distinct.len()
+	);
+	assert!(ids.len() >= 20, "expected to walk all ~20 fixture rows, got {}", ids.len());
+	println!("offset non-unique order: {} rows, all distinct ✓", ids.len());
+}
+
+#[tokio::test]
+async fn test_cursor_no_data_loss_nonunique_order() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+	let rust_client = TestClient::new(&rust_url());
+
+	// True total for the entity.
+	let total_resp = rust_client.query(r#"{ assetTeleporteds { totalCount } }"#).await;
+	let total = total_resp
+		.pointer("/data/assetTeleporteds/totalCount")
+		.and_then(|v| v.as_i64())
+		.expect("totalCount") as usize;
+
+	// Walk all pages via after-cursor, ordered by the non-unique CHAIN column.
+	let mut all_ids: HashSet<String> = HashSet::new();
+	let mut after: Option<String> = None;
+	for _ in 0..50 {
+		let after_arg = match &after {
+			Some(c) => format!(r#", after: "{c}""#),
+			None => String::new(),
+		};
+		let query = format!(
+			r#"{{ assetTeleporteds(first: 5, orderBy: CHAIN_ASC{after_arg}) {{ pageInfo {{ endCursor hasNextPage }} edges {{ node {{ id }} }} }} }}"#
+		);
+		let resp = rust_client.query(&query).await;
+		let edges = resp
+			.pointer("/data/assetTeleporteds/edges")
+			.and_then(|v| v.as_array())
+			.cloned()
+			.unwrap_or_default();
+		for e in &edges {
+			if let Some(id) = e.pointer("/node/id").and_then(|v| v.as_str()) {
+				all_ids.insert(id.to_string());
+			}
+		}
+		let has_next = resp
+			.pointer("/data/assetTeleporteds/pageInfo/hasNextPage")
+			.and_then(|v| v.as_bool())
+			.unwrap_or(false);
+		if !has_next {
+			break;
+		}
+		after = resp
+			.pointer("/data/assetTeleporteds/pageInfo/endCursor")
+			.and_then(|v| v.as_str())
+			.map(String::from);
+	}
+
+	assert_eq!(
+		all_ids.len(),
+		total,
+		"cursor pagination over a non-unique order lost rows: retrieved {} distinct of {} total",
+		all_ids.len(),
+		total
+	);
+	println!("cursor non-unique order: retrieved all {total} rows, no data loss ✓");
+}
