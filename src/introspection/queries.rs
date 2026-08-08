@@ -114,6 +114,16 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 			}
 		}
 
+		// Drop duplicate FK entries on the same (column → table) pair. The
+		// information_schema join above can multiply rows for composite or same-named
+		// constraints, and a comment-declared virtual FK can restate a real one. Each
+		// duplicate would register the same forward field on this type and the same
+		// backward field on the parent — which `async-graphql` turns into a panic.
+		{
+			let mut seen = std::collections::HashSet::new();
+			foreign_keys.retain(|fk| seen.insert((fk.column.clone(), fk.foreign_table.clone())));
+		}
+
 		tables.push(TableInfo {
 			name: table_name.clone(),
 			columns,

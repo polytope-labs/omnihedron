@@ -49,10 +49,17 @@ pub fn register_subscriptions(
 	mut builder: SchemaBuilder,
 ) -> SchemaBuilder {
 	let mut subscription_obj = Subscription::new("Subscription");
+	// `Subscription::field` panics on a duplicate name, so skip tables that inflect to a
+	// field name already taken (see `FieldNames` in `builder.rs`).
+	let mut seen_fields = std::collections::HashSet::new();
 
 	for table in tables {
 		let type_name = table_to_type_name(&table.name);
 		let field_name = table_to_connection_field(&table.name); // e.g. "transfers"
+		if !seen_fields.insert(field_name.clone()) {
+			tracing::warn!(field = %field_name, "Duplicate subscription field name — skipping");
+			continue;
+		}
 		let payload_type = format!("{type_name}SubscriptionPayload");
 
 		// Register the payload type: { id, mutation_type, _entity }
