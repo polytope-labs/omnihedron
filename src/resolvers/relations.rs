@@ -35,6 +35,7 @@ use crate::{
 		},
 		dataloader::{RelationKey, RelationLoader},
 	},
+	schema::inflector::to_camel_case,
 	sql::{
 		filter::build_filter_sql,
 		pagination::{PaginationArgs, resolve_pagination},
@@ -55,6 +56,7 @@ pub async fn resolve_forward_relation(
 	fk_column: &str,
 	foreign_is_historical: bool,
 	foreign_columns: &[String],
+	foreign_fk_fields: &std::collections::HashMap<String, String>,
 ) -> async_graphql::Result<Option<Value>> {
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
 	let fk_val = match parent.get(fk_column) {
@@ -80,13 +82,25 @@ pub async fn resolve_forward_relation(
 		v => v.to_string(),
 	};
 
-	// Collect requested columns from the GraphQL selection set, ensuring `id` is always included.
-	let mut columns: Vec<String> = ctx
-		.field()
-		.selection_set()
-		.map(|field| field.name().to_string())
-		.filter(|name| foreign_columns.contains(name))
+	// Collect requested columns from the GraphQL selection set, ensuring `id` is always
+	// included.  The selection set yields camelCase GraphQL field names while
+	// `foreign_columns` holds snake_case SQL column names, so match on the inflected
+	// form — comparing the two directly would silently drop every multi-word column
+	// from the SELECT and resolve its field to null.
+	let requested: std::collections::HashSet<String> =
+		ctx.field().selection_set().map(|field| field.name().to_string()).collect();
+	let mut columns: Vec<String> = foreign_columns
+		.iter()
+		.filter(|col| requested.contains(&to_camel_case(col)) || requested.contains(col.as_str()))
+		.cloned()
 		.collect();
+	// A nested forward relation resolves off the FK column, not the relation field name,
+	// so pull in the column backing any requested relation.
+	for (field, col) in foreign_fk_fields {
+		if requested.contains(field) && !columns.contains(col) {
+			columns.push(col.clone());
+		}
+	}
 	if !columns.contains(&"id".to_string()) {
 		columns.push("id".to_string());
 	}

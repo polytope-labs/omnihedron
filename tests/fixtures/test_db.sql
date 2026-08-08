@@ -4626,6 +4626,9 @@ COPY "app"."transfers" ("id","chain","amount","from","to","_id","_block_range") 
 CREATE TABLE app.test_authors (
     id text NOT NULL,
     name text NOT NULL,
+    -- Multi-word column: its GraphQL field is `birthYear`, so a forward relation that
+    -- matches selection-set names against raw column names would drop it from the SELECT.
+    birth_year integer NOT NULL,
     _id uuid NOT NULL,
     _block_range int8range NOT NULL
 );
@@ -4672,27 +4675,27 @@ ALTER TABLE app.test_author_profiles ADD CONSTRAINT test_author_profiles_author_
 COMMENT ON CONSTRAINT test_author_profiles_author_id_fkey ON app.test_author_profiles IS '@singleForeignFieldName profile';
 
 -- Ten authors visible at all block heights.
-INSERT INTO app.test_authors (_id, id, name, _block_range) VALUES
+INSERT INTO app.test_authors (_id, id, name, birth_year, _block_range) VALUES
     ('11111111-1111-1111-1111-111111111111'::uuid,
-     'author-alice', 'Alice', '[0,)'::int8range),
+     'author-alice', 'Alice', 1902, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111112'::uuid,
-     'author-bob', 'Bob', '[0,)'::int8range),
+     'author-bob', 'Bob', 1903, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111113'::uuid,
-     'author-charlie', 'Charlie', '[0,)'::int8range),
+     'author-charlie', 'Charlie', 1904, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111114'::uuid,
-     'author-diana', 'Diana', '[0,)'::int8range),
+     'author-diana', 'Diana', 1905, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111115'::uuid,
-     'author-eve', 'Eve', '[0,)'::int8range),
+     'author-eve', 'Eve', 1906, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111116'::uuid,
-     'author-frank', 'Frank', '[0,)'::int8range),
+     'author-frank', 'Frank', 1907, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111117'::uuid,
-     'author-grace', 'Grace', '[0,)'::int8range),
+     'author-grace', 'Grace', 1908, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111118'::uuid,
-     'author-henry', 'Henry', '[0,)'::int8range),
+     'author-henry', 'Henry', 1909, '[0,)'::int8range),
     ('11111111-1111-1111-1111-111111111119'::uuid,
-     'author-iris', 'Iris', '[0,)'::int8range),
+     'author-iris', 'Iris', 1910, '[0,)'::int8range),
     ('11111111-1111-1111-1111-11111111111a'::uuid,
-     'author-jack', 'Jack', '[0,)'::int8range);
+     'author-jack', 'Jack', 1911, '[0,)'::int8range);
 
 INSERT INTO app.test_author_profiles (_id, id, bio, author_id, _block_range) VALUES
     ('33333333-3333-3333-3333-333333333301'::uuid,

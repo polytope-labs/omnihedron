@@ -584,12 +584,25 @@ fn register_table_types(
 		let foreign_columns: Vec<String> = foreign_info
 			.map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
 			.unwrap_or_default();
+		// Relation field → FK column on the related table, so a nested forward relation
+		// still gets the column it resolves off.
+		let foreign_fk_fields: Arc<std::collections::HashMap<String, String>> = Arc::new(
+			foreign_info
+				.map(|t| {
+					t.foreign_keys
+						.iter()
+						.map(|fk| (forward_relation_field(&fk.column), fk.column.clone()))
+						.collect()
+				})
+				.unwrap_or_default(),
+		);
 
 		entity_obj =
 			entity_obj.field(Field::new(field_name, TypeRef::named(&related_type), move |ctx| {
 				let fk_col = fk_col.clone();
 				let foreign_table = foreign_table.clone();
 				let foreign_columns = foreign_columns.clone();
+				let foreign_fk_fields = foreign_fk_fields.clone();
 				FieldFuture::new(async move {
 					let maybe = resolvers::relations::resolve_forward_relation(
 						&ctx,
@@ -597,6 +610,7 @@ fn register_table_types(
 						&fk_col,
 						foreign_is_historical,
 						&foreign_columns,
+						&foreign_fk_fields,
 					)
 					.await?;
 					Ok(maybe.map(FieldValue::owned_any))
