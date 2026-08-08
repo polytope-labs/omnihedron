@@ -19,6 +19,32 @@ use common::*;
 #[allow(unused_imports)]
 use serde_json::{Value, json};
 
+/// A forward relation must fetch columns whose GraphQL field name differs from the SQL
+/// column name.  `birthYear`/`birth_year` is dropped from the SELECT if the resolver
+/// compares selection-set names against raw column names, which resolves the field to
+/// null — or errors outright when the column is non-null.
+#[tokio::test]
+async fn test_forward_relation_multiword_column() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	let query = r#"{ testBook(id: "book-2") { id creator { id name birthYear } } }"#;
+	let ts = ts_client.query(query).await;
+	let rust = rust_client.query(query).await;
+
+	assert!(rust.get("errors").is_none(), "unexpected errors: {rust:#?}");
+	let creator = rust.pointer("/data/testBook/creator").expect("creator missing");
+	assert_eq!(creator["id"], "author-alice");
+	assert_eq!(creator["birthYear"], 1902, "multi-word column dropped from SELECT: {creator:#?}");
+
+	compare_responses("testBook forward relation multi-word column", &ts, &rust);
+	println!("forward relation multi-word column: creator.birthYear ✓");
+}
+
 #[tokio::test]
 async fn test_forward_relation() {
 	if !services_available() {
