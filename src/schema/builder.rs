@@ -39,6 +39,43 @@ use crate::{
 };
 use async_graphql::{Name, Value as GqlValue, dynamic::*};
 use deadpool_postgres::Pool;
+use std::collections::HashSet;
+use tracing::warn;
+
+/// Guards against duplicate field names on a single GraphQL object.
+///
+/// `async-graphql`'s `Object::field` / `InputObject::field` **panic** on a duplicate
+/// name, which turns any schema quirk into a process abort at startup.  Those quirks
+/// are outside our control: a SubQuery entity rename leaves the old table behind with
+/// its `@foreignFieldName` smart tag still pointing at a live parent, two `@derivedFrom`
+/// relations can inflect to the same name, and a table can shadow a built-in root field.
+/// Skipping the later field with a warning keeps the rest of the API serving.
+struct FieldNames {
+	owner: String,
+	seen: HashSet<String>,
+}
+
+impl FieldNames {
+	fn new(owner: impl Into<String>) -> Self {
+		Self { owner: owner.into(), seen: HashSet::new() }
+	}
+
+	/// Records `name`, returning `true` when it is new and `false` (with a warning) when
+	/// it collides with a field already added to this object.
+	fn claim(&mut self, name: &str) -> bool {
+		if self.seen.insert(name.to_string()) {
+			return true;
+		}
+		warn!(
+			graphql_type = %self.owner,
+			field = %name,
+			"Duplicate GraphQL field name — skipping the later definition. Check for stale \
+			 tables left behind by an entity rename, or two relations that inflect to the same \
+			 name."
+		);
+		false
+	}
+}
 
 /// Build the complete dynamic GraphQL schema from an introspected set of tables.
 ///
@@ -93,6 +130,12 @@ pub fn build_schema(
 	let table_to_type = Arc::new(table_to_type);
 
 	let mut query = Object::new("Query");
+	let mut query_fields = FieldNames::new("Query");
+	// Reserve the built-in root fields first: they are part of the PostGraphile contract,
+	// so a table whose inflected name collides with one loses rather than aborting startup.
+	for reserved in ["query", "nodeId", "_bigIntFilters", "node", "_metadata", "_metadatas"] {
+		query_fields.claim(reserved);
+	}
 	for table in tables {
 		let type_name = table_to_type_name(&table.name);
 		let plural_type_name = table_to_plural_type_name(&table.name);
@@ -161,39 +204,46 @@ pub fn build_schema(
 				.argument(InputValue::new(historical_arg_name, TypeRef::named(TypeRef::STRING)));
 		}
 
-		query = query.field(conn_field);
+		if query_fields.claim(&connection_field) {
+			query = query.field(conn_field);
+		}
 
 		// Single-record query
 		let table_name2 = table.name.clone();
 		let cfg_clone2 = cfg.clone();
-		query = query.field(
-			Field::new(&single_field, TypeRef::named(&type_name), move |ctx| {
-				let table_name = table_name2.clone();
-				let cfg = cfg_clone2.clone();
-				FieldFuture::new(async move {
-					let maybe = resolvers::single::resolve_single(&ctx, &table_name, &cfg).await?;
-					Ok(maybe.map(FieldValue::owned_any))
+		if query_fields.claim(&single_field) {
+			query = query.field(
+				Field::new(&single_field, TypeRef::named(&type_name), move |ctx| {
+					let table_name = table_name2.clone();
+					let cfg = cfg_clone2.clone();
+					FieldFuture::new(async move {
+						let maybe =
+							resolvers::single::resolve_single(&ctx, &table_name, &cfg).await?;
+						Ok(maybe.map(FieldValue::owned_any))
+					})
 				})
-			})
-			.argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
-		);
+				.argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
+			);
+		}
 
 		// {entity}ByNodeId query
 		let by_node_id_field = format!("{single_field}ByNodeId");
 		let table_name3 = table.name.clone();
 		let cfg_clone3 = cfg.clone();
-		query = query.field(
-			Field::new(&by_node_id_field, TypeRef::named(&type_name), move |ctx| {
-				let table_name = table_name3.clone();
-				let cfg = cfg_clone3.clone();
-				FieldFuture::new(async move {
-					let maybe =
-						resolvers::single::resolve_by_node_id(&ctx, &table_name, &cfg).await?;
-					Ok(maybe.map(FieldValue::owned_any))
+		if query_fields.claim(&by_node_id_field) {
+			query = query.field(
+				Field::new(&by_node_id_field, TypeRef::named(&type_name), move |ctx| {
+					let table_name = table_name3.clone();
+					let cfg = cfg_clone3.clone();
+					FieldFuture::new(async move {
+						let maybe =
+							resolvers::single::resolve_by_node_id(&ctx, &table_name, &cfg).await?;
+						Ok(maybe.map(FieldValue::owned_any))
+					})
 				})
-			})
-			.argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
-		);
+				.argument(InputValue::new("nodeId", TypeRef::named_nn(TypeRef::ID))),
+			);
+		}
 	}
 
 	// ── PostGraphile root compatibility fields ────────────────────────────────
@@ -308,6 +358,9 @@ pub fn build_schema(
 		// Find the table this search function returns.
 		let table_info = tables.iter().find(|t| t.name == search_fn.returns_table);
 		if table_info.is_none() {
+			continue;
+		}
+		if !query_fields.claim(&search_fn.graphql_name) {
 			continue;
 		}
 
@@ -453,6 +506,7 @@ fn register_table_types(
 	} else {
 		Object::new(&type_name)
 	};
+	let mut entity_fields = FieldNames::new(&type_name);
 
 	// nodeId: PostGraphile-compatible computed field.
 	// Format: base64(["table_name", _id_uuid]) — matches PostGraphile exactly.
@@ -466,6 +520,7 @@ fn register_table_types(
 		} else {
 			table.primary_keys.first().cloned().unwrap_or_else(|| "id".to_string())
 		};
+		entity_fields.claim("nodeId");
 		entity_obj =
 			entity_obj.field(Field::new("nodeId", TypeRef::named_nn(TypeRef::ID), move |ctx| {
 				let table_name = table_name_for_node.clone();
@@ -492,6 +547,9 @@ fn register_table_types(
 		let type_ref =
 			if col.is_nullable { TypeRef::named(gql_type) } else { TypeRef::named_nn(gql_type) };
 		let col_name = col.name.clone();
+		if !entity_fields.claim(&field_name) {
+			continue;
+		}
 		entity_obj = entity_obj.field(Field::new(field_name, type_ref, move |ctx| {
 			let col = col_name.clone();
 			FieldFuture::new(async move {
@@ -513,6 +571,9 @@ fn register_table_types(
 	for fk in &table.foreign_keys {
 		let related_type = table_to_type_name(&fk.foreign_table);
 		let field_name = forward_relation_field(&fk.column); // e.g. author (from author_id)
+		if !entity_fields.claim(&field_name) {
+			continue;
+		}
 		let fk_col = fk.column.clone();
 		let foreign_table = fk.foreign_table.clone();
 		// Determine whether the related table is historical so the resolver can
@@ -566,6 +627,10 @@ fn register_table_types(
 						.clone()
 						.unwrap_or(default_field_name);
 
+					if !entity_fields.claim(&field_name) {
+						continue;
+					}
+
 					// Single record backward relation (one-to-one)
 					entity_obj = entity_obj.field(Field::new(
 						field_name,
@@ -589,6 +654,10 @@ fn register_table_types(
 					// Use @foreignFieldName smart tag if available, else default
 					let field_name =
 						fk.smart_tags.foreign_field_name.clone().unwrap_or(default_field_name);
+
+					if !entity_fields.claim(&field_name) {
+						continue;
+					}
 
 					// Many backward relation (one-to-many) → connection
 					let child_conn_type = format!("{child_plural_type_name}Connection");
@@ -642,14 +711,24 @@ fn register_table_types(
 		let fks = &junction.foreign_keys;
 		// For each pair of FKs in the junction table, if one points to this table,
 		// the other is the target. Register a shortcut field on this entity.
+		// A self-referencing junction (both FKs point at this table) would otherwise
+		// register the same field name twice — once per iteration — so only the first
+		// FK gets a shortcut field.
+		let self_referencing = fks[0].foreign_table == fks[1].foreign_table;
 		for (i, fk) in fks.iter().enumerate() {
 			if fk.foreign_table != table.name {
+				continue;
+			}
+			if self_referencing && i == 1 {
 				continue;
 			}
 			let other_fk = &fks[1 - i]; // the other FK
 			let target_plural = table_to_plural_type_name(&other_fk.foreign_table);
 			let target_conn = format!("{target_plural}Connection");
 			let field_name = table_to_connection_field(&other_fk.foreign_table);
+			if !entity_fields.claim(&field_name) {
+				continue;
+			}
 			let junction_name = junction.name.clone();
 			let fk_to_source = fk.column.clone();
 			let fk_to_target = other_fk.column.clone();
@@ -792,9 +871,16 @@ fn register_table_types(
 		.field(InputValue::new("and", TypeRef::named_nn_list(&filter_type_name)))
 		.field(InputValue::new("or", TypeRef::named_nn_list(&filter_type_name)))
 		.field(InputValue::new("not", TypeRef::named(&filter_type_name)));
+	let mut filter_fields = FieldNames::new(&filter_type_name);
+	for reserved in ["and", "or", "not"] {
+		filter_fields.claim(reserved);
+	}
 
 	for col in table.public_columns() {
 		let field_name = to_camel_case(&col.name);
+		if !filter_fields.claim(&field_name) {
+			continue;
+		}
 		let field_filter: String = if let Some(display_name) = &col.enum_display_name {
 			format!("{display_name}Filter")
 		} else if col.udt_name.starts_with('_') {
@@ -815,12 +901,16 @@ fn register_table_types(
 		let fk_field_name = forward_relation_field(&fk.column);
 		// Forward filter: e.g. `testAuthors: TestAuthorFilter`
 		let foreign_filter = format!("{foreign_type}Filter");
-		filter_obj =
-			filter_obj.field(InputValue::new(&fk_field_name, TypeRef::named(&foreign_filter)));
+		if filter_fields.claim(&fk_field_name) {
+			filter_obj =
+				filter_obj.field(InputValue::new(&fk_field_name, TypeRef::named(&foreign_filter)));
+		}
 		// Exists filter: e.g. `testAuthorsExists: Boolean`
 		let exists_field = format!("{fk_field_name}Exists");
-		filter_obj =
-			filter_obj.field(InputValue::new(&exists_field, TypeRef::named(TypeRef::BOOLEAN)));
+		if filter_fields.claim(&exists_field) {
+			filter_obj =
+				filter_obj.field(InputValue::new(&exists_field, TypeRef::named(TypeRef::BOOLEAN)));
+		}
 	}
 
 	// ── Backward relation (ToMany) filters ────────────────────────────────
@@ -833,6 +923,10 @@ fn register_table_types(
 				let default_rel_name = backward_relation_field(&other_table.name, &fk.column);
 				let rel_field_name =
 					fk.smart_tags.foreign_field_name.clone().unwrap_or(default_rel_name);
+
+				if !filter_fields.claim(&rel_field_name) {
+					continue;
+				}
 
 				// Register the ToMany filter input type (some/none/every)
 				let to_many_obj = InputObject::new(&to_many_filter_name)
@@ -982,4 +1076,112 @@ fn build_filter_context(
 fn json_field_to_gql_value(row: &serde_json::Value, field: &str) -> Option<GqlValue> {
 	let v = row.get(field)?.clone();
 	GqlValue::from_json(v).ok()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::introspection::model::{ColumnInfo, ForeignKey, SmartTags};
+	use clap::Parser;
+
+	fn col(name: &str) -> ColumnInfo {
+		ColumnInfo {
+			name: name.to_string(),
+			pg_type: "text".to_string(),
+			udt_name: "text".to_string(),
+			is_nullable: false,
+			ordinal_position: 1,
+			enum_display_name: None,
+		}
+	}
+
+	fn table(name: &str, columns: Vec<ColumnInfo>, foreign_keys: Vec<ForeignKey>) -> TableInfo {
+		TableInfo {
+			name: name.to_string(),
+			columns,
+			primary_keys: vec!["id".to_string()],
+			foreign_keys,
+			unique_constraints: vec![],
+			is_historical: false,
+		}
+	}
+
+	fn fk(column: &str, foreign_table: &str, foreign_field_name: Option<&str>) -> ForeignKey {
+		ForeignKey {
+			constraint_name: format!("{column}_fkey"),
+			column: column.to_string(),
+			foreign_table: foreign_table.to_string(),
+			foreign_column: "id".to_string(),
+			smart_tags: SmartTags {
+				foreign_field_name: foreign_field_name.map(str::to_string),
+				single_foreign_field_name: None,
+			},
+		}
+	}
+
+	fn build(tables: &[TableInfo]) -> anyhow::Result<Schema> {
+		let cfg = Arc::new(Config::parse_from(["omnihedron", "-n", "app"]));
+		let db = crate::config::DbConfig::from_env().unwrap();
+		// No connection is opened here — the pool is lazy.
+		let pool = Arc::new(crate::db::create_pool(&db, &cfg, false).unwrap());
+		build_schema(tables, &[], pool, cfg, "blockHeight", &[])
+	}
+
+	/// A SubQuery entity rename leaves the old table in place, still carrying the
+	/// `@foreignFieldName` smart tag that targets a live parent.  Both child tables then
+	/// want the same backward-relation field on the parent — this must warn and skip, not
+	/// panic (`async-graphql`'s `Object::field` aborts the process on a duplicate name).
+	#[test]
+	fn duplicate_backward_relation_name_does_not_panic() {
+		let tables = vec![
+			table("liquidity_providers", vec![col("id")], vec![]),
+			// Stale table left behind by the rename to ...V2.
+			table(
+				"liquidity_provider_balances",
+				vec![col("id"), col("provider_id")],
+				vec![fk("provider_id", "liquidity_providers", Some("balances"))],
+			),
+			table(
+				"liquidity_provider_balance_v2s",
+				vec![col("id"), col("provider_id")],
+				vec![fk("provider_id", "liquidity_providers", Some("balances"))],
+			),
+		];
+
+		let schema = build(&tables).expect("schema should build");
+		let sdl = schema.sdl();
+		let provider = sdl
+			.split("type LiquidityProvider ")
+			.nth(1)
+			.and_then(|s| s.split('}').next())
+			.unwrap_or_default();
+		let balances_fields =
+			provider.lines().filter(|l| l.trim_start().starts_with("balances(")).count();
+		assert_eq!(balances_fields, 1, "one `balances` field: {provider}");
+	}
+
+	/// Both FKs of a junction table pointing at the same parent used to register the
+	/// many-to-many shortcut field twice.
+	#[test]
+	fn self_referencing_junction_does_not_panic() {
+		let tables = vec![
+			table("balances", vec![col("id")], vec![]),
+			table(
+				"balance_transfers",
+				vec![col("id"), col("from_id"), col("to_id")],
+				vec![fk("from_id", "balances", None), fk("to_id", "balances", None)],
+			),
+		];
+		build(&tables).expect("schema should build");
+	}
+
+	/// Two tables inflecting to the same root connection field must not abort startup.
+	#[test]
+	fn colliding_root_query_fields_do_not_panic() {
+		let tables = vec![
+			table("balance", vec![col("id")], vec![]),
+			table("balances", vec![col("id")], vec![]),
+		];
+		build(&tables).expect("schema should build");
+	}
 }

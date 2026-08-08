@@ -44,8 +44,16 @@ impl TableInfo {
 
 	/// Returns only the columns that should be exposed in the GraphQL schema
 	/// (excludes internal SubQuery columns such as `_block_range` and `_id`).
+	///
+	/// Columns whose camelCase form collides with an earlier column are dropped: every
+	/// consumer names its field with `to_camel_case`, and `async-graphql` panics rather
+	/// than erroring when the same field name is added twice.
 	pub fn public_columns(&self) -> impl Iterator<Item = &ColumnInfo> {
-		self.columns.iter().filter(|c| !is_internal_column(&c.name))
+		let mut seen = std::collections::HashSet::new();
+		self.columns.iter().filter(move |c| {
+			!is_internal_column(&c.name) &&
+				seen.insert(crate::schema::inflector::to_camel_case(&c.name))
+		})
 	}
 
 	/// Returns `true` if the given column is covered by a single-column unique constraint,
@@ -193,7 +201,12 @@ impl SmartTags {
 						let val = parts[1].trim();
 						if let Some(start) = val.find('(') {
 							if let Some(end) = val[start..].find(')') {
-								fk_column = Some(val[start + 1..start + end].trim().to_string());
+								fk_column = Some(
+									val[start + 1..start + end]
+										.trim()
+										.trim_matches('"')
+										.to_string(),
+								);
 							}
 						}
 						if let Some(ref_idx) = val.find("REFERENCES") {
