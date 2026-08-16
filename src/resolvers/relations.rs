@@ -31,7 +31,7 @@ use crate::{
 	resolvers::{
 		connection::{
 			extract_order_cols, json_to_pg_params, parse_distinct, parse_orderby,
-			reverse_order_clause, row_to_json,
+			push_tiebreaker_clauses, reverse_order_clause, row_to_json, unique_tiebreak_cols,
 		},
 		dataloader::{RelationKey, RelationLoader},
 	},
@@ -202,6 +202,7 @@ pub async fn resolve_backward_relation(
 	child_table: &str,
 	fk_column: &str,
 	child_is_historical: bool,
+	child_primary_keys: &[String],
 	cfg: &Config,
 ) -> async_graphql::Result<Option<Value>> {
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
@@ -281,7 +282,20 @@ pub async fn resolve_backward_relation(
 
 	// ── ORDER BY ─────────────────────────────────────────────────────────────
 	let order_clauses = parse_orderby(order_by_gql.as_ref());
-	let order_cols: Vec<String> = extract_order_cols(&order_clauses);
+	let mut order_cols: Vec<String> = extract_order_cols(&order_clauses);
+	if order_cols.is_empty() {
+		order_cols.push("id".to_string());
+	}
+	// Append the child table's unique key as a final tiebreaker so ordering by a
+	// non-unique column is a *total* order — preventing duplicate rows under
+	// offset pagination and skipped rows under cursor pagination. The same
+	// columns drive the ORDER BY tiebreaker and the keyset cursor below.
+	let tiebreak_cols = unique_tiebreak_cols(child_primary_keys, child_is_historical);
+	for tb in &tiebreak_cols {
+		if !order_cols.iter().any(|c| c == tb) {
+			order_cols.push(tb.clone());
+		}
+	}
 
 	// ── PAGINATION ───────────────────────────────────────────────────────────
 	let pagination = resolve_pagination(
@@ -320,12 +334,14 @@ pub async fn resolve_backward_relation(
 		_ => "",
 	};
 
-	let forward_order_clause = if order_clauses.is_empty() {
-		format!("ORDER BY t.id ASC{nulls_suffix}")
-	} else {
-		let clauses_with_nulls: Vec<String> =
-			order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect();
-		format!("ORDER BY {}", clauses_with_nulls.join(", "))
+	let forward_order_clause = {
+		let mut clauses: Vec<String> = if order_clauses.is_empty() {
+			vec![format!("t.id ASC{nulls_suffix}")]
+		} else {
+			order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect()
+		};
+		push_tiebreaker_clauses(&mut clauses, &tiebreak_cols);
+		format!("ORDER BY {}", clauses.join(", "))
 	};
 
 	let order_clause = if pagination.is_backwards {
@@ -390,10 +406,11 @@ pub async fn resolve_backward_relation(
 				map.insert("_block_height".to_string(), json!(bh));
 			}
 		}
-		let cursor = crate::schema::cursor::encode_cursor(&[(
-			"id",
-			node.get("id").cloned().unwrap_or(json!(null)),
-		)]);
+		let cursor_fields: Vec<(&str, Value)> = order_cols
+			.iter()
+			.map(|col| (col.as_str(), node.get(col).cloned().unwrap_or(json!(null))))
+			.collect();
+		let cursor = crate::schema::cursor::encode_cursor(&cursor_fields);
 		edges.push(json!({ "cursor": cursor, "node": node.clone() }));
 		nodes.push(node);
 	}

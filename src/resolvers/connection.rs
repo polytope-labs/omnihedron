@@ -51,6 +51,7 @@ pub async fn resolve_connection_ctx(
 	cfg: &Config,
 	is_historical: bool,
 	columns: &[String],
+	primary_keys: &[String],
 	filter_ctx: &crate::sql::filter::FilterContext,
 	fk_field_to_col: &HashMap<String, String>,
 ) -> async_graphql::Result<Option<Value>> {
@@ -139,6 +140,19 @@ pub async fn resolve_connection_ctx(
 	if order_cols.is_empty() {
 		order_cols.push("id".to_string());
 	}
+	// Append the table's unique key as a final tiebreaker so that ordering by a
+	// non-unique column produces a *total* order. Without this, tied rows come
+	// back in an arbitrary, unstable order — yielding duplicate rows under offset
+	// pagination and skipped rows under cursor pagination. The same columns are
+	// appended to the ORDER BY below so the keyset cursor stays consistent with
+	// it. (PostGraphile appends the primary key to every connection's ordering
+	// for the same reason.)
+	let tiebreak_cols = unique_tiebreak_cols(primary_keys, is_historical);
+	for tb in &tiebreak_cols {
+		if !order_cols.iter().any(|c| c == tb) {
+			order_cols.push(tb.clone());
+		}
+	}
 
 	// ── PAGINATION ────────────────────────────────────────────────────────────
 	let pagination = resolve_pagination(
@@ -192,11 +206,9 @@ pub async fn resolve_connection_ctx(
 		} else {
 			order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect()
 		};
-		// PostGraphile appends `_id ASC` as a unique tiebreaker for historical tables
-		// to ensure deterministic ordering when multiple versions share the same id.
-		if is_historical && !clauses.iter().any(|c| c.contains("t._id ")) {
-			clauses.push("t._id ASC".to_string());
-		}
+		// Append the unique-key tiebreaker(s) so the ORDER BY is a total order
+		// (mirrors the keyset columns appended to `order_cols` above).
+		push_tiebreaker_clauses(&mut clauses, &tiebreak_cols);
 		// PostgreSQL requires DISTINCT ON columns to be leading ORDER BY columns.
 		if !distinct_cols.is_empty() {
 			let leading: Vec<String> = distinct_cols
@@ -311,9 +323,7 @@ pub async fn resolve_connection_ctx(
 				} else {
 					order_clauses.iter().map(|c| format!("{c}{nulls_suffix}")).collect()
 				};
-				if is_historical && !clauses.iter().any(|c| c.contains("t._id ")) {
-					clauses.push("t._id ASC".to_string());
-				}
+				push_tiebreaker_clauses(&mut clauses, &tiebreak_cols);
 				format!("ORDER BY {}", clauses.join(", "))
 			};
 			// Outer ORDER BY: deterministic ordering by distinct columns.
@@ -585,7 +595,9 @@ fn build_select_cols(
 /// 3. Any column whose camelCase name (or raw name) appears in `requested`.
 /// 4. All `order_cols` and `distinct_cols` (needed for ORDER BY / DISTINCT ON).
 ///
-/// If `requested` is empty (shouldn't happen in practice) only `t."id"` is returned.
+/// When `requested` is empty (e.g. only `cursor`/`pageInfo` selected, no node
+/// fields) the result is `id` plus any `order_cols`/`distinct_cols` — the latter
+/// must always be fetched so the keyset cursor encodes complete ordering values.
 pub fn filter_columns_by_request(
 	requested: &HashSet<String>,
 	columns: &[String],
@@ -593,14 +605,6 @@ pub fn filter_columns_by_request(
 	distinct_cols: &[String],
 ) -> String {
 	let has_internal_id = columns.iter().any(|c| c == "_id");
-
-	if requested.is_empty() {
-		return if has_internal_id {
-			"t.\"id\", t.\"_id\"".to_string()
-		} else {
-			"t.\"id\"".to_string()
-		};
-	}
 
 	let mut selected: Vec<String> = Vec::new();
 	let mut included: HashSet<String> = HashSet::new();
@@ -636,7 +640,7 @@ pub fn filter_columns_by_request(
 mod tests {
 	use std::collections::HashSet;
 
-	use super::filter_columns_by_request;
+	use super::{filter_columns_by_request, push_tiebreaker_clauses, unique_tiebreak_cols};
 
 	fn set(items: &[&str]) -> HashSet<String> {
 		items.iter().map(|s| s.to_string()).collect()
@@ -644,6 +648,45 @@ mod tests {
 
 	fn cols(items: &[&str]) -> Vec<String> {
 		items.iter().map(|s| s.to_string()).collect()
+	}
+
+	#[test]
+	fn tiebreak_prefers_primary_key() {
+		assert_eq!(unique_tiebreak_cols(&cols(&["id"]), false), cols(&["id"]));
+		assert_eq!(unique_tiebreak_cols(&cols(&["_id"]), true), cols(&["_id"]));
+		// Composite primary key is preserved in order.
+		assert_eq!(unique_tiebreak_cols(&cols(&["a", "b"]), false), cols(&["a", "b"]));
+	}
+
+	#[test]
+	fn tiebreak_falls_back_when_no_pk() {
+		assert_eq!(unique_tiebreak_cols(&[], false), cols(&["id"]));
+		assert_eq!(unique_tiebreak_cols(&[], true), cols(&["_id"]));
+	}
+
+	#[test]
+	fn tiebreaker_appends_pk_to_non_unique_order() {
+		// Ordering by a non-unique column gains a unique `id` tiebreaker.
+		let mut clauses = cols(&["t.chain ASC"]);
+		push_tiebreaker_clauses(&mut clauses, &cols(&["id"]));
+		assert_eq!(clauses, cols(&["t.chain ASC", "t.id ASC"]));
+	}
+
+	#[test]
+	fn tiebreaker_skips_column_already_ordered() {
+		// `id` already leads the ORDER BY — don't duplicate it.
+		let mut clauses = cols(&["t.id DESC"]);
+		push_tiebreaker_clauses(&mut clauses, &cols(&["id"]));
+		assert_eq!(clauses, cols(&["t.id DESC"]));
+	}
+
+	#[test]
+	fn tiebreaker_keeps_subquery_order_and_adds_pk() {
+		// Correlated-subquery ordering (forward-relation/aggregate) is not unique,
+		// so the pk tiebreaker is still appended after it.
+		let mut clauses = cols(&["(SELECT ...) ASC"]);
+		push_tiebreaker_clauses(&mut clauses, &cols(&["id"]));
+		assert_eq!(clauses, cols(&["(SELECT ...) ASC", "t.id ASC"]));
 	}
 
 	#[test]
@@ -873,6 +916,33 @@ pub fn extract_order_cols(clauses: &[String]) -> Vec<String> {
 			c.trim_start_matches("t.").split_whitespace().next().map(str::to_string)
 		})
 		.collect()
+}
+
+/// The column(s) that uniquely identify a row — used as the final ORDER BY
+/// tiebreaker and appended to the cursor keyset so pagination is a *total*
+/// order. Prefers the declared primary key; falls back to the historical
+/// surrogate `_id` or the conventional `id` when no primary key is known.
+pub fn unique_tiebreak_cols(primary_keys: &[String], is_historical: bool) -> Vec<String> {
+	if !primary_keys.is_empty() {
+		primary_keys.to_vec()
+	} else if is_historical {
+		vec!["_id".to_string()]
+	} else {
+		vec!["id".to_string()]
+	}
+}
+
+/// Append unique-key tiebreaker column(s) to an `ORDER BY` clause list so the
+/// ordering is total. A tiebreaker is skipped when the column already appears as
+/// a leading `t.<col>` term. Tiebreakers are always ascending, matching the
+/// keyset cursor comparator in [`crate::sql::pagination`].
+pub fn push_tiebreaker_clauses(clauses: &mut Vec<String>, tiebreak_cols: &[String]) {
+	for tb in tiebreak_cols {
+		let prefix = format!("t.{tb} ");
+		if !clauses.iter().any(|c| c.starts_with(&prefix)) {
+			clauses.push(format!("t.{tb} ASC"));
+		}
+	}
 }
 
 pub fn parse_distinct(val: Option<&async_graphql::Value>) -> Vec<String> {
