@@ -20,7 +20,11 @@
     <div id="graphiql">Loading...</div>
     <script src="https://unpkg.com/graphiql@4/graphiql.min.js" type="application/javascript"></script>
     <script src="https://unpkg.com/@graphiql/plugin-explorer@4/dist/index.umd.js" crossorigin></script>
+    <script src="https://unpkg.com/prettier@3/standalone.js"></script>
+    <script src="https://unpkg.com/prettier@3/plugins/graphql.js"></script>
     <script>
+      const PRINT_WIDTH = 60;
+
       const url = new URL('/', window.location.origin).toString();
       const fetcher = (graphQLParams, opts) =>
         fetch(url, {
@@ -30,13 +34,46 @@
           credentials: 'same-origin',
         }).then(r => r.json());
       const explorer = GraphiQLPluginExplorer.explorerPlugin();
-      ReactDOM.createRoot(document.getElementById('graphiql')).render(
+      const root = ReactDOM.createRoot(document.getElementById('graphiql'));
+      let graphiqlRef = null;
+
+      root.render(
         React.createElement(GraphiQL, {
+          ref: (el) => { graphiqlRef = el; },
           fetcher,
           defaultEditorToolsVisibility: true,
           plugins: [explorer],
         })
       );
+
+      // Override the prettify button to use prettier with printWidth
+      requestAnimationFrame(function hookPrettify() {
+        const btn = document.querySelector(
+          'button[aria-label="Prettify query (Shift-Ctrl-P)"]'
+        );
+        if (!btn) return requestAnimationFrame(hookPrettify);
+
+        const parent = btn.parentNode;
+        const replacement = btn.cloneNode(true);
+        parent.replaceChild(replacement, btn);
+
+        replacement.addEventListener('click', async () => {
+          const editor = document.querySelector('.graphiql-query-editor .CodeMirror');
+          if (!editor || !editor.CodeMirror) return;
+          const cm = editor.CodeMirror;
+          const source = cm.getValue();
+          try {
+            const formatted = await prettier.format(source, {
+              parser: 'graphql',
+              plugins: prettierPlugins,
+              printWidth: PRINT_WIDTH,
+            });
+            cm.setValue(formatted.trimEnd());
+          } catch (e) {
+            console.warn('Prettify failed:', e);
+          }
+        });
+      });
     </script>
   </body>
 </html>
