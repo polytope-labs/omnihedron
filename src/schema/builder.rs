@@ -215,18 +215,33 @@ pub fn build_schema(
 		let table_name2 = table.name.clone();
 		let cfg_clone2 = cfg.clone();
 		if query_fields.claim(&single_field) {
-			query = query.field(
+			let mut single_fld =
 				Field::new(&single_field, TypeRef::named(&type_name), move |ctx| {
 					let table_name = table_name2.clone();
 					let cfg = cfg_clone2.clone();
 					FieldFuture::new(async move {
-						let maybe =
-							resolvers::single::resolve_single(&ctx, &table_name, &cfg).await?;
+						let maybe = resolvers::single::resolve_single(
+							&ctx,
+							&table_name,
+							&cfg,
+							is_historical,
+						)
+						.await?;
 						Ok(maybe.map(FieldValue::owned_any))
 					})
 				})
-				.argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
-			);
+				.argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID)));
+
+			// Historical tables expose the same blockHeight/timestamp argument as the
+			// connection field so a specific version can be requested by id.
+			if is_historical {
+				single_fld = single_fld.argument(InputValue::new(
+					historical_arg_name,
+					TypeRef::named(TypeRef::STRING),
+				));
+			}
+
+			query = query.field(single_fld);
 		}
 
 		// {entity}ByNodeId query

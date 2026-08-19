@@ -18,6 +18,13 @@
 //! - [`resolve_single`] — handles `{entity}(id: ID!)` root query fields.
 //! - [`resolve_by_node_id`] — handles `{entity}ByNodeId(nodeId: ID!)` root query fields, decoding
 //!   the PostGraphile-compatible base64 nodeId before performing the lookup.
+//!
+//! Historical tables store one row per version of an entity, discriminated by the
+//! `_block_range` column. `resolve_single` therefore *must* constrain the lookup to a
+//! single version — without it, `WHERE id = $1 LIMIT 1` returns whichever version
+//! PostgreSQL happens to reach first in heap order, which is arbitrary and unstable.
+//! `resolve_by_node_id` needs no such predicate: a nodeId encodes the internal `_id`
+//! column, which is unique *per version row*, so it already identifies exactly one row.
 
 use async_graphql::dynamic::ResolverContext;
 use serde_json::Value;
@@ -33,6 +40,7 @@ pub async fn resolve_single(
 	ctx: &ResolverContext<'_>,
 	table: &str,
 	cfg: &Config,
+	is_historical: bool,
 ) -> async_graphql::Result<Option<Value>> {
 	let id: String = ctx
 		.args
@@ -41,15 +49,36 @@ pub async fn resolve_single(
 		.map(str::to_string)
 		.ok_or_else(|| async_graphql::Error::new("Missing required argument: id"))?;
 
+	// The historical argument is named `blockHeight` or `timestamp` depending on the
+	// project's `historicalStateEnabled` mode; accept either, as the connection resolver does.
+	let block_height: Option<String> = ctx
+		.args
+		.get("blockHeight")
+		.or_else(|| ctx.args.get("timestamp"))
+		.and_then(|v| v.string().ok())
+		.map(str::to_string);
+
 	let schema = &cfg.name;
-	let sql = format!(r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t.id = $1 LIMIT 1"#);
+	let mut params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(id)];
+
+	// Historical tables keep every version of an entity. Select the single version whose
+	// `_block_range` contains the requested point, defaulting to MAX_INT64 so that only
+	// the currently-open version matches — the same rule the connection resolver applies.
+	let sql = if is_historical {
+		let bh = block_height.as_ref().and_then(|s| s.parse::<i64>().ok()).unwrap_or(i64::MAX);
+		params.push(Box::new(bh));
+		format!(
+			r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t.id = $1 AND t._block_range @> $2::bigint ORDER BY lower(t._block_range) DESC LIMIT 1"#
+		)
+	} else {
+		format!(r#"SELECT * FROM "{schema}"."{table}" AS t WHERE t.id = $1 LIMIT 1"#)
+	};
 
 	trace!(sql = %sql, "Executing single query");
 
 	let req_client = ctx
 		.data::<std::sync::Arc<crate::db::RequestClient>>()
 		.map_err(|_| async_graphql::Error::new("Missing RequestClient in context"))?;
-	let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(id)];
 	let pg_refs: Vec<&(dyn ToSql + Sync)> =
 		params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect();
 
@@ -58,7 +87,14 @@ pub async fn resolve_single(
 		return Ok(None);
 	}
 
-	Ok(Some(row_to_json(&rows[0])))
+	let mut node = row_to_json(&rows[0]);
+	// Propagate the requested blockHeight so nested relation resolvers filter consistently
+	// (they read `_block_height` off the parent entity JSON).
+	if let (Value::Object(map), Some(bh)) = (&mut node, block_height) {
+		map.insert("_block_height".to_string(), Value::String(bh));
+	}
+
+	Ok(Some(node))
 }
 
 /// Resolve a `{entity}ByNodeId(nodeId: ID!)` query.

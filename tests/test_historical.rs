@@ -394,3 +394,110 @@ async fn test_historical_nested_relation() {
 
 	println!("historical nested relation: block 200 → [v1, book2], block 600 → [v2, book2] ✓");
 }
+
+/// Regression test: `{entity}(id:)` must return the *open* version of a historical
+/// entity, not an arbitrary one.
+///
+/// Historical tables keep one row per version. The single-record resolver previously
+/// ran `WHERE id = $1 LIMIT 1` with no `_block_range` predicate, so PostgreSQL returned
+/// whichever version it reached first in heap order — for this fixture entity that is
+/// the *stale* `SOURCE` version, not the open `DESTINATION` one. The connection field
+/// filtered correctly, so `getRequests(filter: {id: {equalTo: …}})` and
+/// `getRequest(id: …)` disagreed on the same entity.
+#[tokio::test]
+async fn test_single_by_id_returns_open_version() {
+	let rust_client = TestClient::new(&rust_url());
+	let rust_available = std::process::Command::new("curl")
+		.args(["-sf", "--max-time", "3", &format!("{}/health", rust_url())])
+		.output()
+		.map(|o| o.status.success())
+		.unwrap_or(false);
+	if !rust_available {
+		eprintln!("SKIP: Rust service not available.");
+		return;
+	}
+
+	// This entity has three versions in the fixture, in this physical (COPY) order:
+	//   SOURCE                [1743772738000, 1743772818000)   ← physically first
+	//   HYPERBRIDGE_DELIVERED [1743772818000, 1743772918000)
+	//   DESTINATION           [1743772918000, )                ← the open version
+	let target_id = "0xf6ee5c001d5275afea10a2ce2927b1fb5defaed2eb13a4bdc2a3c2447d8ab458";
+
+	// ── by-id with no blockHeight must return the open version ────────────
+	let query_single = format!(r#"{{ getRequest(id: "{target_id}") {{ id status }} }}"#);
+	let resp_single = rust_client.query(&query_single).await;
+
+	assert!(
+		resp_single
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"getRequest(id:) returned errors: {resp_single}"
+	);
+
+	let single_status = resp_single
+		.pointer("/data/getRequest/status")
+		.and_then(|v| v.as_str())
+		.expect("status missing from getRequest(id:)");
+
+	assert_eq!(
+		single_status, "DESTINATION",
+		"getRequest(id:) must return the open version (DESTINATION), got {single_status} — the \
+		 _block_range predicate is missing from the single-record resolver"
+	);
+
+	// ── the by-id and connection paths must agree ─────────────────────────
+	let query_conn = format!(
+		r#"{{ getRequests(first: 5, filter: {{ id: {{ equalTo: "{target_id}" }} }}) {{ nodes {{ id status }} }} }}"#
+	);
+	let resp_conn = rust_client.query(&query_conn).await;
+
+	let conn_nodes = resp_conn
+		.pointer("/data/getRequests/nodes")
+		.and_then(|v| v.as_array())
+		.expect("nodes missing from getRequests");
+
+	assert_eq!(conn_nodes.len(), 1, "expected exactly one open version, got {conn_nodes:?}");
+
+	let conn_status =
+		conn_nodes[0]["status"].as_str().expect("status missing from connection node");
+
+	assert_eq!(
+		conn_status, single_status,
+		"by-id and connection paths disagree on the same entity: connection says {conn_status}, \
+		 by-id says {single_status}"
+	);
+
+	// ── by-id with an explicit blockHeight selects that version ───────────
+	// 1743772850000 falls inside [1743772818000, 1743772918000) → HYPERBRIDGE_DELIVERED.
+	let query_mid = format!(
+		r#"{{ getRequest(id: "{target_id}", blockHeight: "1743772850000") {{ status }} }}"#
+	);
+	let resp_mid = rust_client.query(&query_mid).await;
+
+	assert!(
+		resp_mid
+			.get("errors")
+			.and_then(|e| e.as_array())
+			.map(|a| a.is_empty())
+			.unwrap_or(true),
+		"getRequest(id:, blockHeight:) returned errors: {resp_mid}"
+	);
+
+	let mid_status = resp_mid
+		.pointer("/data/getRequest/status")
+		.and_then(|v| v.as_str())
+		.expect("status missing from getRequest(id:, blockHeight:)");
+
+	assert_eq!(
+		mid_status, "HYPERBRIDGE_DELIVERED",
+		"getRequest(id:, blockHeight: 1743772850000) should return the mid-lifecycle version, got \
+		 {mid_status}"
+	);
+
+	println!(
+		"single by-id: default → DESTINATION (open), blockHeight 1743772850000 → \
+		 HYPERBRIDGE_DELIVERED ✓"
+	);
+}
