@@ -134,7 +134,35 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 		});
 	}
 
+	drop_dangling_foreign_keys(&mut tables);
+
 	Ok(tables)
+}
+
+/// Removes foreign keys whose referenced table was not introspected.
+///
+/// SubQuery's comment-declared virtual FKs are plain text, so an entity rename or removal
+/// can leave a child table's `@foreignKey (...) REFERENCES old_table (id)` pointing at a
+/// table that no longer exists.  The schema builder would then emit a field typed as the
+/// missing entity, and `async-graphql` rejects the whole schema with `Type "..." not found`.
+fn drop_dangling_foreign_keys(tables: &mut [TableInfo]) {
+	let known: std::collections::HashSet<String> = tables.iter().map(|t| t.name.clone()).collect();
+	for table in tables.iter_mut() {
+		table.foreign_keys.retain(|fk| {
+			let exists = known.contains(&fk.foreign_table);
+			if !exists {
+				tracing::warn!(
+					table = %table.name,
+					column = %fk.column,
+					foreign_table = %fk.foreign_table,
+					"Foreign key references a table that does not exist in this schema — \
+					 skipping the relation. Check for a stale @foreignKey smart tag left behind \
+					 by an entity rename or removal."
+				);
+			}
+			exists
+		});
+	}
 }
 
 /// Discover fulltext search functions created by SubQuery's `@fullText` directive.
@@ -394,4 +422,45 @@ async fn fetch_unique_constraints(
 	}
 
 	Ok(map.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::introspection::model::SmartTags;
+
+	fn table(name: &str, fks: &[(&str, &str)]) -> TableInfo {
+		TableInfo {
+			name: name.to_string(),
+			columns: vec![],
+			primary_keys: vec!["id".to_string()],
+			foreign_keys: fks
+				.iter()
+				.map(|(col, foreign)| ForeignKey {
+					constraint_name: format!("{name}_{col}_fkey_virtual"),
+					column: col.to_string(),
+					foreign_table: foreign.to_string(),
+					foreign_column: "id".to_string(),
+					smart_tags: SmartTags::default(),
+				})
+				.collect(),
+			unique_constraints: vec![],
+			is_historical: true,
+		}
+	}
+
+	#[test]
+	fn drops_foreign_keys_to_missing_tables() {
+		// A stale child table whose smart-tag FK still names a parent that was dropped
+		// (e.g. `liquidity_provider_balances` → `liquidity_providers` after an entity removal).
+		let mut tables = vec![
+			table("liquidity_provider_balances", &[("provider_id", "liquidity_providers")]),
+			table("response_v2s", &[("request_id", "request_v2s")]),
+			table("request_v2s", &[]),
+		];
+		drop_dangling_foreign_keys(&mut tables);
+		assert!(tables[0].foreign_keys.is_empty());
+		assert_eq!(tables[1].foreign_keys.len(), 1);
+		assert_eq!(tables[1].foreign_keys[0].foreign_table, "request_v2s");
+	}
 }
