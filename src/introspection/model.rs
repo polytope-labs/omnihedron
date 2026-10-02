@@ -72,7 +72,8 @@ impl TableInfo {
 			self.foreign_keys.iter().map(|fk| fk.column.as_str()).collect();
 		self.public_columns()
 			.filter(|c| c.name != "id" && !fk_cols.contains(c.name.as_str()))
-			.count() == 0
+			.count() ==
+			0
 	}
 }
 

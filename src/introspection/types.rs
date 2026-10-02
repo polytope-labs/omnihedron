@@ -100,11 +100,14 @@ pub fn is_comparable_type(graphql_type: &str) -> bool {
 	matches!(
 		graphql_type,
 		"Int" |
-			"BigInt" | "Float" |
+			"BigInt" |
+			"Float" |
 			"BigFloat" |
-			"String" | "Date" |
+			"String" |
+			"Date" |
 			"Datetime" |
-			"UUID" | "Time" |
+			"UUID" |
+			"Time" |
 			"BitString" |
 			"InternetAddress"
 	)
