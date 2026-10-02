@@ -59,7 +59,7 @@
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
       "datasource": "Prometheus",
       "targets": [
-        { "expr": "rate(omnihedron_http_requests_total[30s])", "legendFormat": "{{method}} {{path}} {{status}}" }
+        { "expr": "sum by (method, path, status) (rate(omnihedron_http_requests_total[30s]))", "legendFormat": "{{method}} {{path}} {{status}}" }
       ],
       "fieldConfig": {
         "defaults": { "unit": "reqps", "min": 0, "noValue": "0" },
@@ -72,8 +72,8 @@
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
       "datasource": "Prometheus",
       "targets": [
-        { "expr": "omnihedron_http_request_duration_seconds{quantile=\"0.5\"}", "legendFormat": "p50 {{method}} {{path}}" },
-        { "expr": "omnihedron_http_request_duration_seconds{quantile=\"0.99\"}", "legendFormat": "p99 {{method}} {{path}}" }
+        { "expr": "omnihedron_http_request_duration_seconds{quantile=\"0.5\", path!=\"unmatched\"}", "legendFormat": "p50 {{method}} {{path}}" },
+        { "expr": "omnihedron_http_request_duration_seconds{quantile=\"0.99\", path!=\"unmatched\"}", "legendFormat": "p99 {{method}} {{path}}" }
       ],
       "fieldConfig": {
         "defaults": { "unit": "s", "min": 0, "noValue": "0" },

@@ -1927,6 +1927,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "native-tls",
  "once_cell",
  "postgres-native-tls",
