@@ -348,7 +348,7 @@ async fn execute_single(
 	let query_type = classify_query(&query_preview);
 
 	// Record GraphQL metrics (no-op if recorder not installed)
-	crate::metrics::record_graphql_query(&operation, query_type);
+	crate::metrics::record_graphql_query(query_type);
 	crate::metrics::record_graphql_duration(query_type, duration.as_secs_f64());
 	if let Some(c) = computed_complexity {
 		crate::metrics::record_query_complexity(c);

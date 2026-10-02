@@ -20,7 +20,7 @@
 //!
 //! - `omnihedron_http_requests_total` (counter, labels: method, path, status)
 //! - `omnihedron_http_request_duration_seconds` (histogram, labels: method, path)
-//! - `omnihedron_graphql_queries_total` (counter, labels: operation, type)
+//! - `omnihedron_graphql_queries_total` (counter, labels: type)
 //! - `omnihedron_graphql_query_duration_seconds` (histogram, labels: type)
 //! - `omnihedron_graphql_errors_total` (counter)
 //! - `omnihedron_db_pool_size` (gauge)
@@ -57,7 +57,7 @@ pub const HTTP_REQUESTS_TOTAL: &str = "omnihedron_http_requests_total";
 /// HTTP request duration in seconds.
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "omnihedron_http_request_duration_seconds";
 
-/// Total GraphQL queries executed (labels: operation, type).
+/// Total GraphQL queries executed (labels: type).
 pub const GRAPHQL_QUERIES_TOTAL: &str = "omnihedron_graphql_queries_total";
 
 /// GraphQL query duration in seconds (labels: type).
@@ -193,11 +193,13 @@ pub fn start_runtime_sampler() {
 	});
 }
 
-/// Record a completed GraphQL query with operation name and query type.
-pub fn record_graphql_query(operation: &str, query_type: &str) {
+/// Record a completed GraphQL query by query type.
+///
+/// The operation name is deliberately not a label: it is client-supplied and
+/// would let any client mint a new time series per request.
+pub fn record_graphql_query(query_type: &str) {
 	metrics::counter!(
 		GRAPHQL_QUERIES_TOTAL,
-		"operation" => operation.to_string(),
 		"type" => query_type.to_string(),
 	)
 	.increment(1);
