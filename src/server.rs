@@ -36,8 +36,8 @@ use async_graphql_axum::{GraphQLProtocol, GraphQLResponse, GraphQLWebSocket};
 use axum::{
 	Router,
 	body::Bytes,
-	extract::{State, WebSocketUpgrade},
-	http::StatusCode,
+	extract::{MatchedPath, State, WebSocketUpgrade},
+	http::{Method, StatusCode},
 	middleware,
 	response::{Html, IntoResponse, Json, Response},
 	routing::{get, post},
@@ -131,7 +131,9 @@ pub fn build_router(state: AppState) -> Router {
 	app_router =
 		app_router.layer(middleware::from_fn_with_state(state.clone(), in_flight_middleware));
 
-	// Metrics middleware — records request count and duration per method/path/status
+	// Metrics middleware — records request count and duration per method/path/status.
+	// Must stay a `Router::layer` on the routes themselves: `MatchedPath` is only in
+	// the request extensions once routing has happened.
 	if cfg.metrics {
 		app_router =
 			app_router.layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
@@ -346,7 +348,7 @@ async fn execute_single(
 	let query_type = classify_query(&query_preview);
 
 	// Record GraphQL metrics (no-op if recorder not installed)
-	crate::metrics::record_graphql_query(&operation, query_type);
+	crate::metrics::record_graphql_query(query_type);
 	crate::metrics::record_graphql_duration(query_type, duration.as_secs_f64());
 	if let Some(c) = computed_complexity {
 		crate::metrics::record_query_complexity(c);
@@ -506,13 +508,44 @@ async fn in_flight_middleware(
 	response
 }
 
+/// `path` label for requests that hit no route (scanner probes, typos, …).
+const UNMATCHED_PATH_LABEL: &str = "unmatched";
+
+/// `path` label for HTTP metrics: the matched route template, never the raw URI.
+///
+/// The raw path is client-controlled, so using it as a label lets any client
+/// mint a new permanent time series per URL it requests.
+fn metrics_path_label(req: &axum::extract::Request) -> String {
+	req.extensions()
+		.get::<MatchedPath>()
+		.map(|p| p.as_str().to_owned())
+		.unwrap_or_else(|| UNMATCHED_PATH_LABEL.to_owned())
+}
+
+/// `method` label for HTTP metrics. Extension methods are arbitrary
+/// client-supplied tokens, so anything non-standard collapses into `OTHER`.
+fn metrics_method_label(method: &Method) -> &'static str {
+	match *method {
+		Method::GET => "GET",
+		Method::POST => "POST",
+		Method::PUT => "PUT",
+		Method::DELETE => "DELETE",
+		Method::HEAD => "HEAD",
+		Method::OPTIONS => "OPTIONS",
+		Method::CONNECT => "CONNECT",
+		Method::PATCH => "PATCH",
+		Method::TRACE => "TRACE",
+		_ => "OTHER",
+	}
+}
+
 async fn metrics_middleware(
 	State(state): State<AppState>,
 	req: axum::extract::Request,
 	next: middleware::Next,
 ) -> Response {
-	let method = req.method().to_string();
-	let path = req.uri().path().to_string();
+	let method = metrics_method_label(req.method());
+	let path = metrics_path_label(&req);
 	let start = std::time::Instant::now();
 
 	let response = next.run(req).await;
@@ -522,7 +555,7 @@ async fn metrics_middleware(
 
 	metrics::counter!(
 		crate::metrics::HTTP_REQUESTS_TOTAL,
-		"method" => method.clone(),
+		"method" => method,
 		"path" => path.clone(),
 		"status" => status,
 	)
@@ -544,4 +577,85 @@ async fn metrics_middleware(
 	);
 
 	response
+}
+
+#[cfg(test)]
+mod tests {
+	use axum::body::Body;
+	use tower::ServiceExt;
+
+	use super::*;
+
+	/// Mirrors the layering in `build_router`, exposing the computed labels as
+	/// response headers instead of recording them.
+	fn label_router() -> Router {
+		async fn expose_labels(req: axum::extract::Request, next: middleware::Next) -> Response {
+			let method = metrics_method_label(req.method());
+			let path = metrics_path_label(&req);
+			let mut res = next.run(req).await;
+			res.headers_mut().insert("x-method", method.parse().unwrap());
+			res.headers_mut().insert("x-path", path.parse().unwrap());
+			res
+		}
+
+		let app = Router::new()
+			.route("/", post(|| async { "ok" }))
+			.route("/ws", get(|| async { "ok" }))
+			.layer(middleware::from_fn(expose_labels));
+		let infra = Router::new().route("/health", get(|| async { "ok" }));
+		Router::new().merge(infra).merge(app).layer(CompressionLayer::new())
+	}
+
+	async fn labels(method: &str, uri: &str) -> (StatusCode, Option<String>, Option<String>) {
+		let req = axum::http::Request::builder()
+			.method(method)
+			.uri(uri)
+			.body(Body::empty())
+			.unwrap();
+		let res = label_router().oneshot(req).await.unwrap();
+		let header = |name: &str| res.headers().get(name).map(|v| v.to_str().unwrap().to_owned());
+		(res.status(), header("x-method"), header("x-path"))
+	}
+
+	#[tokio::test]
+	async fn matched_routes_use_route_template() {
+		let (status, method, path) = labels("POST", "/").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(method.as_deref(), Some("POST"));
+		assert_eq!(path.as_deref(), Some("/"));
+
+		let (_, _, path) = labels("GET", "/ws?foo=bar").await;
+		assert_eq!(path.as_deref(), Some("/ws"));
+	}
+
+	#[tokio::test]
+	async fn method_not_allowed_keeps_route_template() {
+		let (status, method, path) = labels("GET", "/").await;
+		assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+		assert_eq!(method.as_deref(), Some("GET"));
+		assert_eq!(path.as_deref(), Some("/"));
+	}
+
+	#[tokio::test]
+	async fn unknown_paths_collapse_into_one_label() {
+		for uri in ["/.env", "/.git/config", "/.aws/credentials%2esecret", "/a/b/c/d"] {
+			let (status, _, path) = labels("GET", uri).await;
+			assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+			assert_eq!(path.as_deref(), Some(UNMATCHED_PATH_LABEL), "{uri}");
+		}
+	}
+
+	#[tokio::test]
+	async fn extension_methods_collapse_into_other() {
+		let (_, method, path) = labels("PROPFIND", "/whatever").await;
+		assert_eq!(method.as_deref(), Some("OTHER"));
+		assert_eq!(path.as_deref(), Some(UNMATCHED_PATH_LABEL));
+	}
+
+	#[tokio::test]
+	async fn infra_routes_are_not_instrumented() {
+		let (status, method, path) = labels("GET", "/health").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!((method, path), (None, None));
+	}
 }

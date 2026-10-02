@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "omnihedron"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -1927,6 +1927,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "native-tls",
  "once_cell",
  "postgres-native-tls",

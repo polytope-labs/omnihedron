@@ -20,7 +20,7 @@
 //!
 //! - `omnihedron_http_requests_total` (counter, labels: method, path, status)
 //! - `omnihedron_http_request_duration_seconds` (histogram, labels: method, path)
-//! - `omnihedron_graphql_queries_total` (counter, labels: operation, type)
+//! - `omnihedron_graphql_queries_total` (counter, labels: type)
 //! - `omnihedron_graphql_query_duration_seconds` (histogram, labels: type)
 //! - `omnihedron_graphql_errors_total` (counter)
 //! - `omnihedron_db_pool_size` (gauge)
@@ -44,7 +44,10 @@
 //! - `omnihedron_tokio_num_workers` (gauge)
 //! - `omnihedron_tokio_global_queue_depth` (gauge)
 
+use std::time::Duration;
+
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_util::MetricKindMask;
 
 // ── Metric name constants ────────────────────────────────────────────────────
 
@@ -54,7 +57,7 @@ pub const HTTP_REQUESTS_TOTAL: &str = "omnihedron_http_requests_total";
 /// HTTP request duration in seconds.
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "omnihedron_http_request_duration_seconds";
 
-/// Total GraphQL queries executed (labels: operation, type).
+/// Total GraphQL queries executed (labels: type).
 pub const GRAPHQL_QUERIES_TOTAL: &str = "omnihedron_graphql_queries_total";
 
 /// GraphQL query duration in seconds (labels: type).
@@ -123,6 +126,14 @@ pub const TOKIO_NUM_WORKERS: &str = "omnihedron_tokio_num_workers";
 /// Depth of the Tokio global task queue.
 pub const TOKIO_GLOBAL_QUEUE_DEPTH: &str = "omnihedron_tokio_global_queue_depth";
 
+/// How long a counter or histogram series may go without an update before it
+/// is dropped from the registry (and from `/metrics`).
+///
+/// Bounds memory for series keyed on client-influenced labels. Gauges are
+/// exempt: several are adjusted with increment/decrement and would be wrong
+/// if they were dropped and recreated at zero.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Initialise the Prometheus exporter recorder and return a handle for
 /// rendering metrics on the `/metrics` endpoint.
 ///
@@ -135,6 +146,7 @@ pub const TOKIO_GLOBAL_QUEUE_DEPTH: &str = "omnihedron_tokio_global_queue_depth"
 /// called once).
 pub fn init_recorder() -> PrometheusHandle {
 	let handle = PrometheusBuilder::new()
+		.idle_timeout(MetricKindMask::COUNTER | MetricKindMask::HISTOGRAM, Some(IDLE_TIMEOUT))
 		.install_recorder()
 		.expect("failed to install Prometheus recorder");
 
@@ -154,6 +166,9 @@ pub fn start_runtime_sampler() {
 		let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
 		loop {
 			interval.tick().await;
+
+			// Keep the always-present error counter from idling out.
+			metrics::counter!(GRAPHQL_ERRORS_TOTAL).increment(0);
 
 			// ── Process memory from /proc/self/statm ──────────────────────
 			if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
@@ -178,11 +193,13 @@ pub fn start_runtime_sampler() {
 	});
 }
 
-/// Record a completed GraphQL query with operation name and query type.
-pub fn record_graphql_query(operation: &str, query_type: &str) {
+/// Record a completed GraphQL query by query type.
+///
+/// The operation name is deliberately not a label: it is client-supplied and
+/// would let any client mint a new time series per request.
+pub fn record_graphql_query(query_type: &str) {
 	metrics::counter!(
 		GRAPHQL_QUERIES_TOTAL,
-		"operation" => operation.to_string(),
 		"type" => query_type.to_string(),
 	)
 	.increment(1);
