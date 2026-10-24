@@ -15,6 +15,7 @@
 
 mod config;
 mod db;
+mod healthcheck;
 mod hot_reload;
 mod introspection;
 mod metrics;
@@ -29,21 +30,27 @@ use std::sync::{
 	atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use clap::Parser;
 use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use config::{Config, DbConfig};
+use config::{Cli, Command, Config, DbConfig};
 use db::{create_pool, discover_schema};
 use hot_reload::start_schema_listener;
 use introspection::{introspect_enums, introspect_schema, introspect_search_functions};
 use schema::build_schema;
 use server::{AppState, SchemaState, SharedSchema, build_router};
 
+fn main() -> anyhow::Result<()> {
+	match Cli::parse() {
+		Cli::Command(Command::Healthcheck(args)) => std::process::exit(healthcheck::run(&args)),
+		Cli::Serve(cfg) => serve(*cfg),
+	}
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-	let cfg = Arc::new(Config::parse());
+async fn serve(cfg: Config) -> anyhow::Result<()> {
+	let cfg = Arc::new(cfg);
 	setup_logging(&cfg);
 
 	info!(version = env!("CARGO_PKG_VERSION"), "Starting omnihedron");

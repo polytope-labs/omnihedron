@@ -86,6 +86,12 @@ services:
     ports:
       - "3000:3000"
     command: ["--name", "${SCHEMA_NAME:-app}", "--port", "3000", "--unsafe-mode"]
+    healthcheck:
+      test: ["CMD", "omnihedron", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
 volumes:

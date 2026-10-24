@@ -222,6 +222,40 @@ Services after startup:
 - Rust service → `http://localhost:3000/graphql`
 - TypeScript service → `http://localhost:3001/graphql`
 
+#### Health check
+
+The image ships a built-in `HEALTHCHECK` that runs `omnihedron healthcheck`, which GETs
+`/health` and exits `0` on a 2xx response, `1` otherwise. The image contains only
+`ca-certificates` and `libssl3` — there is no `curl` or `wget`, and none is needed.
+
+Recommended compose configuration:
+
+```yaml
+healthcheck:
+  test: ["CMD", "omnihedron", "healthcheck"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+```
+
+An explicit compose `healthcheck` overrides the image's, so replace any existing `curl`
+check with `["CMD", "omnihedron", "healthcheck"]`.
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--url` | `OMNIHEDRON_HEALTHCHECK_URL` | `http://127.0.0.1:<port>/health` | Full URL to probe (overrides `--port`) |
+| `--port` / `-p` | `OMNIHEDRON_PORT` | `3000` | Port the local server listens on |
+| `--timeout` | `OMNIHEDRON_HEALTHCHECK_TIMEOUT` | `3` | Request timeout in seconds |
+
+The check inherits the container's environment but not its `command:` arguments. If the
+server port is set only via `--port` in `command:`, set `OMNIHEDRON_PORT` on the container
+instead (or pass `--port` in the healthcheck test).
+
+Exit codes: `0` when `/health` returns 2xx; `1` when the probe fails (non-2xx, including
+`503` when the database is down or the server is shutting down, timeout, connection error);
+`2` on invalid arguments. Docker treats any non-zero exit as unhealthy.
+
 ---
 
 ## Configuration

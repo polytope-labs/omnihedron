@@ -37,6 +37,31 @@ All CLI flags accept environment variables with the `OMNIHEDRON_` prefix.
 | `--log-path` | `OMNIHEDRON_LOG_PATH` | — | Path to log file |
 | `--log-rotate` | `OMNIHEDRON_LOG_ROTATE` | off | Enable log file rotation |
 
+## Subcommands
+
+### `omnihedron healthcheck`
+
+Probes a running omnihedron's `/health` endpoint and exits `0` on a 2xx response, `1`
+otherwise. It is what the Docker image's built-in `HEALTHCHECK` runs, so the image needs
+no `curl` or `wget`.
+
+```bash
+omnihedron healthcheck --port 3000
+```
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--url` | `OMNIHEDRON_HEALTHCHECK_URL` | `http://127.0.0.1:<port>/health` | Full URL to probe (overrides `--port`) |
+| `--port` / `-p` | `OMNIHEDRON_PORT` | `3000` | Port the local server listens on |
+| `--timeout` | `OMNIHEDRON_HEALTHCHECK_TIMEOUT` | `3` | Request timeout in seconds |
+
+`OMNIHEDRON_PORT` is used here because the container's `HEALTHCHECK` process inherits its
+environment but not its `command:` arguments.
+
+Exit codes: `0` when `/health` returns 2xx; `1` when the probe fails (non-2xx, including
+`503` when the database is down or the server is shutting down, timeout, connection error);
+`2` on invalid arguments. Docker treats any non-zero exit as unhealthy.
+
 ## Database environment variables
 
 | Variable | Description |

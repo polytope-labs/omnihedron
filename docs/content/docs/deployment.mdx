@@ -44,7 +44,7 @@ DB_DATABASE=indexer      # PostgreSQL database name
 
 ### Dockerfile
 
-The project ships a Dockerfile at `docker/Dockerfile`. It uses a minimal Debian Bookworm slim base with only `ca-certificates` and `libssl3` installed. The binary must be built on the host first:
+The project ships a Dockerfile at `docker/Dockerfile`. It uses a minimal Debian Bookworm slim base with only `ca-certificates` and `libssl3` installed, so there is no `curl` or `wget`; health checks use the built-in `omnihedron healthcheck` subcommand instead. The binary must be built on the host first:
 
 ```bash
 cargo build --release --bin omnihedron
@@ -62,6 +62,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY target/release/omnihedron /usr/local/bin/omnihedron
 
 EXPOSE 3000
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["omnihedron", "healthcheck"]
 ENTRYPOINT ["omnihedron"]
 ```
 
@@ -83,6 +85,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/omnihedron /usr/local/bin/omnihedron
 EXPOSE 3000
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["omnihedron", "healthcheck"]
 ENTRYPOINT ["omnihedron"]
 ```
 
@@ -116,11 +120,11 @@ services:
       TOKIO_WORKER_THREADS: "8"
     command: ["--name", "${SCHEMA_NAME}"]
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      test: ["CMD", "omnihedron", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     deploy:
       resources:
         limits:
