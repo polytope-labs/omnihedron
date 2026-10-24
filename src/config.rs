@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 /// Omnihedron — high-performance GraphQL query service for SubQuery indexers
 #[derive(Parser, Debug, Clone)]
@@ -146,6 +146,80 @@ pub struct Config {
 	pub log_rotate: bool,
 }
 
+/// Arguments for `omnihedron healthcheck`.
+#[derive(Args, Debug, Clone)]
+pub struct HealthcheckArgs {
+	/// Full URL to probe. Overrides --port. Defaults to http://127.0.0.1:<port>/health
+	#[arg(long, env = "OMNIHEDRON_HEALTHCHECK_URL")]
+	pub url: Option<String>,
+
+	/// Port the local omnihedron server listens on (used when --url is not set)
+	#[arg(short = 'p', long, env = "OMNIHEDRON_PORT", default_value_t = 3000)]
+	pub port: u16,
+
+	/// Request timeout in seconds
+	#[arg(
+		long,
+		env = "OMNIHEDRON_HEALTHCHECK_TIMEOUT",
+		default_value_t = 3,
+		value_parser = clap::value_parser!(u64).range(1..)
+	)]
+	pub timeout: u64,
+}
+
+impl HealthcheckArgs {
+	/// The URL to probe: `--url` if given, else `http://127.0.0.1:{port}/health`.
+	pub fn target_url(&self) -> String {
+		self.url
+			.clone()
+			.unwrap_or_else(|| format!("http://127.0.0.1:{}/health", self.port))
+	}
+}
+
+// NOTE: clap's `Subcommand` derive lifts the enum's doc comment onto the parent
+// command as its `about`, so this enum deliberately has no doc comment.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+	/// Probe a running omnihedron's /health endpoint; exits 0 on a 2xx response, 1 otherwise
+	Healthcheck(HealthcheckArgs),
+}
+
+/// Parsed command line: either run the server (default, no subcommand) or a subcommand.
+#[derive(Debug)]
+pub enum Cli {
+	Serve(Box<Config>),
+	Command(Command),
+}
+
+impl Cli {
+	/// The full clap command tree: the server args plus every subcommand.
+	pub fn command() -> clap::Command {
+		Command::augment_subcommands(Config::command())
+			.subcommand_negates_reqs(true)
+			.args_conflicts_with_subcommands(true)
+			.disable_help_subcommand(true)
+	}
+
+	pub fn try_parse_from<I, T>(itr: I) -> Result<Self, clap::Error>
+	where
+		I: IntoIterator<Item = T>,
+		T: Into<std::ffi::OsString> + Clone,
+	{
+		let mut cmd = Self::command();
+		let mut matches = cmd.try_get_matches_from_mut(itr)?;
+		let parsed = if matches.subcommand().is_some() {
+			Command::from_arg_matches_mut(&mut matches).map(Cli::Command)
+		} else {
+			Config::from_arg_matches_mut(&mut matches).map(|cfg| Cli::Serve(Box::new(cfg)))
+		};
+		parsed.map_err(|e| e.format(&mut cmd))
+	}
+
+	pub fn parse() -> Self {
+		Self::try_parse_from(std::env::args_os()).unwrap_or_else(|e| e.exit())
+	}
+}
+
 /// Database connection settings — read from environment variables.
 #[derive(Debug, Clone)]
 pub struct DbConfig {
@@ -168,5 +242,107 @@ impl DbConfig {
 			password: std::env::var("DB_PASS").unwrap_or_default(),
 			database: std::env::var("DB_DATABASE").unwrap_or_else(|_| "postgres".into()),
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use clap::error::ErrorKind;
+
+	use super::*;
+
+	#[test]
+	fn cli_definition_is_valid() {
+		Cli::command().debug_assert();
+	}
+
+	#[test]
+	fn no_subcommand_serves() {
+		let cli = Cli::try_parse_from(["omnihedron", "--name", "app", "--port", "3000"]).unwrap();
+		match cli {
+			Cli::Serve(cfg) => {
+				assert_eq!(cfg.name, "app");
+				assert_eq!(cfg.port, Some(3000));
+			},
+			other => panic!("expected serve, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn healthcheck_does_not_need_a_name() {
+		let cli = Cli::try_parse_from(["omnihedron", "healthcheck"]).unwrap();
+		assert!(matches!(cli, Cli::Command(Command::Healthcheck(_))));
+	}
+
+	#[test]
+	fn healthcheck_url_overrides_port() {
+		let cli = Cli::try_parse_from([
+			"omnihedron",
+			"healthcheck",
+			"--url",
+			"http://10.0.0.1:9/health",
+			"--port",
+			"4000",
+		])
+		.unwrap();
+		match cli {
+			Cli::Command(Command::Healthcheck(args)) => {
+				assert_eq!(args.target_url(), "http://10.0.0.1:9/health");
+			},
+			other => panic!("expected healthcheck, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn healthcheck_port_builds_url() {
+		let cli = Cli::try_parse_from(["omnihedron", "healthcheck", "--port", "4000"]).unwrap();
+		match cli {
+			Cli::Command(Command::Healthcheck(args)) => {
+				assert_eq!(args.target_url(), "http://127.0.0.1:4000/health");
+			},
+			other => panic!("expected healthcheck, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn healthcheck_timeout_must_be_positive() {
+		let err = Cli::try_parse_from(["omnihedron", "healthcheck", "--timeout", "0"]).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::ValueValidation);
+	}
+
+	#[test]
+	fn root_port_cannot_be_combined_with_healthcheck() {
+		let err = Cli::try_parse_from(["omnihedron", "-p", "4000", "healthcheck"]).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn root_name_cannot_be_combined_with_healthcheck() {
+		let err = Cli::try_parse_from(["omnihedron", "--name", "app", "healthcheck"]).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+	}
+
+	#[test]
+	fn version_is_displayed() {
+		let err = Cli::try_parse_from(["omnihedron", "--version"]).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+	}
+
+	#[test]
+	fn subcommands_do_not_change_the_about_text() {
+		// The `Subcommand` derive lifts the enum's doc comment onto the parent;
+		// make sure the program description still comes from `Config`.
+		assert_eq!(Cli::command().get_about(), Config::command().get_about());
+	}
+
+	#[test]
+	fn missing_name_is_an_error() {
+		// The environment can satisfy `--name`; only assert when it is unset.
+		if std::env::var_os("OMNIHEDRON_NAME").is_some() {
+			return;
+		}
+
+		let err = Cli::try_parse_from(["omnihedron"]).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
 	}
 }

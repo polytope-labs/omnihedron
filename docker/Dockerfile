@@ -9,4 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY target/release/omnihedron /usr/local/bin/omnihedron
 
 EXPOSE 3000
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["omnihedron", "healthcheck"]
 ENTRYPOINT ["omnihedron"]
