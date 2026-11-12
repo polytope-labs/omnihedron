@@ -77,7 +77,8 @@ Docker Hub: `polytopelabs/omnihedron`
 - Forward relation field naming (PostGraphile simplify inflector: strip `_id` from FK column)
 - Backward relation field naming (`{childPlural}By{FkCol}`)
 - Relation filters: `{relation}Exists` boolean, forward relation EXISTS subquery, backward `some`/`none`/`every`
-- `FilterContext` struct for relation-aware filter SQL
+- `FilterContext` for relation-aware filter SQL — holds the filter metadata of every table (relations and array columns), keyed by table name. `build_filter_sql` switches to the related table's entry when it descends into a relation's sub-filter, so relation filters resolve at any nesting depth, on root and nested (backward relation) connections alike. An operator the builder does not know is an error, never a dropped condition.
+- Array-column filters — `{Scalar}ListFilter` matches PostGraphile field for field (`isNull`, whole-array comparisons, `contains`/`containedBy`/`overlaps`, `any…`). `ARRAY_OPERATORS` and `ARRAY_ANY_OPERATORS` in `src/sql/filter.rs` are the single definition both the schema and the SQL builder read. Operands are bound as text with no cast (a PostgreSQL array literal for whole-array operators), so PostgreSQL infers the column's type.
 - Many-to-many junction table detection and resolver
 - Aggregate orderBy enum values with correlated subqueries
 - Historical `timestamp` mode (reads `historicalStateEnabled` from metadata)

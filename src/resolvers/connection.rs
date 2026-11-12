@@ -35,7 +35,7 @@ use crate::{
 	config::Config,
 	schema::{cursor::encode_cursor, inflector::to_camel_case},
 	sql::{
-		filter::{FilterContext, build_filter_sql_ctx},
+		filter::{FilterContext, TableFilterInfo, build_filter_sql},
 		pagination::{PaginationArgs, resolve_pagination},
 	},
 };
@@ -44,7 +44,8 @@ use crate::{
 /// Returns a plain `serde_json::Value` so nested field resolvers can use
 /// `ctx.parent_value.try_downcast_ref::<serde_json::Value>()`.
 ///
-/// Accepts a [`FilterContext`] for relation-aware filtering (exists, forward, some/none/every).
+/// `filter_ctx` holds the filter metadata of every table, for relation-aware
+/// filtering (exists, forward, some/none/every) at any nesting depth.
 pub async fn resolve_connection_ctx(
 	ctx: &ResolverContext<'_>,
 	table: &str,
@@ -52,7 +53,7 @@ pub async fn resolve_connection_ctx(
 	is_historical: bool,
 	columns: &[String],
 	primary_keys: &[String],
-	filter_ctx: &crate::sql::filter::FilterContext,
+	filter_ctx: &FilterContext,
 	fk_field_to_col: &HashMap<String, String>,
 ) -> async_graphql::Result<Option<Value>> {
 	// ── Extract arguments ─────────────────────────────────────────────────────
@@ -124,16 +125,18 @@ pub async fn resolve_connection_ctx(
 	}
 
 	if let Some(f) = filter_val {
-		let mut fctx = filter_ctx.clone();
 		let (filter_conds, filter_params) =
-			build_filter_sql_ctx(&f, "t", &mut param_offset, &mut fctx);
+			build_filter_sql(&f, table, "t", &mut param_offset, filter_ctx)?;
 		conditions.extend(filter_conds);
 		params.extend(filter_params);
 	}
 
 	// ── ORDER BY ──────────────────────────────────────────────────────────────
-	let order_clauses =
-		parse_orderby_with_schema(order_by_gql.as_ref(), Some(schema), Some(filter_ctx));
+	let order_clauses = parse_orderby_with_schema(
+		order_by_gql.as_ref(),
+		Some(schema),
+		filter_ctx.tables.get(table),
+	);
 	let mut order_cols: Vec<String> = extract_order_cols(&order_clauses);
 	// When no explicit orderBy is given the default ORDER BY is `t.id ASC`,
 	// so the cursor must compare against the `id` column to work correctly.
@@ -800,12 +803,13 @@ pub fn parse_orderby(val: Option<&async_graphql::Value>) -> Vec<String> {
 /// Parse orderBy enum values into SQL ORDER BY clauses.
 /// When `schema` is provided, aggregate orderBy values (containing `_BY_`)
 /// are expanded into correlated subqueries.
-/// When `filter_ctx` is provided, forward-relation scalar ordering (double
-/// underscore `__` pattern) is also supported.
+/// When `relations` (those of the table being ordered) is provided,
+/// forward-relation scalar ordering (double underscore `__` pattern) is also
+/// supported.
 pub fn parse_orderby_with_schema(
 	val: Option<&async_graphql::Value>,
 	schema: Option<&str>,
-	filter_ctx: Option<&FilterContext>,
+	relations: Option<&TableFilterInfo>,
 ) -> Vec<String> {
 	let arr: Vec<async_graphql::Value> = match val {
 		Some(async_graphql::Value::List(list)) => list.clone(),
@@ -843,9 +847,9 @@ pub fn parse_orderby_with_schema(
 					if let Some(dunder_idx) = after_by.find("__") {
 						let fk_col = after_by[..dunder_idx].to_lowercase();
 						let target_col = after_by[dunder_idx + 2..].to_lowercase();
-						if let Some(fctx) = filter_ctx {
+						if let Some(relations) = relations {
 							if let Some(info) =
-								fctx.forward_relations.values().find(|r| r.fk_column == fk_col)
+								relations.forward_relations.values().find(|r| r.fk_column == fk_col)
 							{
 								let sql = format!(
 									"(SELECT _rel.\"{}\" FROM \"{}\".\"{}\" AS _rel WHERE _rel.\"{}\" = t.\"{}\")",

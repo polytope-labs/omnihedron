@@ -300,3 +300,192 @@ async fn test_relation_every_filter() {
 	compare_responses("every filter", &ts, &rust);
 	println!("every filter: 2 authors ✓");
 }
+
+// ---------------------------------------------------------------------------
+// Relation filters nested inside another relation filter, and relation filters
+// on nested connection fields. A filter that is dropped or joined to the wrong
+// table still returns a well-formed response, so each case pins the expected
+// rows as well as comparing against the TypeScript service.
+//
+// Fixture: test_collection_books → test_collections → test_authors, where both
+// TestCollection and TestAuthor have a backward relation named `books`.
+// ---------------------------------------------------------------------------
+
+/// Run `query` on both services, require an error-free Rust response that
+/// matches TypeScript, and return the Rust `data`.
+async fn query_both(name: &str, query: &str) -> Value {
+	let ts = TestClient::new(&ts_url()).query(query).await;
+	let rust = TestClient::new(&rust_url()).query(query).await;
+	assert!(!has_graphql_errors(&rust), "{name}: unexpected errors: {rust:#?}");
+	compare_responses(name, &ts, &rust);
+	rust["data"].clone()
+}
+
+fn ids(nodes: &Value) -> Vec<&str> {
+	let mut ids: Vec<&str> = nodes
+		.as_array()
+		.expect("nodes missing")
+		.iter()
+		.map(|n| n["id"].as_str().expect("id missing"))
+		.collect();
+	ids.sort();
+	ids
+}
+
+#[tokio::test]
+async fn test_forward_relation_filter_nested_in_forward() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	// `owner` is a relation of TestCollection, not of the root TestCollectionBook.
+	let data = query_both(
+		"forward → forward filter",
+		r#"{
+            testCollectionBooks(
+                filter: { collection: { owner: { name: { equalTo: "Alice" } } } }
+            ) { nodes { id } totalCount }
+        }"#,
+	)
+	.await;
+	assert_eq!(
+		ids(&data["testCollectionBooks"]["nodes"]),
+		["collection-book-1", "collection-book-2"]
+	);
+
+	// A scalar beside the nested relation must not hide the relation being dropped:
+	// the label alone matches both of Alice's entries.
+	let data = query_both(
+		"forward → forward filter, no match",
+		r#"{
+            testCollectionBooks(filter: {
+                collection: {
+                    label: { startsWith: "Alice" }
+                    owner: { name: { equalTo: "Nobody" } }
+                }
+            }) { totalCount }
+        }"#,
+	)
+	.await;
+	assert_eq!(data["testCollectionBooks"]["totalCount"], 0);
+}
+
+#[tokio::test]
+async fn test_forward_relation_filter_nested_in_backward() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let data = query_both(
+		"backward → forward filter",
+		r#"{
+            testAuthors(
+                filter: { books: { some: { creator: { name: { equalTo: "Bob" } } } } }
+            ) { nodes { id } totalCount }
+        }"#,
+	)
+	.await;
+	assert_eq!(ids(&data["testAuthors"]["nodes"]), ["author-bob"]);
+
+	let data = query_both(
+		"backward → forward filter, no match",
+		r#"{
+            testAuthors(
+                filter: { books: { some: { creator: { name: { equalTo: "Nobody" } } } } }
+            ) { totalCount }
+        }"#,
+	)
+	.await;
+	assert_eq!(data["testAuthors"]["totalCount"], 0);
+}
+
+/// Inside `owner`, `books` is the author's books (test_books), although the root
+/// TestCollection has a `books` relation of its own (test_collection_books).
+/// "Book Three" was written by Bob but is shelved in Alice's collection, so the
+/// two readings select different collections.
+#[tokio::test]
+async fn test_nested_relation_filter_name_shared_with_root() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let data = query_both(
+		"nested relation named like a root relation",
+		r#"{
+            testCollections(
+                filter: { owner: { books: { some: { title: { equalTo: "Book Three" } } } } }
+            ) { nodes { id } totalCount }
+        }"#,
+	)
+	.await;
+	assert_eq!(ids(&data["testCollections"]["nodes"]), ["collection-2"]);
+
+	let data = query_both(
+		"root relation of the same name",
+		r#"{
+            testCollections(
+                filter: { books: { some: { title: { equalTo: "Book Three" } } } }
+            ) { nodes { id } totalCount }
+        }"#,
+	)
+	.await;
+	assert_eq!(ids(&data["testCollections"]["nodes"]), ["collection-1"]);
+}
+
+#[tokio::test]
+async fn test_relation_filters_on_nested_connection() {
+	if !services_available() {
+		eprintln!("SKIP: Services not available.");
+		return;
+	}
+
+	let counts = |data: &Value| -> Vec<i64> {
+		data["testCollections"]["nodes"]
+			.as_array()
+			.expect("nodes missing")
+			.iter()
+			.map(|n| n["books"]["totalCount"].as_i64().expect("totalCount missing"))
+			.collect()
+	};
+
+	// Forward relation filter: collection-1 holds 2 entries, collection-2 holds 1.
+	let data = query_both(
+		"nested connection, forward relation filter",
+		r#"{
+            testCollections(orderBy: ID_ASC) {
+                nodes {
+                    id
+                    books(filter: { collection: { label: { equalTo: "Alice Favourites" } } }) {
+                        nodes { id }
+                        totalCount
+                    }
+                }
+            }
+        }"#,
+	)
+	.await;
+	assert_eq!(counts(&data), [2, 0, 0]);
+
+	// `…Exists` filter: every entry reached through a collection has one.
+	let data = query_both(
+		"nested connection, exists filter",
+		r#"{
+            testCollections(orderBy: ID_ASC) {
+                nodes { id books(filter: { collectionExists: false }) { totalCount } }
+            }
+        }"#,
+	)
+	.await;
+	assert_eq!(counts(&data), [0, 0, 0]);
+
+	// The same filter on the root connection finds the one unshelved entry.
+	let data = query_both(
+		"root connection, exists filter",
+		r#"{ testCollectionBooks(filter: { collectionExists: false }) { nodes { id } totalCount } }"#,
+	)
+	.await;
+	assert_eq!(ids(&data["testCollectionBooks"]["nodes"]), ["collection-book-4"]);
+}
