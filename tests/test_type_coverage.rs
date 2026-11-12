@@ -741,3 +741,414 @@ async fn test_all_nulls() {
 		);
 	}
 }
+
+// ─── Array column filters ───────────────────────────────────────────────────
+//
+// `{Scalar}ListFilter` must match the TypeScript service in shape and in the
+// rows each operator selects. Row `type-test-1` holds the arrays listed in
+// `ARRAY_COLUMNS`; row `type-test-null` holds NULL in every column.
+
+/// Operators that compare the column with a whole array.
+const ARRAY_OPERATORS: [&str; 11] = [
+	"equalTo",
+	"notEqualTo",
+	"distinctFrom",
+	"notDistinctFrom",
+	"lessThan",
+	"lessThanOrEqualTo",
+	"greaterThan",
+	"greaterThanOrEqualTo",
+	"contains",
+	"containedBy",
+	"overlaps",
+];
+
+/// Operators that compare one value with the column's elements.
+const ARRAY_ANY_OPERATORS: [&str; 6] = [
+	"anyEqualTo",
+	"anyNotEqualTo",
+	"anyLessThan",
+	"anyLessThanOrEqualTo",
+	"anyGreaterThan",
+	"anyGreaterThanOrEqualTo",
+];
+
+/// An array column of `type-test-1`, with operands written as GraphQL literals.
+struct ArrayColumn {
+	field: &'static str,
+	/// The array the row stores.
+	stored: &'static str,
+	/// An array sharing exactly one element with `stored`.
+	partial: &'static str,
+	/// That shared element.
+	element: &'static str,
+	/// A value that is not an element of `stored`.
+	absent: &'static str,
+}
+
+const fn array_column(
+	field: &'static str,
+	stored: &'static str,
+	partial: &'static str,
+	element: &'static str,
+	absent: &'static str,
+) -> ArrayColumn {
+	ArrayColumn { field, stored, partial, element, absent }
+}
+
+/// Every array column the TypeScript service offers a filter for.
+const ARRAY_COLUMNS: [ArrayColumn; 15] = [
+	array_column("colBoolArr", "[true, false, true]", "[true]", "true", "false"),
+	array_column("colInt2Arr", "[1, 2, 3]", "[2, 9]", "2", "9"),
+	array_column("colInt4Arr", "[10, 20, 30]", "[20, 99]", "20", "99"),
+	array_column("colInt8Arr", r#"["100", "200"]"#, r#"["200", "999"]"#, r#""200""#, r#""999""#),
+	array_column("colFloat4Arr", "[1.1, 2.2]", "[2.2, 9.9]", "2.2", "9.9"),
+	array_column("colFloat8Arr", "[3.3, 4.4]", "[4.4, 9.9]", "4.4", "9.9"),
+	array_column(
+		"colTextArr",
+		r#"["foo", "bar", "baz"]"#,
+		r#"["bar", "zzz"]"#,
+		r#""bar""#,
+		r#""zzz""#,
+	),
+	array_column(
+		"colNumericArr",
+		r#"["1.23", "4.56"]"#,
+		r#"["4.56", "9.99"]"#,
+		r#""4.56""#,
+		r#""9.99""#,
+	),
+	array_column(
+		"colUuidArr",
+		r#"["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"]"#,
+		r#"["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"]"#,
+		r#""a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11""#,
+		r#""b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11""#,
+	),
+	array_column(
+		"colTimestampArr",
+		r#"["2024-01-15T10:30:00", "2024-06-15T12:00:00"]"#,
+		r#"["2024-06-15T12:00:00", "2030-01-01T00:00:00"]"#,
+		r#""2024-06-15T12:00:00""#,
+		r#""2030-01-01T00:00:00""#,
+	),
+	array_column(
+		"colTimestamptzArr",
+		r#"["2024-01-15T10:30:00+00:00"]"#,
+		r#"["2024-01-15T10:30:00+00:00", "2030-01-01T00:00:00+00:00"]"#,
+		r#""2024-01-15T10:30:00+00:00""#,
+		r#""2030-01-01T00:00:00+00:00""#,
+	),
+	array_column(
+		"colDateArr",
+		r#"["2024-01-15", "2024-06-15"]"#,
+		r#"["2024-06-15", "2030-01-01"]"#,
+		r#""2024-06-15""#,
+		r#""2030-01-01""#,
+	),
+	array_column(
+		"colTimeArr",
+		r#"["14:30:00", "08:00:00"]"#,
+		r#"["08:00:00", "23:59:59"]"#,
+		r#""08:00:00""#,
+		r#""23:59:59""#,
+	),
+	array_column("colJsonbArr", "[{a: 1}, {b: 2}]", "[{b: 2}, {z: 9}]", "{b: 2}", "{z: 9}"),
+	array_column(
+		"colInetArr",
+		r#"["192.168.1.1", "10.0.0.1"]"#,
+		r#"["10.0.0.1", "8.8.8.8"]"#,
+		r#""10.0.0.1""#,
+		r#""8.8.8.8""#,
+	),
+];
+
+/// Clients for both services, built once per test: building a client costs far
+/// more than a request, and the operator matrix makes hundreds of them.
+struct Services {
+	ts: TestClient,
+	rust: TestClient,
+}
+
+impl Services {
+	fn new() -> Self {
+		Self { ts: TestClient::new(&ts_url()), rust: TestClient::new(&rust_url()) }
+	}
+
+	/// Run `query` on both services, require an error-free Rust response that
+	/// matches TypeScript, and return the ids of the `typeCoverages` rows selected.
+	async fn type_coverage_ids(
+		&self,
+		label: &str,
+		query: &str,
+		variables: Option<Value>,
+	) -> Vec<String> {
+		let body = match variables {
+			Some(variables) => serde_json::json!({ "query": query, "variables": variables }),
+			None => serde_json::json!({ "query": query }),
+		};
+		let (ts, rust) = tokio::join!(
+			self.ts.query_with_body(body.clone()),
+			self.rust.query_with_body(body.clone()),
+		);
+		assert!(!has_graphql_errors(&rust), "{label}: unexpected errors: {rust:#?}");
+		compare_responses(label, &ts, &rust);
+		let mut ids: Vec<String> = rust["data"]["typeCoverages"]["nodes"]
+			.as_array()
+			.expect("typeCoverages nodes missing")
+			.iter()
+			.map(|n| n["id"].as_str().expect("id missing").to_string())
+			.collect();
+		ids.sort();
+		ids
+	}
+
+	/// The ids selected by `filter`, a `TypeCoverageFilter` written as a GraphQL literal.
+	async fn array_filter_ids(&self, filter: &str) -> Vec<String> {
+		let query =
+			format!("{{ typeCoverages(filter: {filter}) {{ totalCount nodes {{ id }} }} }}");
+		self.type_coverage_ids(filter, &query, None).await
+	}
+}
+
+/// Every `{Scalar}ListFilter` has the same fields, of the same types, as on the
+/// TypeScript service.
+#[tokio::test]
+async fn test_list_filter_types_match_typescript() {
+	if !services_available() {
+		eprintln!("SKIP");
+		return;
+	}
+	let rust_client = TestClient::new(&rust_url());
+	let ts_client = TestClient::new(&ts_url());
+
+	for scalar in [
+		"String",
+		"Int",
+		"BigInt",
+		"Float",
+		"BigFloat",
+		"Boolean",
+		"Date",
+		"Datetime",
+		"JSON",
+		"UUID",
+		"Time",
+		"InternetAddress",
+	] {
+		let query = format!(
+			r#"{{ __type(name: "{scalar}ListFilter") {{
+                inputFields {{ name type {{ kind name ofType {{ kind name }} }} }}
+            }} }}"#
+		);
+		let fields = |resp: Value| -> Vec<(String, String)> {
+			let mut fields: Vec<(String, String)> = resp
+				.pointer("/data/__type/inputFields")
+				.and_then(|v| v.as_array())
+				.unwrap_or_else(|| panic!("{scalar}ListFilter missing: {resp}"))
+				.iter()
+				.map(|f| (f["name"].as_str().unwrap().to_string(), f["type"].to_string()))
+				.collect();
+			fields.sort();
+			fields
+		};
+		let ts = fields(ts_client.query(&query).await);
+		let rust = fields(rust_client.query(&query).await);
+		assert_eq!(rust.len(), 18, "{scalar}ListFilter should have 18 operators");
+		assert_eq!(ts, rust, "{scalar}ListFilter fields differ from TypeScript");
+	}
+}
+
+/// Every operator, on every array element type, selects the rows TypeScript does.
+#[tokio::test]
+async fn test_array_filter_operators_match_typescript() {
+	if !services_available() {
+		eprintln!("SKIP");
+		return;
+	}
+	let services = Services::new();
+
+	let mut cases = 0;
+	for col in &ARRAY_COLUMNS {
+		let field = col.field;
+		for op in ARRAY_OPERATORS {
+			for operand in [col.stored, col.partial, "[]"] {
+				services
+					.array_filter_ids(&format!("{{ {field}: {{ {op}: {operand} }} }}"))
+					.await;
+				cases += 1;
+			}
+		}
+		for op in ARRAY_ANY_OPERATORS {
+			for operand in [col.element, col.absent] {
+				services
+					.array_filter_ids(&format!("{{ {field}: {{ {op}: {operand} }} }}"))
+					.await;
+				cases += 1;
+			}
+		}
+		for operand in ["true", "false"] {
+			services
+				.array_filter_ids(&format!("{{ {field}: {{ isNull: {operand} }} }}"))
+				.await;
+			cases += 1;
+		}
+	}
+	println!("array filters: {cases} operator/operand cases match TypeScript ✓");
+}
+
+/// The rows each family of operators selects, pinned so that a filter both
+/// services got wrong would still be caught.
+#[tokio::test]
+async fn test_array_filter_selects_expected_rows() {
+	if !services_available() {
+		eprintln!("SKIP");
+		return;
+	}
+	let services = Services::new();
+	let row = vec!["type-test-1".to_string()];
+	let none: Vec<String> = vec![];
+
+	// Equality compares the whole array, in order.
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colTextArr: { equalTo: ["foo", "bar", "baz"] } }"#)
+			.await,
+		row
+	);
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colTextArr: { equalTo: ["baz", "bar", "foo"] } }"#)
+			.await,
+		none
+	);
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colNumericArr: { equalTo: ["1.23", "4.56"] } }"#)
+			.await,
+		row
+	);
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { notEqualTo: [10, 20] } }").await, row);
+
+	// Containment.
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colTextArr: { contains: ["baz", "foo"] } }"#)
+			.await,
+		row
+	);
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colTextArr: { contains: ["foo", "zzz"] } }"#)
+			.await,
+		none
+	);
+	assert_eq!(
+		services
+			.array_filter_ids("{ colInt4Arr: { containedBy: [10, 20, 30, 40] } }")
+			.await,
+		row
+	);
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { containedBy: [10, 20] } }").await, none);
+
+	// Overlap.
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { overlaps: [30, 99] } }").await, row);
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { overlaps: [98, 99] } }").await, none);
+	assert_eq!(
+		services.array_filter_ids(r#"{ colNumericArr: { overlaps: ["4.56"] } }"#).await,
+		row
+	);
+
+	// `any…` reads as "some element <op> the value": the smallest element is 10.
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { anyEqualTo: 20 } }").await, row);
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { anyLessThan: 11 } }").await, row);
+	assert_eq!(services.array_filter_ids("{ colInt4Arr: { anyLessThan: 10 } }").await, none);
+	assert_eq!(
+		services.array_filter_ids("{ colInt4Arr: { anyLessThanOrEqualTo: 10 } }").await,
+		row
+	);
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colNumericArr: { anyGreaterThan: "4.56" } }"#)
+			.await,
+		none
+	);
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colNumericArr: { anyGreaterThanOrEqualTo: "4.56" } }"#)
+			.await,
+		row
+	);
+	assert_eq!(services.array_filter_ids(r#"{ colTextArr: { anyNotEqualTo: "foo" } }"#).await, row);
+
+	// NULL arrays.
+	assert_eq!(
+		services.array_filter_ids("{ colTextArr: { isNull: true } }").await,
+		vec!["type-test-null".to_string()]
+	);
+	assert_eq!(services.array_filter_ids("{ colTextArr: { isNull: false } }").await, row);
+}
+
+/// Operands that reach the SQL builder in a different form: a bare value in
+/// place of a list, characters that are special in an array literal, variables,
+/// and array filters combined with scalar and logical ones.
+#[tokio::test]
+async fn test_array_filter_operand_forms() {
+	if !services_available() {
+		eprintln!("SKIP");
+		return;
+	}
+	let services = Services::new();
+	let row = vec!["type-test-1".to_string()];
+	let none: Vec<String> = vec![];
+
+	// GraphQL coerces a single value to a one-element list.
+	assert_eq!(services.array_filter_ids(r#"{ colTextArr: { contains: "foo" } }"#).await, row);
+	assert_eq!(services.array_filter_ids(r#"{ colTextArr: { contains: "zzz" } }"#).await, none);
+
+	// Quotes, braces, commas and backslashes stay inside their element.
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colTextArr: { overlaps: ["a\"b,c}\\", "foo"] } }"#)
+			.await,
+		row
+	);
+	assert_eq!(
+		services
+			.array_filter_ids(r#"{ colTextArr: { overlaps: ["foo\",\"bar", "{foo}", "NULL"] } }"#)
+			.await,
+		none
+	);
+	assert_eq!(services.array_filter_ids("{ colTextArr: { contains: [null] } }").await, none);
+
+	// JSON elements.
+	assert_eq!(services.array_filter_ids("{ colJsonbArr: { contains: [{a: 1}] } }").await, row);
+	assert_eq!(services.array_filter_ids(r#"{ colJsonbArr: { anyEqualTo: "a" } }"#).await, none);
+
+	let query = "query($filter: TypeCoverageFilter) {
+        typeCoverages(filter: $filter) { totalCount nodes { id } }
+    }";
+	let variables = serde_json::json!({ "filter": {
+		"colInt8Arr": { "overlaps": ["200", "5"] },
+		"colNumericArr": { "anyGreaterThanOrEqualTo": "4.56" },
+		"colDateArr": { "contains": ["2024-06-15"] },
+	}});
+	assert_eq!(
+		services
+			.type_coverage_ids("array filters in variables", query, Some(variables))
+			.await,
+		row
+	);
+
+	assert_eq!(
+		services
+			.array_filter_ids(
+				r#"{ or: [
+                { colTextArr: { anyEqualTo: "zzz" } }
+                { colInt2Arr: { containedBy: [1, 2, 3, 4] }, id: { startsWith: "type-test" } }
+            ] }"#
+			)
+			.await,
+		row
+	);
+}

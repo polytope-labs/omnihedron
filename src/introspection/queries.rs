@@ -24,18 +24,17 @@ use anyhow::Result;
 use deadpool_postgres::Pool;
 use tracing::debug;
 
-/// Introspect every user-defined table in `schema` and return their full
-/// metadata: columns, primary keys, foreign keys, and unique constraints.
-pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInfo>> {
-	let client = pool.get().await?;
-
-	// ── 0. Build enum map (pg_type_name → display_name) ─────────────────────
-	let enums = introspect_enums(pool, schema).await?;
-	let enum_map: HashMap<String, String> =
-		enums.into_iter().map(|e| (e.pg_type_name, e.display_name)).collect();
-
-	// ── 1. List tables (with table comments for historical smart tags) ───────
-	let table_rows = client
+/// List the tables and views of `schema` that the GraphQL schema exposes, each
+/// with its comment: everything except SubQuery's internal tables.
+///
+/// This is the one definition of "the schema's tables". [`introspect_schema`]
+/// builds from it and [`count_tables`] counts it, so a count taken later can be
+/// compared with the number of tables the live schema was built from.
+async fn list_tables(
+	client: &deadpool_postgres::Object,
+	schema: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+	let rows = client
 		.query(
 			r#"
             SELECT t.table_name,
@@ -54,20 +53,37 @@ pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInf
 		)
 		.await?;
 
-	let table_names: Vec<String> = table_rows
+	Ok(rows
 		.iter()
-		.map(|r| r.get::<_, String>("table_name"))
-		.filter(|n| !is_internal_table(n))
-		.collect();
+		.map(|r| (r.get::<_, String>("table_name"), r.get::<_, Option<String>>("table_comment")))
+		.filter(|(name, _)| !is_internal_table(name))
+		.collect())
+}
+
+/// Count the tables [`introspect_schema`] returns for `schema`, without
+/// introspecting them.
+pub async fn count_tables(client: &deadpool_postgres::Object, schema: &str) -> Result<usize> {
+	Ok(list_tables(client, schema).await?.len())
+}
+
+/// Introspect every user-defined table in `schema` and return their full
+/// metadata: columns, primary keys, foreign keys, and unique constraints.
+pub async fn introspect_schema(pool: &Pool, schema: &str) -> Result<Vec<TableInfo>> {
+	let client = pool.get().await?;
+
+	// ── 0. Build enum map (pg_type_name → display_name) ─────────────────────
+	let enums = introspect_enums(pool, schema).await?;
+	let enum_map: HashMap<String, String> =
+		enums.into_iter().map(|e| (e.pg_type_name, e.display_name)).collect();
+
+	// ── 1. List tables (with table comments for historical smart tags) ───────
+	let listed = list_tables(&client, schema).await?;
+	let table_names: Vec<String> = listed.iter().map(|(name, _)| name.clone()).collect();
 
 	// Build a map of table_name → table_comment for smart tag extraction.
-	let table_comments: HashMap<String, String> = table_rows
-		.iter()
-		.filter_map(|r| {
-			let name: String = r.get("table_name");
-			let comment: Option<String> = r.get("table_comment");
-			comment.map(|c| (name, c))
-		})
+	let table_comments: HashMap<String, String> = listed
+		.into_iter()
+		.filter_map(|(name, comment)| comment.map(|c| (name, c)))
 		.collect();
 
 	debug!(schema, table_count = table_names.len(), "Introspecting tables");

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::{
 	config::Config,
 	introspection::{
-		model::{EnumInfo, TableInfo},
+		model::{ColumnInfo, EnumInfo, TableInfo},
 		types::pg_type_to_graphql,
 	},
 	resolvers,
@@ -36,6 +36,7 @@ use crate::{
 		metadata::register_metadata_types,
 		subscriptions::register_subscriptions,
 	},
+	sql::filter::{ArrayColumn, BackwardRelInfo, FilterContext, ForwardRelInfo, TableFilterInfo},
 };
 use async_graphql::{Name, Value as GqlValue, dynamic::*};
 use deadpool_postgres::Pool;
@@ -114,8 +115,12 @@ pub fn build_schema(
 	}
 
 	// ── Per-entity types ─────────────────────────────────────────────────────
+	// Relation metadata for every table, shared by all connection resolvers so a
+	// filter can follow relations to any depth.
+	let filter_ctx = Arc::new(build_filter_context(tables, &cfg.name, cfg.no_historical));
+
 	for table in tables {
-		builder = register_table_types(table, tables, builder, cfg.clone());
+		builder = register_table_types(table, tables, builder, cfg.clone(), filter_ctx.clone());
 	}
 
 	// ── Root Query type ───────────────────────────────────────────────────────
@@ -148,10 +153,6 @@ pub fn build_schema(
 		let cfg_clone = cfg.clone();
 		let is_historical = table.is_historical && !cfg.no_historical;
 		let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-
-		// Build filter context for relation-aware filtering
-		let filter_ctx = build_filter_context(table, tables, &cfg.name, cfg.no_historical);
-		let filter_ctx = Arc::new(filter_ctx);
 
 		// Build FK field → column map for selective SELECT (forward relations)
 		let fk_field_to_col: std::collections::HashMap<String, String> = table
@@ -506,6 +507,7 @@ fn register_table_types(
 	all_tables: &[TableInfo],
 	mut builder: SchemaBuilder,
 	cfg: Arc<Config>,
+	filter_ctx: Arc<FilterContext>,
 ) -> SchemaBuilder {
 	let type_name = table_to_type_name(&table.name);
 	let plural_type_name = table_to_plural_type_name(&table.name);
@@ -697,6 +699,7 @@ fn register_table_types(
 					let child_orderby_enum = format!("{child_plural_type_name}OrderBy");
 					let child_distinct_enum = format!("{}_distinct_enum", &other_table.name);
 					let child_primary_keys = other_table.primary_keys.clone();
+					let filter_ctx = filter_ctx.clone();
 
 					entity_obj = entity_obj.field(
 						Field::new(field_name, TypeRef::named_nn(&child_conn_type), move |ctx| {
@@ -704,6 +707,7 @@ fn register_table_types(
 							let fk_col = fk_col.clone();
 							let cfg = cfg_clone.clone();
 							let child_primary_keys = child_primary_keys.clone();
+							let filter_ctx = filter_ctx.clone();
 							FieldFuture::new(async move {
 								let maybe = resolvers::relations::resolve_backward_relation(
 									&ctx,
@@ -712,6 +716,7 @@ fn register_table_types(
 									child_is_historical,
 									&child_primary_keys,
 									&cfg,
+									&filter_ctx,
 								)
 								.await?;
 								Ok(maybe.map(FieldValue::owned_any))
@@ -918,9 +923,8 @@ fn register_table_types(
 		}
 		let field_filter: String = if let Some(display_name) = &col.enum_display_name {
 			format!("{display_name}Filter")
-		} else if col.udt_name.starts_with('_') {
+		} else if let Some(element_udt) = array_element_udt(col) {
 			// Array column: use list filter based on element type.
-			let element_udt = &col.udt_name[1..]; // strip leading '_'
 			let (element_gql_type, _) = pg_type_to_graphql("", element_udt);
 			list_filter_type_for(element_gql_type).to_string()
 		} else {
@@ -1052,15 +1056,47 @@ fn register_table_types(
 
 // ── Filter context builder ────────────────────────────────────────────────────
 
-fn build_filter_context(
+/// The element type (`udt_name` without its leading `_`) of an array column, or
+/// `None` for any other column. Decides both the column's filter input type and
+/// how the SQL builder treats it, so the two cannot disagree.
+fn array_element_udt(col: &ColumnInfo) -> Option<&str> {
+	if col.enum_display_name.is_some() {
+		return None;
+	}
+	col.udt_name.strip_prefix('_')
+}
+
+/// Build the filter metadata of every table, keyed by table name.
+fn build_filter_context(tables: &[TableInfo], schema: &str, no_historical: bool) -> FilterContext {
+	FilterContext {
+		tables: tables
+			.iter()
+			.map(|table| {
+				(table.name.clone(), table_filter_info(table, tables, schema, no_historical))
+			})
+			.collect(),
+	}
+}
+
+/// Filter metadata for `table`: the fields of its filter input that are not
+/// plain scalar columns.
+fn table_filter_info(
 	table: &TableInfo,
 	all_tables: &[TableInfo],
 	schema: &str,
 	no_historical: bool,
-) -> crate::sql::filter::FilterContext {
-	use crate::sql::filter::{BackwardRelInfo, FilterContext, ForwardRelInfo};
+) -> TableFilterInfo {
+	let mut ctx = TableFilterInfo::default();
 
-	let mut ctx = FilterContext::default();
+	// Array columns
+	for col in table.public_columns() {
+		if let Some(element_udt) = array_element_udt(col) {
+			ctx.array_columns.insert(
+				to_camel_case(&col.name),
+				ArrayColumn { json_elements: matches!(element_udt, "json" | "jsonb") },
+			);
+		}
+	}
 
 	// Forward relations + Exists
 	for fk in &table.foreign_keys {

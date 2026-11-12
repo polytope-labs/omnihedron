@@ -37,7 +37,7 @@ use crate::{
 	},
 	schema::inflector::to_camel_case,
 	sql::{
-		filter::build_filter_sql,
+		filter::{FilterContext, build_filter_sql},
 		pagination::{PaginationArgs, resolve_pagination},
 	},
 };
@@ -197,6 +197,9 @@ pub async fn resolve_backward_single(
 ///
 /// When `child_is_historical` is true the child rows are filtered by
 /// `_block_range`, using the `_block_height` embedded in the parent entity JSON.
+///
+/// `filter_ctx` resolves relation filters in the `filter` argument, which is a
+/// filter of the child table.
 pub async fn resolve_backward_relation(
 	ctx: &ResolverContext<'_>,
 	child_table: &str,
@@ -204,6 +207,7 @@ pub async fn resolve_backward_relation(
 	child_is_historical: bool,
 	child_primary_keys: &[String],
 	cfg: &Config,
+	filter_ctx: &FilterContext,
 ) -> async_graphql::Result<Option<Value>> {
 	let parent = ctx.parent_value.try_downcast_ref::<Value>()?;
 	let parent_id = match parent.get("id") {
@@ -275,7 +279,8 @@ pub async fn resolve_backward_relation(
 	}
 
 	if let Some(f) = filter_val {
-		let (filter_conds, filter_params) = build_filter_sql(&f, "t", &mut param_offset);
+		let (filter_conds, filter_params) =
+			build_filter_sql(&f, child_table, "t", &mut param_offset, filter_ctx)?;
 		conditions.extend(filter_conds);
 		params.extend(filter_params);
 	}

@@ -4736,3 +4736,61 @@ CREATE OR REPLACE FUNCTION app.search_test_books(search text)
 $$ LANGUAGE sql STABLE;
 
 COMMENT ON FUNCTION app.search_test_books(text) IS '@name search_test_books';
+
+-- ---------------------------------------------------------------------------
+-- Test tables for relation filters nested inside another relation filter.
+-- test_collection_books → test_collections → test_authors is a two-hop forward
+-- chain. TestCollection and TestAuthor both expose a backward relation named
+-- `books`, each over a different table, so a nested `books` that is resolved
+-- against the wrong table is caught.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE app.test_collections (
+    id text NOT NULL,
+    label text NOT NULL,
+    owner_id text NOT NULL,
+    _id uuid NOT NULL,
+    _block_range int8range NOT NULL
+);
+
+ALTER TABLE app.test_collections ADD CONSTRAINT test_collections_pkey PRIMARY KEY (_id);
+-- UNIQUE on id is required for the FK from test_collection_books to work.
+ALTER TABLE app.test_collections ADD CONSTRAINT test_collections_id_unique UNIQUE (id);
+ALTER TABLE app.test_collections ADD CONSTRAINT test_collections_owner_id_fkey
+    FOREIGN KEY (owner_id) REFERENCES app.test_authors(id);
+
+CREATE TABLE app.test_collection_books (
+    id text NOT NULL,
+    title text NOT NULL,
+    -- Nullable: PostGraphile only offers `collectionExists` for a nullable FK.
+    collection_id text,
+    _id uuid NOT NULL,
+    _block_range int8range NOT NULL
+);
+
+ALTER TABLE app.test_collection_books ADD CONSTRAINT test_collection_books_pkey PRIMARY KEY (_id);
+ALTER TABLE app.test_collection_books ADD CONSTRAINT test_collection_books_collection_id_fkey
+    FOREIGN KEY (collection_id) REFERENCES app.test_collections(id);
+-- Same backward relation name as test_books has on TestAuthor.
+COMMENT ON CONSTRAINT test_collection_books_collection_id_fkey ON app.test_collection_books IS '@foreignFieldName books';
+
+INSERT INTO app.test_collections (_id, id, label, owner_id, _block_range) VALUES
+    ('44444444-4444-4444-4444-444444444401'::uuid,
+     'collection-1', 'Alice Favourites', 'author-alice', '[0,)'::int8range),
+    ('44444444-4444-4444-4444-444444444402'::uuid,
+     'collection-2', 'Bob Picks', 'author-bob', '[0,)'::int8range),
+    ('44444444-4444-4444-4444-444444444403'::uuid,
+     'collection-3', 'Charlie Shelf', 'author-charlie', '[0,)'::int8range);
+
+-- collection-book-2 sits in Alice's collection but carries the title of a
+-- test_books row written by Bob, so the two `books` relations give different
+-- answers for the same title.
+INSERT INTO app.test_collection_books (_id, id, title, collection_id, _block_range) VALUES
+    ('55555555-5555-5555-5555-555555555501'::uuid,
+     'collection-book-1', 'Pick One', 'collection-1', '[0,)'::int8range),
+    ('55555555-5555-5555-5555-555555555502'::uuid,
+     'collection-book-2', 'Book Three', 'collection-1', '[0,)'::int8range),
+    ('55555555-5555-5555-5555-555555555503'::uuid,
+     'collection-book-3', 'Pick Three', 'collection-2', '[0,)'::int8range),
+    ('55555555-5555-5555-5555-555555555504'::uuid,
+     'collection-book-4', 'Unshelved', NULL, '[0,)'::int8range);

@@ -20,8 +20,10 @@
 //! 2. `LISTEN`s on the SubQuery schema-change channel.
 //! 3. On receiving a `schema_updated` notification, re-runs full introspection and atomically
 //!    replaces the live schema via the [`server::SharedSchema`] `Arc<RwLock<Schema>>`.
-//! 4. Sends a keep-alive `SELECT 1` every `sl_keep_alive_interval` ms to prevent idle connection
-//!    termination.
+//! 4. Sends a keep-alive `SELECT 1` on that same connection every `sl_keep_alive_interval` ms, so
+//!    the server does not close it as idle (`idle_session_timeout`).
+//! 5. Reconnects when the connection is lost, and rebuilds the schema once it is listening again:
+//!    notifications sent while nothing was listening are not redelivered.
 
 use std::{sync::Arc, time::Duration};
 
@@ -55,6 +57,9 @@ pub async fn start_schema_listener(
 	let channel = hash_name(&cfg.name, "schema_channel", "_metadata");
 
 	tokio::spawn(async move {
+		// The schema was built just before this task started, so only a
+		// reconnect has a gap in which a change could have been missed.
+		let mut catch_up = false;
 		loop {
 			match listen_for_changes(
 				pool.clone(),
@@ -62,6 +67,7 @@ pub async fn start_schema_listener(
 				cfg.clone(),
 				&channel,
 				schema_state.clone(),
+				catch_up,
 			)
 			.await
 			{
@@ -71,6 +77,7 @@ pub async fn start_schema_listener(
 					tokio::time::sleep(Duration::from_secs(5)).await;
 				},
 			}
+			catch_up = true;
 		}
 	});
 }
@@ -81,6 +88,7 @@ async fn listen_for_changes(
 	cfg: Arc<Config>,
 	channel: &str,
 	schema_state: Arc<SchemaState>,
+	catch_up: bool,
 ) -> anyhow::Result<()> {
 	let db = crate::config::DbConfig::from_env()?;
 	let tls = build_tls_connector(&cfg)?;
@@ -116,42 +124,49 @@ async fn listen_for_changes(
 	client.execute(&format!(r#"LISTEN "{channel}""#), &[]).await?;
 	info!(channel = %channel, "Listening for schema changes");
 
-	let keep_alive_ms = cfg.sl_keep_alive_interval;
-	let ka_pool = pool.clone();
-	tokio::spawn(async move {
-		let mut ticker = tokio::time::interval(Duration::from_millis(keep_alive_ms));
-		loop {
-			ticker.tick().await;
-			if let Ok(c) = ka_pool.get().await {
-				if let Err(e) = c.execute("SELECT 1", &[]).await {
-					warn!(error = %e, "Schema listener keep-alive failed");
-				}
-			}
-		}
-	});
+	// Notifications sent while no connection was listening are lost, so rebuild
+	// once now that this one is.
+	if catch_up {
+		rebuild_schema(pool.clone(), schema.clone(), cfg.clone(), schema_state.clone()).await;
+	}
+
+	// The keep-alive runs on this connection and in this loop. It is the LISTEN
+	// session that the server would close as idle, and a ticker owned by this
+	// function stops with it instead of outliving every reconnect.
+	let period = Duration::from_millis(cfg.sl_keep_alive_interval.max(1));
+	let mut keep_alive = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+	keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
 	loop {
-		match rx.recv().await {
-			Some(notif) if notif.payload() == "schema_updated" => {
-				rebuild_schema(pool.clone(), schema.clone(), cfg.clone(), schema_state.clone())
-					.await;
+		tokio::select! {
+			notification = rx.recv() => match notification {
+				Some(notif) if notif.payload() == "schema_updated" => {
+					rebuild_schema(pool.clone(), schema.clone(), cfg.clone(), schema_state.clone())
+						.await;
+				},
+				Some(_) => {}, // Different payload, ignore
+				None => return Err(anyhow::anyhow!("Notification channel closed")),
 			},
-			Some(_) => {}, // Different payload, ignore
-			None => return Err(anyhow::anyhow!("Notification channel closed")),
+			_ = keep_alive.tick() => {
+				client
+					.batch_execute("SELECT 1")
+					.await
+					.map_err(|e| anyhow::anyhow!("Keep-alive failed: {e}"))?;
+			},
 		}
 	}
 }
 
-async fn try_build_schema(
-	pool: &Arc<Pool>,
-	cfg: &Arc<Config>,
-) -> anyhow::Result<async_graphql::dynamic::Schema> {
+/// Introspect the database and build a schema from it. Returns the schema and
+/// the number of tables it was built from.
+async fn try_build_schema(pool: &Arc<Pool>, cfg: &Arc<Config>) -> anyhow::Result<(Schema, usize)> {
 	let tables = introspect_schema(pool, &cfg.name).await?;
 	let enums = introspect_enums(pool, &cfg.name).await?;
 	let search_fns = introspect_search_functions(pool, &cfg.name).await?;
 	// Detect historical mode on every rebuild (it may have changed).
 	let hist_arg = detect_historical_mode(pool, &cfg.name).await;
-	build_schema(&tables, &enums, pool.clone(), cfg.clone(), &hist_arg, &search_fns)
+	let schema = build_schema(&tables, &enums, pool.clone(), cfg.clone(), &hist_arg, &search_fns)?;
+	Ok((schema, tables.len()))
 }
 
 /// Query `_metadata` for `historicalStateEnabled`.
@@ -183,13 +198,11 @@ async fn rebuild_schema(
 	const MAX_RETRIES: u32 = 5;
 	for attempt in 1..=MAX_RETRIES {
 		match try_build_schema(&pool, &cfg).await {
-			Ok(new_schema) => {
+			Ok((new_schema, table_count)) => {
 				*schema_lock.write().await = new_schema;
 				let duration = start.elapsed().as_secs_f64();
 
 				// Update schema state for health checks
-				let table_count =
-					introspect_schema(&pool, &cfg.name).await.map(|t| t.len()).unwrap_or(0);
 				schema_state.update(table_count).await;
 
 				info!(duration_ms = (duration * 1000.0) as u64, "Schema successfully rebuilt");
