@@ -47,6 +47,29 @@ async fn test_health() {
 	println!("TS   /graphql probe: ok");
 }
 
+/// `/health` must report the schema as current on a database that has not
+/// changed since startup. The fixture is a multi-chain schema with several
+/// `_metadata_*` tables, which introspection leaves out: counting them in the
+/// staleness check made every multi-chain deployment report "stale".
+#[tokio::test]
+async fn test_health_reports_current_schema() {
+	let resp = match reqwest::get(format!("{}/health", rust_url())).await {
+		Ok(resp) if resp.status().is_success() => resp,
+		_ => {
+			eprintln!("SKIP: Rust service not available");
+			return;
+		},
+	};
+	let body: Value = resp.json().await.expect("/health did not return JSON");
+
+	assert_eq!(body["checks"]["schema"]["status"], "current", "/health: {body}");
+	assert_eq!(body["status"], "healthy", "/health: {body}");
+	assert!(
+		body["checks"]["schema"]["tableCount"].as_u64().unwrap_or(0) > 0,
+		"/health should report the introspected table count: {body}"
+	);
+}
+
 #[tokio::test]
 async fn test_metadata() {
 	if !services_available() {

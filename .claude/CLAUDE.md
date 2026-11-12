@@ -72,7 +72,8 @@ Docker Hub: `polytopelabs/omnihedron`
 - Hex enum type naming — `pg_enum_type_to_gql_name` replicates PostGraphile's `coerceToGraphQLName` + lodash `upperCamelCase` with digit→letter word boundaries (for SubQuery's blake2 10-char hash enum names)
 - `_MetadatasEdge` type registered with `cursor` + `node` fields; `_Metadatas` exposes `edges` field
 - Cursor-based pagination (`after`/`before`) with explicit `orderBy` — `parse_orderby` and `parse_distinct` accept both `List` and bare `Enum`/`String` values since async-graphql dynamic schema does not auto-coerce single enum values into lists for these args
-- Schema hot reload (LISTEN/NOTIFY with atomic schema swap)
+- Schema hot reload (LISTEN/NOTIFY with atomic schema swap). The listener sends its keep-alive on the LISTEN connection itself (it is that session `idle_session_timeout` would close), in the same loop that receives notifications, and rebuilds the schema after every reconnect because notifications sent while disconnected are lost.
+- `/health` schema staleness — compares the table count the live schema was built from with `count_tables`, which shares `list_tables` (and so the internal-table filter) with `introspect_schema`. Counting every table in the schema can never match on a multi-chain project.
 - Backward relation `filter`/`orderBy`/`orderByNull`/`distinct` args
 - Forward relation field naming (PostGraphile simplify inflector: strip `_id` from FK column)
 - Backward relation field naming (`{childPlural}By{FkCol}`)

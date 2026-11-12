@@ -425,21 +425,17 @@ async fn health_handler(State(state): State<AppState>) -> Response {
 	let (db_ok, schema_status) =
 		match tokio::time::timeout(std::time::Duration::from_secs(2), async {
 			let client = state.pool.get().await.map_err(|_| ())?;
-			let row = client
-				.query_one(
-					"SELECT COUNT(*)::int AS cnt FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE'",
-					&[&schema_state.schema_name],
-				)
+			// Count the same set of tables the schema was built from. Counting
+			// every table would never match: introspection leaves out SubQuery's
+			// internal tables.
+			crate::introspection::count_tables(&client, &schema_state.schema_name)
 				.await
-				.map_err(|_| ())?;
-			let current_count: i32 = row.get("cnt");
-			Ok::<_, ()>(current_count)
+				.map_err(|_| ())
 		})
 		.await
 		{
 			Ok(Ok(current_count)) => {
-				let status =
-					if current_count as usize == table_count { "current" } else { "stale" };
+				let status = if current_count == table_count { "current" } else { "stale" };
 				(true, status)
 			},
 			_ => (false, "unknown"),
